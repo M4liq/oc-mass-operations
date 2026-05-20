@@ -8,6 +8,8 @@ import re
 import subprocess
 import sys
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +22,7 @@ import yaml
 DONE_STATUSES = {"completed", "done", "skipped"}
 MANIFEST_START = "OCMO_MANIFEST_START"
 MANIFEST_END = "OCMO_MANIFEST_END"
+TERMINAL_STATUSES = {"completed", "failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"}
 
 
 class OcmoError(Exception):
@@ -34,6 +37,7 @@ class RunOptions:
     timeout_seconds: int | None
     dry_run: bool
     yes: bool
+    ui: str = "auto"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,6 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each item")
     run_parser.add_argument("--dry-run", action="store_true", help="Print commands/prompts without running opencode")
     run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for non-dry runs")
+    run_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for non-dry runs")
 
     validate_parser = subparsers.add_parser("validate", help="Validate a manifest")
     validate_parser.add_argument("manifest", type=Path)
@@ -69,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
-            return run_manifest(RunOptions(args.manifest, args.select, args.concurrency, args.timeout_seconds, args.dry_run, args.yes))
+            return run_manifest(RunOptions(args.manifest, args.select, args.concurrency, args.timeout_seconds, args.dry_run, args.yes, args.ui))
         if args.command == "validate":
             manifest = load_manifest(args.manifest)
             validate_manifest(manifest, args.manifest)
@@ -448,6 +453,206 @@ def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: st
     return command
 
 
+class PlainRunReporter:
+    captures_subprocess_output = False
+
+    def __enter__(self) -> "PlainRunReporter":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+    def start(self, manifest: dict[str, Any], selected: list[dict[str, Any]], concurrency: int, auto_worktrees: dict[str, Any]) -> None:
+        return None
+
+    def item(self, item_id: str, status: str, detail: str = "") -> None:
+        if detail:
+            print(f"[{item_id}] {detail}")
+
+    def run(self, item_id: str, run_id: str, status: str, detail: str = "") -> None:
+        message = detail or status.replace("_", " ")
+        print(f"[{item_id}/{run_id}] {message}")
+
+    def worker_error(self, item_id: str, error: Exception) -> None:
+        print(f"[{item_id}] unexpected worker error: {error}")
+
+    def subprocess_output(self, item_id: str, run_id: str, completed: subprocess.CompletedProcess) -> None:
+        return None
+
+
+class LiveRunReporter(PlainRunReporter):  # pragma: no cover
+    captures_subprocess_output = True
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.items: dict[str, dict[str, Any]] = {}
+        self.events: deque[str] = deque(maxlen=10)
+        self.operation_id = ""
+        self.concurrency = 1
+        self.auto_worktrees = False
+        self.started = time.monotonic()
+        self.live: Any = None
+        self.console: Any = None
+
+    def __enter__(self) -> "LiveRunReporter":
+        try:
+            from rich.console import Console
+            from rich.live import Live
+        except ImportError as exc:  # pragma: no cover - dependency is declared for normal installs
+            raise OcmoError("live run UI requires the rich package") from exc
+        self.console = Console()
+        self.live = Live(self.render(), console=self.console, refresh_per_second=4, transient=False)
+        self.live.__enter__()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self.live:
+            self.live.update(self.render())
+            self.live.__exit__(exc_type, exc, traceback)
+
+    def start(self, manifest: dict[str, Any], selected: list[dict[str, Any]], concurrency: int, auto_worktrees: dict[str, Any]) -> None:
+        with self.lock:
+            self.operation_id = str(manifest["operation"]["id"])
+            self.concurrency = concurrency
+            self.auto_worktrees = bool(auto_worktrees.get("enabled"))
+            self.started = time.monotonic()
+            for item in selected:
+                item_id = str(item["id"])
+                self.items[item_id] = {
+                    "status": "queued",
+                    "step": "-",
+                    "progress": f"0/{len(item_runs(manifest, item))}",
+                    "detail": str(item.get("title") or "-"),
+                    "started": None,
+                }
+            self.events.appendleft(f"selected {len(selected)} item(s), concurrency={concurrency}")
+        self.refresh()
+
+    def item(self, item_id: str, status: str, detail: str = "") -> None:
+        with self.lock:
+            item = self.items.setdefault(item_id, {"progress": "0/1", "step": "-", "detail": "-", "started": None})
+            item["status"] = status
+            if status in {"worktree_removed", "cleanup"} and item.get("progress", "0/1").split("/", 1)[0] == item.get("progress", "0/1").split("/", 1)[-1]:
+                item["status"] = "completed"
+            if detail:
+                item["detail"] = detail
+                self.events.appendleft(f"{item_id}: {detail}")
+            if status in {"running", "creating_worktree", "setup", "cleanup"} and item.get("started") is None:
+                item["started"] = time.monotonic()
+        self.refresh()
+
+    def run(self, item_id: str, run_id: str, status: str, detail: str = "") -> None:
+        with self.lock:
+            item = self.items.setdefault(item_id, {"progress": "0/1", "step": "-", "detail": "-", "started": None})
+            if item.get("started") is None:
+                item["started"] = time.monotonic()
+            if status == "completed":
+                item["status"] = "running"
+            else:
+                item["status"] = "running" if status == "running" else status
+            item["step"] = run_id
+            run_detail = detail or status.replace("_", " ")
+            item["detail"] = run_detail
+            progress = item.get("progress", "0/1")
+            total = progress.split("/", 1)[-1] if "/" in progress else "1"
+            if status == "running":
+                current = item.get("runIndex", 0) + 1
+                item["runIndex"] = current
+                item["progress"] = f"{current}/{total}"
+            self.events.appendleft(f"{item_id}/{run_id}: {run_detail}")
+        self.refresh()
+
+    def worker_error(self, item_id: str, error: Exception) -> None:
+        self.item(item_id, "failed", f"unexpected worker error: {error}")
+
+    def subprocess_output(self, item_id: str, run_id: str, completed: subprocess.CompletedProcess) -> None:
+        text = "\n".join(part for part in [getattr(completed, "stdout", ""), getattr(completed, "stderr", "")] if part)
+        last_line = next((line.strip() for line in reversed(text.splitlines()) if line.strip()), "")
+        if last_line:
+            with self.lock:
+                self.events.appendleft(f"{item_id}/{run_id}: {last_line[:120]}")
+            self.refresh()
+
+    def refresh(self) -> None:
+        if self.live:
+            self.live.update(self.render())
+
+    def render(self) -> Any:
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+
+        elapsed = format_duration(time.monotonic() - self.started)
+        counts = self.status_counts()
+        title = Text(f"OC Mass Operations: {self.operation_id or '-'}", style="bold cyan")
+        summary = Text(
+            f"selected={len(self.items)} running={counts['running']} completed={counts['completed']} "
+            f"failed={counts['failed']} pending={counts['pending']} concurrency={self.concurrency} elapsed={elapsed}"
+        )
+        if self.auto_worktrees:
+            summary.append(" autoWorktrees=true")
+        table = Table(expand=True)
+        table.add_column("Item", no_wrap=True)
+        table.add_column("Status", no_wrap=True)
+        table.add_column("Step", no_wrap=True)
+        table.add_column("Progress", no_wrap=True)
+        table.add_column("Runtime", no_wrap=True)
+        table.add_column("Detail")
+        with self.lock:
+            rows = list(self.items.items())
+            events = list(self.events)
+        for item_id, item in rows:
+            started = item.get("started")
+            runtime = format_duration(time.monotonic() - started) if started else "-"
+            table.add_row(item_id, str(item.get("status", "-")), str(item.get("step", "-")), str(item.get("progress", "-")), runtime, str(item.get("detail", "-")))
+        event_text = "\n".join(events) if events else "No events yet."
+        return Group(title, summary, table, Panel(event_text, title="Recent Events"))
+
+    def status_counts(self) -> dict[str, int]:
+        counts = {"running": 0, "completed": 0, "failed": 0, "pending": 0}
+        with self.lock:
+            statuses = [str(item.get("status", "queued")) for item in self.items.values()]
+        for status in statuses:
+            if status in {"completed"}:
+                counts["completed"] += 1
+            elif status in {"failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"}:
+                counts["failed"] += 1
+            elif status in {"queued"}:
+                counts["pending"] += 1
+            else:
+                counts["running"] += 1
+        return counts
+
+
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def make_run_reporter(ui: str) -> PlainRunReporter:
+    if ui == "plain":
+        return PlainRunReporter()
+    if ui == "auto" and not sys.stdout.isatty():
+        return PlainRunReporter()
+    if ui == "auto":
+        try:
+            import rich  # noqa: F401
+        except ImportError:
+            return PlainRunReporter()
+    return LiveRunReporter()  # pragma: no cover
+
+
+def subprocess_run_kwargs(reporter: PlainRunReporter) -> dict[str, Any]:
+    if reporter.captures_subprocess_output:
+        return {"capture_output": True, "text": True}
+    return {}
+
+
 def run_manifest(options: RunOptions) -> int:
     manifest = load_manifest(options.manifest_path)
     validate_manifest(manifest, options.manifest_path)
@@ -501,84 +706,98 @@ def run_manifest(options: RunOptions) -> int:
     state = StateStore(state_path(manifest, options.manifest_path))
     state.ensure_operation(manifest)
     results: list[int] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {
-            executor.submit(run_item, manifest, options.manifest_path, item, state, timeout_seconds, auto_worktrees): str(item["id"])
-            for item in selected
-        }
-        for future in concurrent.futures.as_completed(futures):
-            item_id = futures[future]
-            try:
-                results.append(future.result())
-            except Exception as exc:
-                state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": f"unexpected worker error: {exc}"})
-                print(f"[{item_id}] unexpected worker error: {exc}")
-                results.append(1)
+    with make_run_reporter(options.ui) as reporter:
+        reporter.start(manifest, selected, concurrency, auto_worktrees)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {
+                executor.submit(run_item, manifest, options.manifest_path, item, state, timeout_seconds, auto_worktrees, reporter): str(item["id"])
+                for item in selected
+            }
+            for future in concurrent.futures.as_completed(futures):
+                item_id = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": f"unexpected worker error: {exc}"})
+                    reporter.worker_error(item_id, exc)
+                    results.append(1)
 
     if any(code != 0 for code in results):
         return 1
     return 0
 
 
-def run_item(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], state: "StateStore", timeout_seconds: int | None, auto_worktrees: dict[str, Any]) -> int:
+def run_item(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    item: dict[str, Any],
+    state: "StateStore",
+    timeout_seconds: int | None,
+    auto_worktrees: dict[str, Any],
+    reporter: PlainRunReporter | None = None,
+) -> int:
+    reporter = reporter or PlainRunReporter()
     item_id = str(item["id"])
     execution: dict[str, Any] = {}
     try:
         execution = worktree_execution(manifest, manifest_path, item) if auto_worktrees["enabled"] else {}
         run_dir = Path(execution["worktreePath"]) if execution else resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])
         if execution:
-            worktree_code = prepare_worktree(manifest, manifest_path, item, execution, auto_worktrees, state)
+            worktree_code = prepare_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, reporter)
             if worktree_code != 0:
                 return worktree_code
         runs = item_runs(manifest, item)
     except (OSError, OcmoError) as exc:
         state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
-        print(f"[{item_id}] failed before start: {exc}")
+        reporter.item(item_id, "failed", f"failed before start: {exc}")
         return 1
     state.mark(item_id, "running", {"startedAt": utc_now(), "runCount": len(runs), **execution})
+    reporter.item(item_id, "running", "running")
     for run in runs:
         runner = effective_runner(manifest, run)
+        run_id = str(run["id"])
         run_timeout = timeout_seconds if timeout_seconds is not None else runner.get("timeoutSeconds")
         try:
             prompt_text = render_prompt(manifest, item, manifest_path, execution, run, runs)
             command = build_command(manifest, manifest_path, prompt_text, run_dir, runner)
         except (OSError, OcmoError) as exc:
-            state.mark_run(item_id, str(run["id"]), "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
+            state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
             state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
-            print(f"[{item_id}/{run['id']}] failed before start: {exc}")
-            cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
+            reporter.run(item_id, run_id, "failed", f"failed before start: {exc}")
+            cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
             return cleanup_code or 1
-        state.mark_run(item_id, str(run["id"]), "running", {"startedAt": utc_now(), "command": command_without_prompt(command), "timeoutSeconds": run_timeout})
-        print(f"[{item_id}/{run['id']}] starting")
+        state.mark_run(item_id, run_id, "running", {"startedAt": utc_now(), "command": command_without_prompt(command), "timeoutSeconds": run_timeout})
+        reporter.run(item_id, run_id, "running", "starting")
         try:
-            completed = subprocess.run(command, cwd=str(run_dir), timeout=run_timeout)
+            completed = subprocess.run(command, cwd=str(run_dir), timeout=run_timeout, **subprocess_run_kwargs(reporter))
         except subprocess.TimeoutExpired:
-            state.mark_run(item_id, str(run["id"]), "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout})
+            state.mark_run(item_id, run_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout})
             state.mark(item_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout, **execution})
-            print(f"[{item_id}/{run['id']}] timed out after {run_timeout} seconds")
-            cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
+            reporter.run(item_id, run_id, "timed_out", f"timed out after {run_timeout} seconds")
+            cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
             return 124
         except OSError as exc:
-            state.mark_run(item_id, str(run["id"]), "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
+            state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
             state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
-            print(f"[{item_id}/{run['id']}] failed to start: {exc}")
-            cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
+            reporter.run(item_id, run_id, "failed", f"failed to start: {exc}")
+            cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
             return cleanup_code or 1
+        reporter.subprocess_output(item_id, run_id, completed)
         if completed.returncode == 0:
-            state.mark_run(item_id, str(run["id"]), "completed", {"completedAt": utc_now(), "exitCode": 0})
-            print(f"[{item_id}/{run['id']}] completed")
+            state.mark_run(item_id, run_id, "completed", {"completedAt": utc_now(), "exitCode": 0})
+            reporter.run(item_id, run_id, "running", "completed")
         else:
-            state.mark_run(item_id, str(run["id"]), "failed", {"completedAt": utc_now(), "exitCode": completed.returncode})
+            state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": completed.returncode})
             state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": completed.returncode, **execution})
-            print(f"[{item_id}/{run['id']}] failed: exit {completed.returncode}")
-            cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
+            reporter.run(item_id, run_id, "failed", f"failed: exit {completed.returncode}")
+            cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
             return cleanup_code or completed.returncode
     state.mark(item_id, "completed", {"completedAt": utc_now(), "exitCode": 0, **execution})
-    print(f"[{item_id}] completed")
-    cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=True)
+    reporter.item(item_id, "completed", "completed")
+    cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=True, reporter=reporter)
     if cleanup_code != 0:
         state.mark(item_id, "cleanup_failed", {"completedAt": utc_now(), "exitCode": cleanup_code, **execution})
-        print(f"[{item_id}] cleanup failed: exit {cleanup_code}")
+        reporter.item(item_id, "cleanup_failed", f"cleanup failed: exit {cleanup_code}")
         return cleanup_code
     return 0
 
@@ -613,49 +832,69 @@ def resolve_worktree_root(source_workspace: Path, value: str) -> Path:
     return (source_workspace / path).resolve()
 
 
-def prepare_worktree(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], execution: dict[str, Any], config: dict[str, Any], state: "StateStore") -> int:
+def prepare_worktree(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    item: dict[str, Any],
+    execution: dict[str, Any],
+    config: dict[str, Any],
+    state: "StateStore",
+    reporter: PlainRunReporter | None = None,
+) -> int:
+    reporter = reporter or PlainRunReporter()
     item_id = str(item["id"])
     source_workspace = Path(execution["sourceWorkspace"])
     worktree_path = Path(execution["worktreePath"])
     branch_name = execution["branchName"]
     base_branch = execution["baseBranch"]
     state.mark(item_id, "creating_worktree", {"worktreeStartedAt": utc_now(), **execution})
-    print(f"[{item_id}] creating worktree {worktree_path}")
+    reporter.item(item_id, "creating_worktree", f"creating worktree {worktree_path}")
     if worktree_path.exists():
         state.mark(item_id, "worktree_failed", {"completedAt": utc_now(), "exitCode": 1, "error": f"worktree path already exists: {worktree_path}", **execution})
-        print(f"[{item_id}] worktree path already exists: {worktree_path}")
+        reporter.item(item_id, "worktree_failed", f"worktree path already exists: {worktree_path}")
         return 1
     try:
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         state.mark(item_id, "worktree_failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
-        print(f"[{item_id}] could not create worktree parent: {exc}")
+        reporter.item(item_id, "worktree_failed", f"could not create worktree parent: {exc}")
         return 1
     command = ["git", "worktree", "add", "-b", branch_name, str(worktree_path), base_branch]
     try:
         completed = subprocess.run(command, cwd=str(source_workspace))
     except OSError as exc:
         state.mark(item_id, "worktree_failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
-        print(f"[{item_id}] worktree creation failed: {exc}")
+        reporter.item(item_id, "worktree_failed", f"worktree creation failed: {exc}")
         return 1
     if completed.returncode != 0:
         state.mark(item_id, "worktree_failed", {"completedAt": utc_now(), "exitCode": completed.returncode, **execution})
-        print(f"[{item_id}] worktree creation failed: exit {completed.returncode}")
+        reporter.item(item_id, "worktree_failed", f"worktree creation failed: exit {completed.returncode}")
         return completed.returncode
     state.mark(item_id, "worktree_ready", {"worktreeCompletedAt": utc_now(), **execution})
-    setup_code = run_scripts("setup", normalize_scripts(config.get("setup"), "queue.autoWorktrees.setup"), worktree_path, execution, item_id)
+    setup_code = run_scripts("setup", normalize_scripts(config.get("setup"), "queue.autoWorktrees.setup"), worktree_path, execution, item_id, reporter)
     if setup_code != 0:
         state.mark(item_id, "setup_failed", {"completedAt": utc_now(), "exitCode": setup_code, **execution})
-        cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, config, state, success=False)
+        cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, config, state, success=False, reporter=reporter)
         if cleanup_code != 0:
             return cleanup_code
         return setup_code
     if config.get("setup"):
         state.mark(item_id, "setup_completed", {"setupCompletedAt": utc_now(), **execution})
+        reporter.item(item_id, "setup_completed", "setup completed")
     return 0
 
 
-def cleanup_worktree(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], execution: dict[str, Any], config: dict[str, Any], state: "StateStore", success: bool) -> int:
+def cleanup_worktree(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    item: dict[str, Any],
+    execution: dict[str, Any],
+    config: dict[str, Any],
+    state: "StateStore",
+    success: bool,
+    reporter: PlainRunReporter | None = None,
+) -> int:
+    reporter = reporter or PlainRunReporter()
     if not execution:
         return 0
     cleanup = config.get("cleanup", "never")
@@ -664,7 +903,8 @@ def cleanup_worktree(manifest: dict[str, Any], manifest_path: Path, item: dict[s
         return 0
     item_id = str(item["id"])
     worktree_path = Path(execution["worktreePath"])
-    teardown_code = run_scripts("teardown", normalize_scripts(config.get("teardown"), "queue.autoWorktrees.teardown"), worktree_path, execution, item_id)
+    reporter.item(item_id, "cleanup", "cleanup")
+    teardown_code = run_scripts("teardown", normalize_scripts(config.get("teardown"), "queue.autoWorktrees.teardown"), worktree_path, execution, item_id, reporter)
     if teardown_code != 0:
         state.patch(item_id, {"teardownStatus": "failed", "teardownCompletedAt": utc_now(), "teardownExitCode": teardown_code, **execution})
         return teardown_code
@@ -673,25 +913,29 @@ def cleanup_worktree(manifest: dict[str, Any], manifest_path: Path, item: dict[s
         completed = subprocess.run(["git", "worktree", "remove", str(worktree_path)], cwd=str(source_workspace))
     except OSError as exc:
         state.patch(item_id, {"worktreeStatus": "remove_failed", "worktreeRemoveExitCode": 1, "worktreeRemoveError": str(exc), **execution})
+        reporter.item(item_id, "cleanup_failed", f"worktree remove failed: {exc}")
         return 1
     if completed.returncode == 0:
         state.patch(item_id, {"worktreeStatus": "removed", "worktreeRemovedAt": utc_now(), **execution})
+        reporter.item(item_id, "cleanup", "worktree removed")
         return 0
     else:
         state.patch(item_id, {"worktreeStatus": "remove_failed", "worktreeRemoveExitCode": completed.returncode, **execution})
+        reporter.item(item_id, "cleanup_failed", f"worktree remove failed: exit {completed.returncode}")
         return completed.returncode
 
 
-def run_scripts(kind: str, scripts: list[str], cwd: Path, execution: dict[str, Any], item_id: str) -> int:
+def run_scripts(kind: str, scripts: list[str], cwd: Path, execution: dict[str, Any], item_id: str, reporter: PlainRunReporter | None = None) -> int:
+    reporter = reporter or PlainRunReporter()
     for script in scripts:
-        print(f"[{item_id}] {kind}: {script}")
+        reporter.item(item_id, kind, f"{kind}: {script}")
         try:
             completed = subprocess.run(script, cwd=str(cwd), shell=True, env=worktree_env(execution))
         except OSError as exc:
-            print(f"[{item_id}] {kind} failed: {exc}")
+            reporter.item(item_id, f"{kind}_failed", f"{kind} failed: {exc}")
             return 1
         if completed.returncode != 0:
-            print(f"[{item_id}] {kind} failed: exit {completed.returncode}")
+            reporter.item(item_id, f"{kind}_failed", f"{kind} failed: exit {completed.returncode}")
             return completed.returncode
     return 0
 

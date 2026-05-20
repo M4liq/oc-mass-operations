@@ -891,6 +891,33 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         with mock.patch("ocmo.cli.subprocess.run", side_effect=OSError("missing shell")):
             self.assertEqual(cli.run_scripts("setup", ["bad"], self.root, execution, "1"), 1)
 
+    def test_run_reporter_helpers_and_ui_selection(self) -> None:
+        stdout = io.StringIO()
+        reporter = cli.PlainRunReporter()
+
+        with contextlib.redirect_stdout(stdout), reporter:
+            reporter.start({}, [], 1, {"enabled": False})
+            reporter.item("1", "queued")
+            reporter.run("1", "default", "starting")
+            reporter.worker_error("1", RuntimeError("boom"))
+            reporter.subprocess_output("1", "default", subprocess.CompletedProcess(["cmd"], 0))
+
+        output = stdout.getvalue()
+        self.assertIn("[1/default] starting", output)
+        self.assertIn("unexpected worker error: boom", output)
+        self.assertEqual(cli.format_duration(3661), "01:01:01")
+        self.assertEqual(cli.format_duration(61), "01:01")
+        self.assertEqual(cli.subprocess_run_kwargs(reporter), {})
+
+        live_like = mock.Mock(captures_subprocess_output=True)
+        self.assertEqual(cli.subprocess_run_kwargs(live_like), {"capture_output": True, "text": True})
+        with mock.patch("sys.stdout.isatty", return_value=False):
+            self.assertIsInstance(cli.make_run_reporter("auto"), cli.PlainRunReporter)
+        with mock.patch("sys.stdout.isatty", return_value=True), mock.patch.dict("sys.modules", {"rich": None}):
+            self.assertIsInstance(cli.make_run_reporter("auto"), cli.PlainRunReporter)
+        self.assertIsInstance(cli.make_run_reporter("plain"), cli.PlainRunReporter)
+        self.assertIsInstance(cli.make_run_reporter("live"), cli.LiveRunReporter)
+
     def test_state_path_default_and_state_store_existing_file(self) -> None:
         manifest = self.load()
         del manifest["state"]

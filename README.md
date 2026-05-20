@@ -390,7 +390,7 @@ For `ocmo render`, `$worktree_path` and `$branch_name` are empty. `$source_works
 ### `ocmo run`
 
 ```powershell
-ocmo run <manifest> [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--dry-run] [--yes]
+ocmo run <manifest> [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--dry-run] [--yes]
 ```
 
 Examples:
@@ -401,6 +401,7 @@ ocmo run examples/report-rewrite.yaml --select WORK-001,WORK-002 --yes
 ocmo run examples/taxonomy-docs.yaml --select 41-48,93-96 --yes
 ocmo run examples/report-rewrite.yaml --concurrency 1 --yes
 ocmo run examples/report-rewrite.yaml --timeout-seconds 7200 --yes
+ocmo run examples/report-rewrite.yaml --ui live --yes
 ```
 
 `run` validates the manifest, selects items, renders prompts, and starts `opencode run` processes for each selected item. Items without `runs` start one process. Items with `runs.mode: sequential` start one process per step, in step order. It writes durable state to `state.path` and marks each item as it moves through the queue.
@@ -409,11 +410,16 @@ If `queue.autoWorktrees.enabled: true`, `run` also creates one native git worktr
 
 `run` asks for confirmation before starting work unless `--yes` or `-y` is provided.
 
+By default, `run` uses `--ui auto`. In an interactive terminal, `auto` uses a live Rich dashboard showing selected item count, current item status, active run step, per-item progress, runtime, and recent events. When stdout is redirected or `rich` is unavailable, `auto` falls back to plain line-oriented output. Use `--ui plain` for stable logs or CI output. Use `--ui live` to require the live terminal dashboard.
+
+In live UI mode, child `opencode run` output is captured so concurrent agents do not corrupt the dashboard. The dashboard reports that output was produced and shows recent output context as events instead of streaming each child process directly into the terminal.
+
 Options:
 
 - `--select <selector>`: overrides `selection.default`; accepts `all`, `pending`, `uncompleted`, exact IDs, comma-separated IDs, numeric ranges, or mixed ranges and IDs.
 - `--concurrency <count>`: overrides `queue.concurrency` for this invocation.
 - `--timeout-seconds <seconds>`: overrides manifest timeouts for every `opencode run` process in this invocation.
+- `--ui auto|live|plain`: controls non-dry-run terminal output; defaults to `auto`.
 - `--dry-run`: previews execution without starting work or writing state.
 - `--yes`, `-y`: skips the confirmation prompt for non-dry runs.
 

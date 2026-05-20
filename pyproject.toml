@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "OC Mass Operations queue runner for opencode"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["PyYAML>=6.0"]
+dependencies = ["PyYAML>=6.0", "rich>=13.0"]
 
 [project.optional-dependencies]
 test = ["coverage>=7.0"]
