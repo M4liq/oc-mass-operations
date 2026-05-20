@@ -949,6 +949,9 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         self.assertIn("unexpected worker error: boom", output)
         self.assertEqual(cli.format_duration(3661), "01:01:01")
         self.assertEqual(cli.format_duration(61), "01:01")
+        self.assertEqual(cli.item_runtime({"started": None}, 40), "-")
+        self.assertEqual(cli.item_runtime({"started": 10, "ended": None}, 40), "00:30")
+        self.assertEqual(cli.item_runtime({"started": 10, "ended": 20}, 40), "00:10")
         self.assertEqual(cli.subprocess_run_kwargs(reporter), {})
 
         live_like = mock.Mock(captures_subprocess_output=True)

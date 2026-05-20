@@ -544,13 +544,14 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
                     "progress": f"0/{len(item_runs(manifest, item))}",
                     "detail": str(item.get("title") or "-"),
                     "started": None,
+                    "ended": None,
                 }
             self.events.appendleft(f"selected {len(selected)} item(s), concurrency={concurrency}")
         self.refresh()
 
     def item(self, item_id: str, status: str, detail: str = "") -> None:
         with self.lock:
-            item = self.items.setdefault(item_id, {"progress": "0/1", "step": "-", "detail": "-", "started": None})
+            item = self.items.setdefault(item_id, {"progress": "0/1", "step": "-", "detail": "-", "started": None, "ended": None})
             item["status"] = status
             if status in {"worktree_removed", "cleanup"} and item.get("progress", "0/1").split("/", 1)[0] == item.get("progress", "0/1").split("/", 1)[-1]:
                 item["status"] = "completed"
@@ -559,11 +560,13 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
                 self.events.appendleft(f"{item_id}: {detail}")
             if status in {"running", "creating_worktree", "setup", "cleanup"} and item.get("started") is None:
                 item["started"] = time.monotonic()
+            if item["status"] in TERMINAL_STATUSES and item.get("ended") is None:
+                item["ended"] = time.monotonic()
         self.refresh()
 
     def run(self, item_id: str, run_id: str, status: str, detail: str = "") -> None:
         with self.lock:
-            item = self.items.setdefault(item_id, {"progress": "0/1", "step": "-", "detail": "-", "started": None})
+            item = self.items.setdefault(item_id, {"progress": "0/1", "step": "-", "detail": "-", "started": None, "ended": None})
             if item.get("started") is None:
                 item["started"] = time.monotonic()
             if status == "completed":
@@ -579,6 +582,8 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
                 current = item.get("runIndex", 0) + 1
                 item["runIndex"] = current
                 item["progress"] = f"{current}/{total}"
+            if status in TERMINAL_STATUSES and item.get("ended") is None:
+                item["ended"] = time.monotonic()
             self.events.appendleft(f"{item_id}/{run_id}: {run_detail}")
         self.refresh()
 
@@ -623,8 +628,7 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
             rows = list(self.items.items())
             events = list(self.events)
         for item_id, item in rows:
-            started = item.get("started")
-            runtime = format_duration(time.monotonic() - started) if started else "-"
+            runtime = item_runtime(item, time.monotonic())
             table.add_row(item_id, str(item.get("status", "-")), str(item.get("step", "-")), str(item.get("progress", "-")), runtime, str(item.get("detail", "-")))
         event_text = "\n".join(events) if events else "No events yet."
         return Group(title, summary, table, Panel(event_text, title="Recent Events"))
@@ -652,6 +656,14 @@ def format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def item_runtime(item: dict[str, Any], now: float) -> str:
+    started = item.get("started")
+    if started is None:
+        return "-"
+    ended = item.get("ended")
+    return format_duration((ended if ended is not None else now) - started)
 
 
 def make_run_reporter(ui: str) -> PlainRunReporter:
