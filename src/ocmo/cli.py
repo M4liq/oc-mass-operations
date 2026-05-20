@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="Run operation items from a manifest")
-    run_parser.add_argument("manifest", type=Path)
+    run_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory; defaults to manifest.yaml")
     run_parser.add_argument("--select", help="Selection: all, pending, uncompleted, IDs, or ranges")
     run_parser.add_argument("--concurrency", type=int, help="Override queue.concurrency")
     run_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each item")
@@ -76,7 +76,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
-            return run_manifest(RunOptions(args.manifest, args.select, args.concurrency, args.timeout_seconds, args.dry_run, args.yes, args.ui))
+            manifest_path = run_manifest_path(args.manifest)
+            return run_manifest(RunOptions(manifest_path, args.select, args.concurrency, args.timeout_seconds, args.dry_run, args.yes, args.ui))
         if args.command == "validate":
             manifest = load_manifest(args.manifest)
             validate_manifest(manifest, args.manifest)
@@ -1045,6 +1046,13 @@ def quote_arg(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./:\\=-]+", value):
         return value
     return '"' + value.replace('"', '\\"') + '"'
+
+
+def run_manifest_path(value: Path | None) -> Path:
+    path = value or Path("manifest.yaml")
+    if path.is_dir():
+        return path / "manifest.yaml"
+    return path
 
 
 def plan_manifest(args: argparse.Namespace) -> int:

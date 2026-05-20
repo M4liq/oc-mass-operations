@@ -588,6 +588,22 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertIn("valid:", output)
         self.assertIn("# item 1 / run default", output)
 
+    def test_main_run_defaults_manifest_and_accepts_directory(self) -> None:
+        manifest_dir = self.root / "operation"
+        manifest_dir.mkdir()
+
+        with mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
+            code = cli.main(["run", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_args.args[0].manifest_path, Path("manifest.yaml"))
+
+        with mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
+            code = cli.main(["run", str(manifest_dir), "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_args.args[0].manifest_path, manifest_dir / "manifest.yaml")
+
+        self.assertEqual(cli.run_manifest_path(self.manifest_path), self.manifest_path)
+
     def test_main_returns_two_for_ocmo_errors(self) -> None:
         stderr = io.StringIO()
 

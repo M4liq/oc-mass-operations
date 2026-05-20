@@ -347,8 +347,8 @@ Sequential run behavior:
 | --- | --- |
 | Check manifest validity | `ocmo validate <manifest>` |
 | Inspect rendered prompt text | `ocmo render <manifest> --select <selector>` |
-| Inspect the full execution plan | `ocmo run <manifest> --select <selector> --dry-run` |
-| Execute selected items | `ocmo run <manifest> --select <selector> --yes` |
+| Inspect the full execution plan | `ocmo run [manifest-or-directory] --select <selector> --dry-run` |
+| Execute selected items | `ocmo run [manifest-or-directory] --select <selector> --yes` |
 | Generate a manifest draft | `ocmo plan --from <prompt-file>` |
 
 ### `ocmo validate`
@@ -390,7 +390,7 @@ For `ocmo render`, `$worktree_path` and `$branch_name` are empty. `$source_works
 ### `ocmo run`
 
 ```powershell
-ocmo run <manifest> [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--dry-run] [--yes]
+ocmo run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--dry-run] [--yes]
 ```
 
 Examples:
@@ -402,7 +402,11 @@ ocmo run examples/taxonomy-docs.yaml --select 41-48,93-96 --yes
 ocmo run examples/report-rewrite.yaml --concurrency 1 --yes
 ocmo run examples/report-rewrite.yaml --timeout-seconds 7200 --yes
 ocmo run examples/report-rewrite.yaml --ui live --yes
+ocmo run --yes
+ocmo run .ocmo/business-taxonomy-prompt --yes
 ```
+
+If `manifest-or-directory` is omitted, `run` uses `manifest.yaml` in the current working directory. If `manifest-or-directory` is a directory, `run` uses `<directory>/manifest.yaml`. This matches the default folder layout produced by `ocmo plan`, so you can run from inside an operation folder with `ocmo run --yes` or from the workspace with `ocmo run .ocmo/<prompt-stem> --yes`.
 
 `run` validates the manifest, selects items, renders prompts, and starts `opencode run` processes for each selected item. Items without `runs` start one process. Items with `runs.mode: sequential` start one process per step, in step order. It writes durable state to `state.path` and marks each item as it moves through the queue.
 
@@ -428,7 +432,7 @@ Options:
 ### `ocmo run --dry-run`
 
 ```powershell
-ocmo run <manifest> --select <selector> --dry-run
+ocmo run [manifest-or-directory] --select <selector> --dry-run
 ```
 
 Example:
