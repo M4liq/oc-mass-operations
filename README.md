@@ -1,10 +1,35 @@
 # OC Mass Operations
 
-OC Mass Operations (`ocmo`) is a generic queue runner for repeatable `opencode` jobs.
+OC Mass Operations (`ocmo`) is a deterministic queue runner for repeatable `opencode` jobs.
 
-Use it when a large prompt naturally splits into many similar units of work, such as rewriting many reports, verifying many documentation files, or applying the same review process across many targets. Instead of opening many `opencode` UI tabs manually, `ocmo` reads a manifest, renders one prompt per item, and starts one `opencode run` process for each selected item.
+The project exists to replace non-deterministic agent orchestration with an explicit queue. Instead of asking one parent agent to decide what to do next, `ocmo` runs from:
 
-`ocmo` does not replace `opencode`. It schedules `opencode`. The actual reasoning, editing, reviewing, and tool use still happens inside each `opencode run` session.
+- one manifest
+- one explicit item list
+- one rendered prompt per item
+- one isolated `opencode run` process per scheduled item
+- one durable state file for resuming and auditing work
+
+Use `ocmo` when one large request naturally splits into many similar units of work, such as rewriting many reports, verifying many documentation files, or applying the same review process across many targets.
+
+`ocmo` does not replace `opencode`. It schedules `opencode`. The reasoning, editing, reviewing, and tool use still happens inside each `opencode run` session.
+
+## Contents
+
+- [Why This Exists](#why-this-exists)
+- [Install For Development](#install-for-development)
+- [Core Concepts](#core-concepts)
+- [Architecture](#architecture)
+- [Manifest Format](#manifest-format)
+- [Path Resolution](#path-resolution)
+- [Prompt Templates](#prompt-templates)
+- [Command Reference](#command-reference)
+- [Selection Rules](#selection-rules)
+- [Concurrency](#concurrency)
+- [Auto Worktrees](#auto-worktrees)
+- [Timeouts](#timeouts)
+- [Examples](#examples)
+- [State](#state)
 
 ## Why This Exists
 
@@ -12,12 +37,12 @@ Manual orchestration becomes painful when a task has dozens or hundreds of simil
 
 - You need to track which items are complete, failed, skipped, or still pending.
 - You want to resume interrupted work without re-running finished items.
-- You want one prompt template but different item payloads.
+- You want one prompt template with different item payloads.
 - You want a queue with a maximum number of concurrent `opencode` processes.
 - You want to dry-run generated prompts before spending model/tool time.
 - You want natural-language tasks converted into a structured manifest before execution.
 
-`ocmo` solves only the scheduling layer. It intentionally keeps workflow-specific details in the manifest and prompt template.
+`ocmo` solves only the scheduling layer. Workflow-specific details stay in the manifest and prompt template.
 
 ## Install For Development
 
@@ -25,7 +50,7 @@ Manual orchestration becomes painful when a task has dozens or hundreds of simil
 python -m pip install -e .
 ```
 
-If editable install is not available in your local environment, run directly from source:
+If editable install is not available locally, run directly from source:
 
 ```powershell
 $env:PYTHONPATH='src'
@@ -35,11 +60,11 @@ python -m ocmo --help
 ## Core Concepts
 
 - Operation: one mass workflow, backed by one manifest.
-- Operation item: one independently schedulable unit of work. `ocmo` starts one `opencode run` process per item.
-- Manifest: the YAML file that describes the operation, runner settings, queue settings, prompt template, state path, and items.
-- Prompt template: a text file rendered once per item and passed to `opencode run`.
-- Item payload: task-specific data for one item. `ocmo` does not interpret the payload beyond rendering it into the prompt.
-- Selection: a filter deciding which items to run, such as `uncompleted`, `all`, `ITEM-001`, or `1-10`.
+- Operation item: one independently schedulable unit of work.
+- Manifest: YAML describing the operation, runner settings, queue settings, prompt template, state path, and items.
+- Prompt template: text rendered once per item and passed to `opencode run`.
+- Item payload: task-specific data for one item. `ocmo` only renders it into the prompt.
+- Selection: the filter deciding which items to run, such as `uncompleted`, `all`, `ITEM-001`, or `1-10`.
 - State file: durable JSON state written by `ocmo run`, tracking item status and command metadata.
 
 ## Architecture
@@ -116,13 +141,13 @@ items:
 
 ### Manifest Sections
 
-`schema` identifies the manifest version. Current value is `ocmo/v1`.
+`schema` identifies the manifest version. Current value: `ocmo/v1`.
 
 `operation` describes the overall workflow:
 
 - `id`: stable operation identifier, used for state/log naming.
-- `kind`: currently informational. Keep it `generic` unless your team defines a stable taxonomy.
-- `description`: human-readable summary of the operation.
+- `kind`: informational. Keep it `generic` unless your team defines a stable taxonomy.
+- `description`: human-readable operation summary.
 - `workspace`: target repository or working directory for `opencode run`.
 
 `runner` describes how `opencode` is invoked:
@@ -135,7 +160,7 @@ items:
 - `timeoutSeconds`: optional maximum runtime for each operation item.
 - `dangerouslySkipPermissions`: passes `--dangerously-skip-permissions` when true.
 
-`selection` sets the default selector when `--select` is not passed. Recommended default is `uncompleted`.
+`selection` sets the default selector when `--select` is not passed. Recommended default: `uncompleted`.
 
 `queue` controls scheduling:
 
@@ -144,7 +169,7 @@ items:
 - `stopOnFailure`: reserved for stricter failure handling.
 - `autoWorktrees`: optional per-item git worktree creation and setup.
 
-`policy` is not interpreted deeply by `ocmo`, except for worktree safety rules: if `policy.worktree` is `single`, `ocmo` rejects `concurrency > 1` and rejects `queue.autoWorktrees.enabled: true`.
+`policy` is interpreted only for worktree safety rules. If `policy.worktree` is `single`, `ocmo` rejects `concurrency > 1` and rejects `queue.autoWorktrees.enabled: true`.
 
 `prompt.template` points to the per-item prompt template.
 
@@ -174,8 +199,6 @@ means:
 
 Prompt templates use Python `string.Template` variables.
 
-Example:
-
 ```text
 You are executing one operation item.
 
@@ -196,25 +219,23 @@ Work only on $item_id $item_title.
 
 Available variables:
 
-- `$operation_json`: JSON representation of `operation`
-- `$policy_json`: JSON representation of `policy`
-- `$item_json`: JSON representation of the current item
-- `$payload_json`: JSON representation of the current item payload
-- `$operation_id`: operation ID
-- `$operation_kind`: operation kind
-- `$workspace`: workspace value from the manifest
-- `$item_id`: current item ID
-- `$item_title`: current item title, if present
-- `$item_file`: current item file, if present
-- `$worktree_path`: created per-item worktree path when auto worktrees are enabled
-- `$source_workspace`: original `operation.workspace` path when auto worktrees are enabled
-- `$branch_name`: created per-item branch name when auto worktrees are enabled
+- `$operation_json`: JSON representation of `operation`.
+- `$policy_json`: JSON representation of `policy`.
+- `$item_json`: JSON representation of the current item.
+- `$payload_json`: JSON representation of the current item payload.
+- `$operation_id`: operation ID.
+- `$operation_kind`: operation kind.
+- `$workspace`: workspace value from the manifest.
+- `$item_id`: current item ID.
+- `$item_title`: current item title, if present.
+- `$item_file`: current item file, if present.
+- `$worktree_path`: created per-item worktree path when auto worktrees are enabled.
+- `$source_workspace`: original `operation.workspace` path when auto worktrees are enabled.
+- `$branch_name`: created per-item branch name when auto worktrees are enabled.
 
-The prompt template should tell `opencode` exactly how to complete one item and how to stop. The template should also make clear that the agent must not work on any other item.
+The prompt template should tell `opencode` exactly how to complete one item and how to stop. It should also make clear that the agent must not work on any other item.
 
 ## Command Reference
-
-Use these commands to validate manifests, inspect prompts, preview execution, run queues, and generate manifests from rough requests.
 
 | Task | Command |
 | --- | --- |
@@ -236,7 +257,7 @@ Example:
 ocmo validate examples/report-rewrite.yaml
 ```
 
-`validate` loads the manifest and checks the static configuration before any queue work starts. It verifies the manifest schema, workspace path, runner settings, queue settings, prompt template path, item IDs, concurrency policy, timeout configuration, and auto-worktree configuration.
+`validate` loads the manifest and checks static configuration before queue work starts. It verifies schema, workspace path, runner settings, queue settings, prompt template path, item IDs, concurrency policy, timeout configuration, and auto-worktree configuration.
 
 `validate` does not render prompts, start `opencode`, create worktrees, run setup or teardown commands, write state, edit files, or mark items.
 
@@ -256,23 +277,9 @@ ocmo render examples/report-rewrite.yaml --select WORK-001
 
 `render` is intentionally read-only. It does not start `opencode`, build or print the final `opencode run` command, create worktrees, run setup or teardown commands, write state, edit files, apply concurrency, apply timeouts, or mark items.
 
-Use `render` when you only need to inspect the text that will be sent to an agent. Use `ocmo run --dry-run` when you need to inspect the actual execution command, timeout, and auto-worktree path or branch.
+Use `render` when you only need to inspect the text sent to an agent. Use `ocmo run --dry-run` when you need to inspect the execution command, timeout, and auto-worktree path or branch.
 
-Templates are rendered with these variables:
-
-- `$operation_json`: JSON representation of `operation`.
-- `$policy_json`: JSON representation of `policy`.
-- `$item_json`: JSON representation of the selected item.
-- `$payload_json`: JSON representation of `item.payload`.
-- `$operation_id`: `operation.id`.
-- `$operation_kind`: `operation.kind`, defaulting to `generic`.
-- `$workspace`: `operation.workspace` as written in the manifest.
-- `$item_id`: selected item ID.
-- `$item_title`: selected item title, or an empty string.
-- `$item_file`: selected item file, or an empty string.
-- `$worktree_path`: generated worktree path when an execution context provides one; empty for `ocmo render`.
-- `$source_workspace`: source workspace path when an execution context provides one; otherwise `operation.workspace`.
-- `$branch_name`: generated branch name when an execution context provides one; empty for `ocmo render`.
+For `ocmo render`, `$worktree_path` and `$branch_name` are empty. `$source_workspace` falls back to `operation.workspace`.
 
 ### `ocmo run`
 
@@ -353,13 +360,13 @@ ocmo plan --from prompt.txt --out ocmo/example-operation.yaml --dry-run
 
 Selectors decide which manifest items are passed to the queue.
 
-- `all`: every item in the manifest
-- `pending`: items whose manifest status is `pending`
-- `uncompleted`: items whose manifest status is not `completed`, `done`, or `skipped`
-- `WORK-001`: one exact item ID
-- `WORK-001,WORK-002`: multiple exact item IDs
-- `41-48`: numeric range, matching item IDs `41`, `42`, ..., `48`
-- `41-48,93-96,141`: multiple numeric ranges and exact IDs
+- `all`: every item in the manifest.
+- `pending`: items whose manifest status is `pending`.
+- `uncompleted`: items whose manifest status is not `completed`, `done`, or `skipped`.
+- `WORK-001`: one exact item ID.
+- `WORK-001,WORK-002`: multiple exact item IDs.
+- `41-48`: numeric range, matching item IDs `41`, `42`, ..., `48`.
+- `41-48,93-96,141`: multiple numeric ranges and exact IDs.
 
 Selection matches manifest item IDs, not filenames. If you want numeric taxonomy selections, give the corresponding items numeric IDs in the manifest.
 
@@ -402,7 +409,7 @@ Parallel execution is appropriate only when items do not mutate shared state or 
 
 ## Auto Worktrees
 
-Set `queue.autoWorktrees.enabled: true` to have `ocmo` create one git worktree per selected item. Each selected item gets its own branch, setup commands, and isolated `opencode run --dir <worktree>` process.
+Set `queue.autoWorktrees.enabled: true` to create one git worktree per selected item. Each selected item gets its own branch, setup commands, and isolated `opencode run --dir <worktree>` process.
 
 ```yaml
 queue:
@@ -468,7 +475,7 @@ ocmo run examples/report-rewrite.yaml --timeout-seconds 7200 --yes
 
 `--dry-run` prints the effective timeout but does not start any process or write timeout state.
 
-## Example: Generic Report Rewrite Workflow
+## Examples
 
 See:
 
@@ -486,13 +493,13 @@ Run an `opencode` review pass after each rewrite.
 If review finds issues, run a fix pass and review again.
 ```
 
-All identifiers in the example are synthetic. They are intended to show the manifest shape without embedding real tracker IDs, employee names, reviewer handles, report names, or local filesystem paths.
+All identifiers in the example are synthetic. They show the manifest shape without embedding real tracker IDs, employee names, reviewer handles, report names, or local filesystem paths.
 
 Because the example uses a single git worktree, it sets `queue.concurrency: 1`.
 
-To run the same shape of workflow with isolated per-item worktrees, set `policy.worktree: per-item`, set `queue.autoWorktrees.enabled: true`, and increase `queue.concurrency` to the number of parallel items you want.
+To run the same workflow shape with isolated per-item worktrees, set `policy.worktree: per-item`, set `queue.autoWorktrees.enabled: true`, and increase `queue.concurrency` to the number of parallel items you want.
 
-## Example Item
+### Example Item
 
 ```yaml
 items:
