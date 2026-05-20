@@ -200,7 +200,10 @@ def normalize_scripts(value: Any, field: str) -> list[str]:
 
 
 def ensure_git_repository(path: Path) -> None:
-    completed = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=str(path), capture_output=True, text=True)
+    try:
+        completed = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=str(path), capture_output=True, text=True)
+    except OSError as exc:
+        raise OcmoError(f"could not inspect git repository: {exc}") from exc
     if completed.returncode != 0:
         raise OcmoError(f"operation.workspace must be inside a git repository when auto worktrees are enabled: {path}")
 
@@ -337,9 +340,18 @@ def run_manifest(options: RunOptions) -> int:
     state.ensure_operation(manifest)
     results: list[int] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(run_item, manifest, options.manifest_path, item, state, timeout_seconds, auto_worktrees) for item in selected]
+        futures = {
+            executor.submit(run_item, manifest, options.manifest_path, item, state, timeout_seconds, auto_worktrees): str(item["id"])
+            for item in selected
+        }
         for future in concurrent.futures.as_completed(futures):
-            results.append(future.result())
+            item_id = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": f"unexpected worker error: {exc}"})
+                print(f"[{item_id}] unexpected worker error: {exc}")
+                results.append(1)
 
     if any(code != 0 for code in results):
         return 1
@@ -348,14 +360,20 @@ def run_manifest(options: RunOptions) -> int:
 
 def run_item(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], state: "StateStore", timeout_seconds: int | None, auto_worktrees: dict[str, Any]) -> int:
     item_id = str(item["id"])
-    execution = worktree_execution(manifest, manifest_path, item) if auto_worktrees["enabled"] else {}
-    run_dir = Path(execution["worktreePath"]) if execution else resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])
-    if execution:
-        worktree_code = prepare_worktree(manifest, manifest_path, item, execution, auto_worktrees, state)
-        if worktree_code != 0:
-            return worktree_code
-    prompt_text = render_prompt(manifest, item, manifest_path, execution)
-    command = build_command(manifest, manifest_path, prompt_text, run_dir)
+    execution: dict[str, Any] = {}
+    try:
+        execution = worktree_execution(manifest, manifest_path, item) if auto_worktrees["enabled"] else {}
+        run_dir = Path(execution["worktreePath"]) if execution else resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])
+        if execution:
+            worktree_code = prepare_worktree(manifest, manifest_path, item, execution, auto_worktrees, state)
+            if worktree_code != 0:
+                return worktree_code
+        prompt_text = render_prompt(manifest, item, manifest_path, execution)
+        command = build_command(manifest, manifest_path, prompt_text, run_dir)
+    except (OSError, OcmoError) as exc:
+        state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
+        print(f"[{item_id}] failed before start: {exc}")
+        return 1
     state.mark(item_id, "running", {"startedAt": utc_now(), "command": command_without_prompt(command), "timeoutSeconds": timeout_seconds, **execution})
     print(f"[{item_id}] starting")
     try:
@@ -365,13 +383,22 @@ def run_item(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any]
         print(f"[{item_id}] timed out after {timeout_seconds} seconds")
         cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
         return 124
+    except OSError as exc:
+        state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
+        print(f"[{item_id}] failed to start: {exc}")
+        cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
+        return cleanup_code or 1
     if completed.returncode == 0:
         state.mark(item_id, "completed", {"completedAt": utc_now(), "exitCode": 0})
         print(f"[{item_id}] completed")
     else:
         state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": completed.returncode})
         print(f"[{item_id}] failed: exit {completed.returncode}")
-    cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=completed.returncode == 0)
+    cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=completed.returncode == 0)
+    if cleanup_code != 0 and completed.returncode == 0:
+        state.mark(item_id, "cleanup_failed", {"completedAt": utc_now(), "exitCode": cleanup_code, **execution})
+        print(f"[{item_id}] cleanup failed: exit {cleanup_code}")
+        return cleanup_code
     return completed.returncode
 
 
@@ -417,9 +444,19 @@ def prepare_worktree(manifest: dict[str, Any], manifest_path: Path, item: dict[s
         state.mark(item_id, "worktree_failed", {"completedAt": utc_now(), "exitCode": 1, "error": f"worktree path already exists: {worktree_path}", **execution})
         print(f"[{item_id}] worktree path already exists: {worktree_path}")
         return 1
-    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        state.mark(item_id, "worktree_failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
+        print(f"[{item_id}] could not create worktree parent: {exc}")
+        return 1
     command = ["git", "worktree", "add", "-b", branch_name, str(worktree_path), base_branch]
-    completed = subprocess.run(command, cwd=str(source_workspace))
+    try:
+        completed = subprocess.run(command, cwd=str(source_workspace))
+    except OSError as exc:
+        state.mark(item_id, "worktree_failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
+        print(f"[{item_id}] worktree creation failed: {exc}")
+        return 1
     if completed.returncode != 0:
         state.mark(item_id, "worktree_failed", {"completedAt": utc_now(), "exitCode": completed.returncode, **execution})
         print(f"[{item_id}] worktree creation failed: exit {completed.returncode}")
@@ -428,38 +465,50 @@ def prepare_worktree(manifest: dict[str, Any], manifest_path: Path, item: dict[s
     setup_code = run_scripts("setup", normalize_scripts(config.get("setup"), "queue.autoWorktrees.setup"), worktree_path, execution, item_id)
     if setup_code != 0:
         state.mark(item_id, "setup_failed", {"completedAt": utc_now(), "exitCode": setup_code, **execution})
-        cleanup_worktree(manifest, manifest_path, item, execution, config, state, success=False)
+        cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, config, state, success=False)
+        if cleanup_code != 0:
+            return cleanup_code
         return setup_code
     if config.get("setup"):
         state.mark(item_id, "setup_completed", {"setupCompletedAt": utc_now(), **execution})
     return 0
 
 
-def cleanup_worktree(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], execution: dict[str, Any], config: dict[str, Any], state: "StateStore", success: bool) -> None:
+def cleanup_worktree(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], execution: dict[str, Any], config: dict[str, Any], state: "StateStore", success: bool) -> int:
     if not execution:
-        return
+        return 0
     cleanup = config.get("cleanup", "never")
     should_cleanup = cleanup == "always" or (cleanup == "onSuccess" and success)
     if not should_cleanup:
-        return
+        return 0
     item_id = str(item["id"])
     worktree_path = Path(execution["worktreePath"])
     teardown_code = run_scripts("teardown", normalize_scripts(config.get("teardown"), "queue.autoWorktrees.teardown"), worktree_path, execution, item_id)
     if teardown_code != 0:
         state.patch(item_id, {"teardownStatus": "failed", "teardownCompletedAt": utc_now(), "teardownExitCode": teardown_code, **execution})
-        return
+        return teardown_code
     source_workspace = resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])
-    completed = subprocess.run(["git", "worktree", "remove", str(worktree_path)], cwd=str(source_workspace))
+    try:
+        completed = subprocess.run(["git", "worktree", "remove", str(worktree_path)], cwd=str(source_workspace))
+    except OSError as exc:
+        state.patch(item_id, {"worktreeStatus": "remove_failed", "worktreeRemoveExitCode": 1, "worktreeRemoveError": str(exc), **execution})
+        return 1
     if completed.returncode == 0:
         state.patch(item_id, {"worktreeStatus": "removed", "worktreeRemovedAt": utc_now(), **execution})
+        return 0
     else:
         state.patch(item_id, {"worktreeStatus": "remove_failed", "worktreeRemoveExitCode": completed.returncode, **execution})
+        return completed.returncode
 
 
 def run_scripts(kind: str, scripts: list[str], cwd: Path, execution: dict[str, Any], item_id: str) -> int:
     for script in scripts:
         print(f"[{item_id}] {kind}: {script}")
-        completed = subprocess.run(script, cwd=str(cwd), shell=True, env=worktree_env(execution))
+        try:
+            completed = subprocess.run(script, cwd=str(cwd), shell=True, env=worktree_env(execution))
+        except OSError as exc:
+            print(f"[{item_id}] {kind} failed: {exc}")
+            return 1
         if completed.returncode != 0:
             print(f"[{item_id}] {kind} failed: exit {completed.returncode}")
             return completed.returncode
@@ -478,7 +527,10 @@ def worktree_env(execution: dict[str, Any]) -> dict[str, str]:
 
 
 def current_branch(path: Path) -> str:
-    completed = subprocess.run(["git", "branch", "--show-current"], cwd=str(path), capture_output=True, text=True)
+    try:
+        completed = subprocess.run(["git", "branch", "--show-current"], cwd=str(path), capture_output=True, text=True)
+    except OSError as exc:
+        raise OcmoError(f"could not detect current git branch: {exc}") from exc
     if completed.returncode != 0 or not completed.stdout.strip():
         raise OcmoError("queue.autoWorktrees.baseBranch is required when current git branch cannot be detected")
     return completed.stdout.strip()

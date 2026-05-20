@@ -427,7 +427,7 @@ policy:
 - `enabled`: when true, creates one git worktree per selected item.
 - `root`: directory for generated worktrees. Relative paths are resolved under `operation.workspace`.
 - `baseBranch`: branch or commit used as the worktree base. Defaults to `policy.baseBranch`, then the current branch.
-- `branchPattern`: branch name template. Supports `{operation_id}`, `{item_id}`, and `{item_slug}`.
+- `branchPattern`: branch name template. Supports `{operation_id}`, `{item_id}`, and `{item_slug}`. These values are slugified before interpolation so generated branch names stay filesystem- and git-friendly.
 - `setup`: shell command or list of shell commands run inside the worktree after creation.
 - `teardown`: shell command or list of shell commands run before cleanup removes a worktree.
 - `cleanup`: `never`, `onSuccess`, or `always`. The default is `never` so completed work remains available for review.
@@ -442,6 +442,8 @@ Setup and teardown commands receive these environment variables:
 - `PASEO_BRANCH_NAME`: alias for the generated branch name.
 
 `ocmo` uses native `git worktree` commands. It does not require the Paseo daemon and does not start Paseo services or terminals. If the target worktree path already exists, `ocmo` fails that item instead of reusing the directory.
+
+If cleanup is requested with `cleanup: onSuccess` or `cleanup: always` and teardown or worktree removal fails after a successful item run, `ocmo` marks the item as `cleanup_failed` and returns a non-zero exit code.
 
 `--dry-run` prints the planned worktree path, branch, timeout, command, and prompt. It does not create a worktree, run setup, start `opencode`, write state, or clean anything up.
 
@@ -521,11 +523,3 @@ State is separate from the manifest. The manifest defines intended work. The sta
 - worktree path and branch metadata when auto worktrees are enabled
 
 Failed items remain selectable through `uncompleted` unless you mark them completed or skipped in the manifest.
-
-## Safety Notes
-
-- Always run `ocmo run --dry-run` before starting a large operation.
-- Keep `concurrency: 1` for single-worktree git workflows.
-- Prefer anonymized example data in committed manifests and README snippets.
-- Put secrets, credentials, real customer data, and private source exports outside the repository.
-- Use `ocmo plan` for structure, then review the generated manifest before running it.
