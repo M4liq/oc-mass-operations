@@ -73,6 +73,7 @@ runner:
   agent: build
   model: openai/gpt-5.5
   attach: null
+  timeoutSeconds: 14400
   dangerouslySkipPermissions: false
 
 selection:
@@ -123,6 +124,7 @@ items:
 - `agent`: `opencode` agent name, for example `build` or `plan`.
 - `model`: model identifier passed to `opencode`.
 - `attach`: optional `opencode serve` URL.
+- `timeoutSeconds`: optional maximum runtime for each operation item.
 - `dangerouslySkipPermissions`: passes `--dangerously-skip-permissions` when true.
 
 `selection` sets the default selector when `--select` is not passed. Recommended default is `uncompleted`.
@@ -218,6 +220,8 @@ Dry-run generated `opencode` commands and prompts:
 ocmo run examples/report-rewrite.yaml --select WORK-001 --dry-run
 ```
 
+`--dry-run` validates the manifest, applies the selection, renders the prompt for every selected item, and prints the `opencode run` command that would be launched. It does not start `opencode`, write state, edit files, or mark items as completed or failed.
+
 Run all uncompleted items:
 
 ```powershell
@@ -240,6 +244,12 @@ Override concurrency:
 
 ```powershell
 ocmo run examples/report-rewrite.yaml --concurrency 1 --yes
+```
+
+Override the per-item timeout:
+
+```powershell
+ocmo run examples/report-rewrite.yaml --timeout-seconds 7200 --yes
 ```
 
 ## Selection Rules
@@ -292,6 +302,27 @@ queue:
 If you pass `--concurrency 2` with `policy.worktree: single`, `ocmo` fails before starting work.
 
 Parallel execution is appropriate only when items do not mutate shared state or when each item has a separate workspace/worktree.
+
+## Timeouts
+
+Use `runner.timeoutSeconds` to prevent stale or runaway `opencode run` processes.
+
+```yaml
+runner:
+  command: opencode
+  mode: run
+  timeoutSeconds: 14400
+```
+
+The timeout applies per operation item. If an item exceeds the timeout, `ocmo` stops waiting for that `opencode run`, marks the item as `timed_out` in the state file, prints a timeout message, and returns a non-zero process exit code for the run.
+
+You can override the manifest value at runtime:
+
+```powershell
+ocmo run examples/report-rewrite.yaml --timeout-seconds 7200 --yes
+```
+
+`--dry-run` prints the effective timeout but does not start any process or write timeout state.
 
 ## Planning From An Unstructured Request
 

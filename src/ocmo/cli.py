@@ -28,6 +28,7 @@ class RunOptions:
     manifest_path: Path
     select: str | None
     concurrency: int | None
+    timeout_seconds: int | None
     dry_run: bool
     yes: bool
 
@@ -40,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("manifest", type=Path)
     run_parser.add_argument("--select", help="Selection: all, pending, uncompleted, IDs, or ranges")
     run_parser.add_argument("--concurrency", type=int, help="Override queue.concurrency")
+    run_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each item")
     run_parser.add_argument("--dry-run", action="store_true", help="Print commands/prompts without running opencode")
     run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for non-dry runs")
 
@@ -61,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
-            return run_manifest(RunOptions(args.manifest, args.select, args.concurrency, args.dry_run, args.yes))
+            return run_manifest(RunOptions(args.manifest, args.select, args.concurrency, args.timeout_seconds, args.dry_run, args.yes))
         if args.command == "validate":
             manifest = load_manifest(args.manifest)
             validate_manifest(manifest, args.manifest)
@@ -106,6 +108,9 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> None:
         raise OcmoError(f"operation.workspace does not exist: {workspace}")
     runner = require_mapping(manifest, "runner")
     require_string(runner, "command")
+    timeout_seconds = runner.get("timeoutSeconds")
+    if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or timeout_seconds < 1):
+        raise OcmoError("runner.timeoutSeconds must be a positive integer")
     queue = require_mapping(manifest, "queue")
     concurrency = queue.get("concurrency", 1)
     if not isinstance(concurrency, int) or concurrency < 1:
@@ -230,9 +235,12 @@ def run_manifest(options: RunOptions) -> int:
     manifest = load_manifest(options.manifest_path)
     validate_manifest(manifest, options.manifest_path)
     selected = select_items(manifest, options.select)
-    concurrency = options.concurrency or manifest.get("queue", {}).get("concurrency", 1)
+    concurrency = options.concurrency if options.concurrency is not None else manifest.get("queue", {}).get("concurrency", 1)
+    timeout_seconds = options.timeout_seconds if options.timeout_seconds is not None else manifest.get("runner", {}).get("timeoutSeconds")
     if concurrency < 1:
         raise OcmoError("concurrency must be a positive integer")
+    if timeout_seconds is not None and timeout_seconds < 1:
+        raise OcmoError("timeout must be a positive integer")
     if manifest.get("policy", {}).get("worktree") == "single" and concurrency > 1:
         raise OcmoError("policy.worktree=single cannot run with concurrency > 1")
     if not selected:
@@ -245,13 +253,16 @@ def run_manifest(options: RunOptions) -> int:
             command = build_command(manifest, options.manifest_path, prompt_text)
             print(f"# item {item['id']}")
             print(format_command(command))
+            if timeout_seconds:
+                print(f"# timeout: {timeout_seconds} seconds")
             print("\n--- prompt ---\n")
             print(prompt_text)
             print("\n" + "=" * 80 + "\n")
         return 0
 
     if not options.yes:
-        print(f"About to run {len(selected)} item(s) with concurrency={concurrency}.")
+        timeout_text = f", timeout={timeout_seconds}s" if timeout_seconds else ""
+        print(f"About to run {len(selected)} item(s) with concurrency={concurrency}{timeout_text}.")
         answer = input("Continue? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled.")
@@ -261,7 +272,7 @@ def run_manifest(options: RunOptions) -> int:
     state.ensure_operation(manifest)
     results: list[int] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(run_item, manifest, options.manifest_path, item, state) for item in selected]
+        futures = [executor.submit(run_item, manifest, options.manifest_path, item, state, timeout_seconds) for item in selected]
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result())
 
@@ -270,13 +281,18 @@ def run_manifest(options: RunOptions) -> int:
     return 0
 
 
-def run_item(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], state: "StateStore") -> int:
+def run_item(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], state: "StateStore", timeout_seconds: int | None) -> int:
     item_id = str(item["id"])
     prompt_text = render_prompt(manifest, item, manifest_path)
     command = build_command(manifest, manifest_path, prompt_text)
-    state.mark(item_id, "running", {"startedAt": utc_now(), "command": command_without_prompt(command)})
+    state.mark(item_id, "running", {"startedAt": utc_now(), "command": command_without_prompt(command), "timeoutSeconds": timeout_seconds})
     print(f"[{item_id}] starting")
-    completed = subprocess.run(command, cwd=str(resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])))
+    try:
+        completed = subprocess.run(command, cwd=str(resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])), timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        state.mark(item_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": timeout_seconds})
+        print(f"[{item_id}] timed out after {timeout_seconds} seconds")
+        return 124
     if completed.returncode == 0:
         state.mark(item_id, "completed", {"completedAt": utc_now(), "exitCode": 0})
         print(f"[{item_id}] completed")

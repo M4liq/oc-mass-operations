@@ -12,6 +12,7 @@ runner:
   agent: build
   model: openai/gpt-5.5
   attach: null
+  timeoutSeconds: 14400
   dangerouslySkipPermissions: false
 
 selection:
