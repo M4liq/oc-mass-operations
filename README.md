@@ -124,6 +124,8 @@ policy:
 
 prompt:
   template: .ocmo/prompts/example-workflow.md
+  skills:
+    - code-review
 
 state:
   path: .ocmo/state/example-operation.json
@@ -183,7 +185,7 @@ items:
 
 `policy` is interpreted only for worktree safety rules. If `policy.worktree` is `single`, `ocmo` rejects `concurrency > 1` and rejects `queue.autoWorktrees.enabled: true`.
 
-`prompt.template` points to the per-item prompt template.
+`prompt.template` points to the per-item prompt template. Optional `prompt.skills` is a list of opencode skill names that `ocmo` turns into deterministic slash-command instructions at the top of each rendered prompt.
 
 `state.path` points to the durable state JSON file.
 
@@ -248,11 +250,53 @@ Available variables:
 - `$run_index`: one-based index of the current run within the item.
 - `$run_count`: number of runs for the current item.
 - `$run_mode`: run mode. Currently `sequential`.
+- `$skill_instructions`: deterministic instruction block for configured skills, if any.
+- `$skill_commands`: configured skills as slash commands, one per line, for example `/code-review`.
+- `$skill_names`: configured skill names without leading slashes, comma-separated.
 - `$worktree_path`: created per-item worktree path when auto worktrees are enabled.
 - `$source_workspace`: original `operation.workspace` path when auto worktrees are enabled.
 - `$branch_name`: created per-item branch name when auto worktrees are enabled.
 
 The prompt template should tell `opencode` exactly how to complete one item and how to stop. It should also make clear that the agent must not work on any other item.
+
+### Prompt Skills
+
+Use `prompt.skills` when every rendered prompt must require specific opencode skills:
+
+```yaml
+prompt:
+  template: prompts/example-workflow.md
+  skills:
+    - code-review
+    - repository-audit
+```
+
+`ocmo` prepends this deterministic block to the rendered prompt:
+
+```text
+You must use the following opencode skills before doing this task, in order:
+- /code-review
+- /repository-audit
+```
+
+Skill names can be written with or without the leading slash in the manifest. `ocmo` normalizes them to slash commands in the rendered prompt.
+
+Run-specific prompt settings can override skills for one sequential step:
+
+```yaml
+items:
+  - id: ITEM-001
+    runs:
+      mode: sequential
+      steps:
+        - id: review
+          agent: review
+          prompt:
+            skills:
+              - code-review
+```
+
+If a run-specific `prompt.skills` is present, it replaces the top-level `prompt.skills` for that run. If `prompt.template` is omitted in a run-specific prompt, the top-level template is reused.
 
 ## Multi-Run Items
 
@@ -282,7 +326,7 @@ items:
             template: prompts/multi-agent-fix.md
 ```
 
-Each step inherits top-level `runner` fields and can override `agent`, `model`, `attach`, `title`, `timeoutSeconds`, `dangerouslySkipPermissions`, or other runner fields used by `ocmo`. Each step can also set `prompt.template`; if omitted, it uses the top-level `prompt.template`.
+Each step inherits top-level `runner` fields and can override `agent`, `model`, `attach`, `title`, `timeoutSeconds`, `dangerouslySkipPermissions`, or other runner fields used by `ocmo`. Each step can also set `prompt.template` or `prompt.skills`; if `prompt.template` is omitted, it uses the top-level `prompt.template`.
 
 Sequential run behavior:
 

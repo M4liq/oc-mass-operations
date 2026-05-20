@@ -133,6 +133,7 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> None:
     template_path = resolve_manifest_path(manifest_path, template)
     if not template_path.exists():
         raise OcmoError(f"prompt template not found: {template_path}")
+    normalize_skills(prompt.get("skills"), "prompt.skills")
     items = manifest.get("items")
     if not isinstance(items, list) or not items:
         raise OcmoError("items must be a non-empty list")
@@ -180,10 +181,14 @@ def validate_item_runs(manifest: dict[str, Any], item: dict[str, Any], manifest_
         if prompt is not None:
             if not isinstance(prompt, dict):
                 raise OcmoError(f"items[{item_index}].runs.steps[{step_index}].prompt must be a mapping")
-            template = require_string(prompt, "template")
-            template_path = resolve_manifest_path(manifest_path, template)
-            if not template_path.exists():
-                raise OcmoError(f"prompt template not found: {template_path}")
+            template = prompt.get("template")
+            if template is not None:
+                if not isinstance(template, str) or not template.strip():
+                    raise OcmoError("template must be a non-empty string")
+                template_path = resolve_manifest_path(manifest_path, template)
+                if not template_path.exists():
+                    raise OcmoError(f"prompt template not found: {template_path}")
+            normalize_skills(prompt.get("skills"), f"items[{item_index}].runs.steps[{step_index}].prompt.skills")
 
 
 def item_runs(manifest: dict[str, Any], item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -210,6 +215,29 @@ def effective_prompt(manifest: dict[str, Any], run: dict[str, Any]) -> dict[str,
     prompt = dict(manifest.get("prompt", {}))
     prompt.update(run.get("prompt", {}) or {})
     return prompt
+
+
+def normalize_skills(value: Any, field: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise OcmoError(f"{field} must be a list of skill names")
+    skills = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, str) or not item.strip():
+            raise OcmoError(f"{field}[{index}] must be a non-empty string")
+        skill = item.strip().lstrip("/")
+        if not skill or re.search(r"\s", skill):
+            raise OcmoError(f"{field}[{index}] must be a skill name without whitespace")
+        skills.append(skill)
+    return skills
+
+
+def skill_instructions(skills: list[str]) -> str:
+    if not skills:
+        return ""
+    commands = "\n".join(f"- /{skill}" for skill in skills)
+    return f"You must use the following opencode skills before doing this task, in order:\n{commands}"
 
 
 def require_mapping(parent: dict[str, Any], key: str) -> dict[str, Any]:
@@ -327,6 +355,8 @@ def render_prompt(
     runs = runs or [run]
     runner = effective_runner(manifest, run)
     prompt = effective_prompt(manifest, run)
+    skills = normalize_skills(prompt.get("skills"), "prompt.skills")
+    rendered_skill_instructions = skill_instructions(skills)
     template_path = resolve_manifest_path(manifest_path, prompt["template"])
     template = Template(template_path.read_text(encoding="utf-8"))
     operation = manifest.get("operation", {})
@@ -352,8 +382,14 @@ def render_prompt(
         "run_index": str(run.get("index", "")),
         "run_count": str(len(runs)),
         "run_mode": str(run.get("mode", "sequential")),
+        "skill_instructions": rendered_skill_instructions,
+        "skill_commands": "\n".join(f"/{skill}" for skill in skills),
+        "skill_names": ", ".join(skills),
     }
-    return template.safe_substitute(context)
+    rendered = template.safe_substitute(context)
+    if rendered_skill_instructions:
+        return f"{rendered_skill_instructions}\n\n{rendered}"
+    return rendered
 
 
 def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str, run_dir: Path | None = None, runner: dict[str, Any] | None = None) -> list[str]:
@@ -769,6 +805,8 @@ Rules:
 - If one item needs multiple agents or prompt phases, use items[].runs.mode: sequential and put runs under items[].runs.steps.
 - Use per-run prompt.template values when different agents need different instructions.
 - Use the top-level prompt.template only when every run can share the same template.
+- Use prompt.skills when a run must require opencode skills; list skill names without prose, for example [code-review].
+- Use per-run prompt.skills when different sequential runs need different required skills.
 - Do not use runs.mode: parallel; it is reserved for future support.
 - If a required value is ambiguous, set it to NEEDS_DECISION instead of guessing.
 - Refer to read-only source files only as evidence; do not modify them.

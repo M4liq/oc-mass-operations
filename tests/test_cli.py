@@ -95,11 +95,12 @@ class ValidationTests(OcmoTestCase):
         review_prompt = self.root / "review.md"
         review_prompt.write_text("Review $run_id", encoding="utf-8")
         manifest = self.load()
+        manifest["prompt"]["skills"] = ["code-review"]
         manifest["items"][0]["runs"] = {
             "mode": "sequential",
             "steps": [
                 {"id": "implement", "agent": "build", "prompt": {"template": str(self.prompt)}},
-                {"id": "review", "agent": "review", "timeoutSeconds": 5, "prompt": {"template": str(review_prompt)}},
+                {"id": "review", "agent": "review", "timeoutSeconds": 5, "prompt": {"template": str(review_prompt), "skills": ["/review-skill"]}},
             ],
         }
 
@@ -155,7 +156,11 @@ class ValidationTests(OcmoTestCase):
             ({"runs": {"mode": "sequential", "steps": [{}]}}, "id is required"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "timeoutSeconds": 0}]}}, "timeoutSeconds"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "prompt": []}]}}, "prompt must be a mapping"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "prompt": {"template": ""}}]}}, "template must be a non-empty string"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "prompt": {"template": str(self.root / "missing.md")}}]}}, "prompt template not found"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "prompt": {"skills": "review"}}]}}, "prompt.skills must be a list"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "prompt": {"skills": [""]}}]}}, r"prompt.skills\[1\] must be a non-empty string"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "prompt": {"skills": ["bad skill"]}}]}}, r"prompt.skills\[1\] must be a skill name"),
         ]
         for patch, message in cases:
             manifest = self.load()
@@ -253,6 +258,27 @@ class SelectionAndRenderingTests(OcmoTestCase):
         self.assertIn("agent review model review-model", rendered)
         self.assertIn("C:/worktree", rendered)
         self.assertIn('"name": "Alpha"', rendered)
+
+    def test_render_prompt_prepends_deterministic_skill_instructions(self) -> None:
+        self.prompt.write_text("Skills: $skill_names\nCommands:\n$skill_commands\n$item_id", encoding="utf-8")
+        manifest = self.load()
+        manifest["prompt"]["skills"] = ["analysis", "/code-review"]
+
+        rendered = cli.render_prompt(manifest, manifest["items"][0], self.manifest_path)
+
+        self.assertTrue(rendered.startswith("You must use the following opencode skills before doing this task, in order:\n- /analysis\n- /code-review"))
+        self.assertIn("Skills: analysis, code-review", rendered)
+        self.assertIn("/analysis\n/code-review", rendered)
+
+    def test_run_prompt_skills_override_top_level_skills_without_template_override(self) -> None:
+        manifest = self.load()
+        manifest["prompt"]["skills"] = ["implement"]
+        run = {"id": "review", "index": 1, "mode": "sequential", "prompt": {"skills": ["review"]}}
+
+        rendered = cli.render_prompt(manifest, manifest["items"][0], self.manifest_path, run=run)
+
+        self.assertIn("- /review", rendered)
+        self.assertNotIn("- /implement", rendered)
 
     def test_build_command_and_format_command_hide_prompt(self) -> None:
         manifest = self.load()
