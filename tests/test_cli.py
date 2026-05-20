@@ -69,6 +69,29 @@ items:
     def load(self, extra: str = "") -> dict:
         return cli.load_manifest(self.write_manifest(extra))
 
+    def planned_manifest_text(self, template: str = ".ocmo/prompts/generated.md") -> str:
+        return f"""schema: ocmo/v1
+operation:
+  id: planned-op
+  kind: generic
+  workspace: {self.workspace.as_posix()}
+runner:
+  command: opencode
+  mode: run
+queue:
+  concurrency: 1
+policy:
+  worktree: single
+prompt:
+  template: {template}
+state:
+  path: .ocmo/state/planned-op.json
+items:
+  - id: ITEM-001
+    status: pending
+    payload: {{}}
+"""
+
 
 class ValidationTests(OcmoTestCase):
     def test_valid_manifest_passes(self) -> None:
@@ -886,6 +909,14 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         with self.assertRaisesRegex(cli.OcmoError, "prompt file not found"):
             cli.plan_manifest(mock.Mock(from_file=missing, read_files=[], out=self.root / "out.yaml", model=None, agent="plan", dry_run=True))
 
+        prompt_for_bad_attempts = self.root / "request-bad-attempts.txt"
+        prompt_for_bad_attempts.write_text("Request", encoding="utf-8")
+        with self.assertRaisesRegex(cli.OcmoError, "max-attempts"):
+            cli.plan_manifest(mock.Mock(from_file=prompt_for_bad_attempts, read_files=[], out=self.root / "out.yaml", model=None, agent="plan", dry_run=True, max_attempts=0))
+
+        with self.assertRaisesRegex(cli.OcmoError, "YAML mapping"):
+            cli.load_manifest_text("- not\n- mapping\n")
+
         prompt_for_missing_read = self.root / "request-missing-read.txt"
         prompt_for_missing_read.write_text("Request", encoding="utf-8")
         with self.assertRaisesRegex(cli.OcmoError, "read-only source file not found"):
@@ -896,13 +927,13 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         read_file = self.root / "read.md"
         read_file.write_text("Read", encoding="utf-8")
         out = self.root / "out.yaml"
-        completed = subprocess.CompletedProcess(["opencode"], 0, stdout="schema: ocmo/v1\n", stderr="")
+        completed = subprocess.CompletedProcess(["opencode"], 0, stdout=self.planned_manifest_text(), stderr="")
         with mock.patch("ocmo.cli.subprocess.run", return_value=completed) as run:
             code = cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[read_file], out=out, model="m", agent="plan", dry_run=False))
         self.assertEqual(code, 0)
         self.assertIn("--file", run.call_args.args[0])
         self.assertIn(str(read_file), run.call_args.args[0])
-        self.assertEqual(out.read_text(encoding="utf-8"), "schema: ocmo/v1\n")
+        self.assertEqual(out.read_text(encoding="utf-8"), self.planned_manifest_text())
 
         failed = subprocess.CompletedProcess(["opencode"], 3, stdout="out", stderr="err")
         stdout = io.StringIO()
@@ -911,7 +942,123 @@ class EdgeCaseCoverageTests(OcmoTestCase):
             code = cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[], out=out, model=None, agent="plan", dry_run=False))
         self.assertEqual(code, 3)
         self.assertEqual(stdout.getvalue(), "out")
-        self.assertEqual(stderr.getvalue(), "err")
+        self.assertTrue(stderr.getvalue().endswith("err"))
+
+    def test_plan_manifest_retries_with_validation_feedback(self) -> None:
+        prompt = self.root / "request.txt"
+        prompt.write_text("Request", encoding="utf-8")
+        out = self.root / "planned.yaml"
+        calls = []
+
+        def fake_plan_run(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess(command, 0, stdout="apiVersion: ocmo/v1\n", stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout=self.planned_manifest_text(), stderr="")
+
+        stderr = io.StringIO()
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_plan_run), contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[], out=out, model=None, agent="plan", dry_run=False, max_attempts=2))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("planner output invalid on attempt 1", stderr.getvalue())
+        self.assertIn("Validation error", calls[1][-1])
+        self.assertIn("manifest schema must be ocmo/v1", calls[1][-1])
+        self.assertEqual(out.read_text(encoding="utf-8"), self.planned_manifest_text())
+
+    def test_plan_manifest_uses_workspace_for_dir_and_prompt(self) -> None:
+        prompt = self.root / "request.txt"
+        prompt.write_text("Request", encoding="utf-8")
+        out = self.root / "planned.yaml"
+        workspace = self.root / "target"
+        workspace.mkdir()
+        captured = {}
+
+        def fake_plan_run(command, **kwargs):
+            captured["command"] = command
+            return subprocess.CompletedProcess(command, 0, stdout=self.planned_manifest_text(), stderr="")
+
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_plan_run), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[], out=out, model=None, agent="plan", dry_run=False, max_attempts=1, workspace=workspace, interactive=False))
+
+        self.assertEqual(code, 0)
+        self.assertIn("--dir", captured["command"])
+        self.assertIn(str(workspace.resolve()), captured["command"])
+        self.assertIn(f"operation.workspace must be exactly: {workspace.resolve()}", captured["command"][-1])
+
+    def test_plan_manifest_interactive_extracts_marked_yaml(self) -> None:
+        prompt = self.root / "request.txt"
+        prompt.write_text("Request", encoding="utf-8")
+        out = self.root / "planned.yaml"
+        marked = f"Question before final YAML\n{cli.MANIFEST_START}\n{self.planned_manifest_text()}{cli.MANIFEST_END}\n"
+        process = mock.Mock()
+        process.stdout = iter(marked.splitlines(keepends=True))
+        process.wait.return_value = 0
+
+        with mock.patch("ocmo.cli.subprocess.Popen", return_value=process) as popen, contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()):
+            code = cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[], out=out, model="m", agent="plan", dry_run=False, max_attempts=1, workspace=self.workspace, interactive=True))
+
+        self.assertEqual(code, 0)
+        command = popen.call_args.args[0]
+        self.assertIn("--interactive", command)
+        self.assertIn("--dir", command)
+        self.assertEqual(out.read_text(encoding="utf-8"), self.planned_manifest_text())
+        self.assertIn("Question before final YAML", stdout.getvalue())
+
+    def test_plan_manifest_interactive_rejects_missing_markers(self) -> None:
+        prompt = self.root / "request.txt"
+        prompt.write_text("Request", encoding="utf-8")
+        process = mock.Mock()
+        process.stdout = iter(["schema: ocmo/v1\n"])
+        process.wait.return_value = 0
+
+        with mock.patch("ocmo.cli.subprocess.Popen", return_value=process), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(cli.OcmoError, "planner did not produce"):
+                cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[], out=self.root / "out.yaml", model=None, agent="plan", dry_run=False, max_attempts=1, workspace=self.workspace, interactive=True))
+
+    def test_extract_marked_manifest_rejects_empty_manifest(self) -> None:
+        with self.assertRaisesRegex(cli.OcmoError, "empty manifest"):
+            cli.extract_marked_manifest(f"{cli.MANIFEST_START}\n{cli.MANIFEST_END}")
+
+    def test_plan_manifest_rejects_repeated_invalid_output_without_writing(self) -> None:
+        prompt = self.root / "request.txt"
+        prompt.write_text("Request", encoding="utf-8")
+        out = self.root / "planned.yaml"
+        invalid = "schema: ocmo/v1\noperation:\n  id: op\n  workspace: .\nrunner:\n  command: opencode\nqueue:\n  concurrency: 1\nprompt:\n  template: |\n    inline text\nitems:\n  - id: one\n"
+
+        with mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["opencode"], 0, stdout=invalid, stderr="")):
+            with self.assertRaisesRegex(cli.OcmoError, "planner did not produce"):
+                cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[], out=out, model=None, agent="plan", dry_run=False, max_attempts=1))
+
+        self.assertFalse(out.exists())
+
+    def test_plan_manifest_rejects_invalid_max_attempts(self) -> None:
+        prompt = self.root / "request.txt"
+        prompt.write_text("Request", encoding="utf-8")
+
+        with self.assertRaisesRegex(cli.OcmoError, "max-attempts"):
+            cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[], out=self.root / "out.yaml", model=None, agent="plan", dry_run=False, max_attempts=0))
+
+    def test_load_manifest_text_rejects_non_mapping(self) -> None:
+        with self.assertRaisesRegex(cli.OcmoError, "YAML mapping"):
+            cli.load_manifest_text("- bad\n")
+
+    def test_planning_prompt_includes_schema_constraints(self) -> None:
+        prompt = cli.build_planning_prompt("Request", [], self.workspace, interactive=True)
+
+        self.assertIn("schema: ocmo/v1", prompt)
+        self.assertIn("Do not use apiVersion", prompt)
+        self.assertIn("must be file paths, not inline YAML block text", prompt)
+        self.assertIn(f"operation.workspace must be exactly: {self.workspace}", prompt)
+        self.assertIn(cli.MANIFEST_START, prompt)
+
+    def test_schema_validation_rejects_inline_template_text(self) -> None:
+        manifest = self.load()
+        manifest["prompt"]["template"] = "Inline\nPrompt"
+
+        with self.assertRaisesRegex(cli.OcmoError, "inline template text"):
+            cli.validate_manifest_schema(manifest, self.manifest_path)
 
     def test_final_coverage_branches(self) -> None:
         with mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["git"], 0)):
@@ -982,7 +1129,7 @@ class EdgeCaseCoverageTests(OcmoTestCase):
 
         def fake_plan_run(command, **kwargs):
             captured["command"] = command
-            return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout=self.planned_manifest_text(), stderr="")
 
         with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_plan_run), contextlib.redirect_stdout(io.StringIO()):
             code = cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[read_file], out=out, model=None, agent="plan", dry_run=False))

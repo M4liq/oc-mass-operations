@@ -18,6 +18,8 @@ import yaml
 
 
 DONE_STATUSES = {"completed", "done", "skipped"}
+MANIFEST_START = "OCMO_MANIFEST_START"
+MANIFEST_END = "OCMO_MANIFEST_END"
 
 
 class OcmoError(Exception):
@@ -57,8 +59,11 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--from", dest="from_file", required=True, type=Path, help="Natural-language operation prompt")
     plan_parser.add_argument("--read", dest="read_files", action="append", default=[], type=Path, help="Read-only source file to attach/inspect")
     plan_parser.add_argument("--out", required=True, type=Path, help="Manifest output path")
+    plan_parser.add_argument("--workspace", type=Path, help="Target workspace for planning; defaults to the current directory")
     plan_parser.add_argument("--model", help="opencode model")
     plan_parser.add_argument("--agent", default="plan", help="opencode agent to use for planning")
+    plan_parser.add_argument("--max-attempts", type=int, default=3, help="Maximum planner correction attempts")
+    plan_parser.add_argument("--interactive", action="store_true", help="Allow the planner to ask terminal questions before returning marked YAML")
     plan_parser.add_argument("--dry-run", action="store_true", help="Print the planning prompt only")
 
     args = parser.parse_args(argv)
@@ -102,14 +107,35 @@ def load_manifest(path: Path) -> dict[str, Any]:
     return data
 
 
+def load_manifest_text(text: str) -> dict[str, Any]:
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        raise OcmoError("manifest must be a YAML mapping")
+    return data
+
+
 def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> None:
+    validate_manifest_schema(manifest, manifest_path)
+    workspace = manifest["operation"]["workspace"]
+    if not resolve_manifest_path(manifest_path, workspace).exists():
+        raise OcmoError(f"operation.workspace does not exist: {workspace}")
+    auto_worktrees = auto_worktrees_config(manifest)
+    if auto_worktrees["enabled"]:
+        ensure_git_repository(resolve_manifest_path(manifest_path, workspace))
+    template = manifest["prompt"]["template"]
+    template_path = resolve_manifest_path(manifest_path, template)
+    if not template_path.exists():
+        raise OcmoError(f"prompt template not found: {template_path}")
+    for index, item in enumerate(manifest["items"], start=1):
+        validate_item_run_paths(item, manifest_path, index)
+
+
+def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path) -> None:
     if manifest.get("schema") != "ocmo/v1":
         raise OcmoError("manifest schema must be ocmo/v1")
     operation = require_mapping(manifest, "operation")
     require_string(operation, "id")
-    workspace = require_string(operation, "workspace")
-    if not resolve_manifest_path(manifest_path, workspace).exists():
-        raise OcmoError(f"operation.workspace does not exist: {workspace}")
+    require_string(operation, "workspace")
     runner = require_mapping(manifest, "runner")
     require_string(runner, "command")
     timeout_seconds = runner.get("timeoutSeconds")
@@ -122,17 +148,13 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> None:
     auto_worktrees = auto_worktrees_config(manifest)
     if auto_worktrees["enabled"]:
         validate_auto_worktrees(auto_worktrees)
-        ensure_git_repository(resolve_manifest_path(manifest_path, workspace))
     policy = manifest.get("policy", {})
     if isinstance(policy, dict) and policy.get("worktree") == "single" and concurrency > 1:
         raise OcmoError("policy.worktree=single requires queue.concurrency=1")
     if isinstance(policy, dict) and policy.get("worktree") == "single" and auto_worktrees["enabled"]:
         raise OcmoError("policy.worktree=single cannot be used with queue.autoWorktrees.enabled=true")
     prompt = require_mapping(manifest, "prompt")
-    template = require_string(prompt, "template")
-    template_path = resolve_manifest_path(manifest_path, template)
-    if not template_path.exists():
-        raise OcmoError(f"prompt template not found: {template_path}")
+    validate_template_value(require_string(prompt, "template"), "prompt.template")
     normalize_skills(prompt.get("skills"), "prompt.skills")
     items = manifest.get("items")
     if not isinstance(items, list) or not items:
@@ -149,6 +171,11 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> None:
             raise OcmoError(f"duplicate item id: {item_key}")
         seen.add(item_key)
         validate_item_runs(manifest, item, manifest_path, index)
+
+
+def validate_template_value(value: str, field: str) -> None:
+    if "\n" in value or "\r" in value:
+        raise OcmoError(f"{field} must be a file path, not inline template text")
 
 
 def validate_item_runs(manifest: dict[str, Any], item: dict[str, Any], manifest_path: Path, item_index: int) -> None:
@@ -185,10 +212,21 @@ def validate_item_runs(manifest: dict[str, Any], item: dict[str, Any], manifest_
             if template is not None:
                 if not isinstance(template, str) or not template.strip():
                     raise OcmoError("template must be a non-empty string")
-                template_path = resolve_manifest_path(manifest_path, template)
-                if not template_path.exists():
-                    raise OcmoError(f"prompt template not found: {template_path}")
+                validate_template_value(template, f"items[{item_index}].runs.steps[{step_index}].prompt.template")
             normalize_skills(prompt.get("skills"), f"items[{item_index}].runs.steps[{step_index}].prompt.skills")
+
+
+def validate_item_run_paths(item: dict[str, Any], manifest_path: Path, item_index: int) -> None:
+    runs = item.get("runs")
+    if runs is None:
+        return
+    for step_index, step in enumerate(runs["steps"], start=1):
+        prompt = step.get("prompt") or {}
+        template = prompt.get("template")
+        if template is not None:
+            template_path = resolve_manifest_path(manifest_path, template)
+            if not template_path.exists():
+                raise OcmoError(f"prompt template not found: {template_path}")
 
 
 def item_runs(manifest: dict[str, Any], item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -766,50 +804,184 @@ def quote_arg(value: str) -> str:
 def plan_manifest(args: argparse.Namespace) -> int:
     if not args.from_file.exists():
         raise OcmoError(f"prompt file not found: {args.from_file}")
+    configured_max_attempts = getattr(args, "max_attempts", 3)
+    max_attempts = configured_max_attempts if isinstance(configured_max_attempts, int) else 3
+    if max_attempts < 1:
+        raise OcmoError("--max-attempts must be a positive integer")
     missing = [path for path in args.read_files if not path.exists()]
     if missing:
         raise OcmoError(f"read-only source file not found: {missing[0]}")
+    workspace = plan_workspace(args)
+    configured_interactive = getattr(args, "interactive", False)
+    interactive = configured_interactive if isinstance(configured_interactive, bool) else False
     source_prompt = args.from_file.read_text(encoding="utf-8")
-    planning_prompt = build_planning_prompt(source_prompt, args.read_files)
+    planning_prompt = build_planning_prompt(source_prompt, args.read_files, workspace, interactive)
     if args.dry_run:
         print(planning_prompt)
         return 0
+    print(f"ocmo: planning with agent={args.agent} model={args.model or '<opencode-default>'}", file=sys.stderr)
+    print(f"ocmo: planning workspace={workspace}", file=sys.stderr)
+    feedback = None
+    previous_output = ""
+    for attempt in range(1, max_attempts + 1):
+        print(f"ocmo: planner attempt {attempt}/{max_attempts}", file=sys.stderr)
+        prompt = planning_prompt if feedback is None else build_planning_feedback_prompt(planning_prompt, previous_output, feedback, interactive)
+        command = build_plan_command(args, prompt, workspace, interactive)
+        returncode, output, error_output = run_plan_command(command, interactive)
+        if returncode != 0:
+            print(output, end="")
+            print(error_output, end="", file=sys.stderr)
+            return returncode
+        previous_output = output
+        try:
+            manifest_text = extract_marked_manifest(output) if interactive else output
+            manifest = load_manifest_text(manifest_text)
+            validate_manifest_schema(manifest, args.out)
+        except (OcmoError, yaml.YAMLError) as exc:
+            feedback = str(exc)
+            print(f"ocmo: planner output invalid on attempt {attempt}/{max_attempts}: {feedback}", file=sys.stderr)
+            continue
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(manifest_text, encoding="utf-8")
+        print(f"wrote: {args.out}")
+        return 0
+    raise OcmoError(f"planner did not produce a valid ocmo/v1 manifest after {max_attempts} attempts: {feedback}")
+
+
+def plan_workspace(args: argparse.Namespace) -> Path:
+    configured = getattr(args, "workspace", None)
+    if isinstance(configured, Path):
+        return configured.resolve()
+    return Path.cwd().resolve()
+
+
+def build_plan_command(args: argparse.Namespace, prompt: str, workspace: Path, interactive: bool = False) -> list[str]:
     command = ["opencode", "run", "--agent", args.agent]
     if args.model:
         command += ["--model", args.model]
+    if interactive:
+        command.append("--interactive")
+    command += ["--dir", str(workspace)]
     for read_file in args.read_files:
         command += ["--file", str(read_file)]
-    command.append(planning_prompt)
-    completed = subprocess.run(command, capture_output=True, text=True)
-    if completed.returncode != 0:
-        print(completed.stdout, end="")
-        print(completed.stderr, end="", file=sys.stderr)
-        return completed.returncode
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(completed.stdout, encoding="utf-8")
-    print(f"wrote: {args.out}")
-    return 0
+    command.append(prompt)
+    return command
 
 
-def build_planning_prompt(source_prompt: str, read_files: list[Path]) -> str:
+def run_plan_command(command: list[str], interactive: bool) -> tuple[int, str, str]:
+    if not interactive:
+        completed = subprocess.run(command, capture_output=True, text=True)
+        return completed.returncode, completed.stdout, completed.stderr
+    process = subprocess.Popen(command, stdin=None, stdout=subprocess.PIPE, stderr=None, text=True)
+    output_parts = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="")
+        output_parts.append(line)
+    return process.wait(), "".join(output_parts), ""
+
+
+def extract_marked_manifest(text: str) -> str:
+    start = text.find(MANIFEST_START)
+    end = text.find(MANIFEST_END)
+    if start == -1 or end == -1 or end <= start:
+        raise OcmoError(f"interactive planner output must contain {MANIFEST_START} and {MANIFEST_END} markers")
+    manifest = text[start + len(MANIFEST_START) : end].strip()
+    if not manifest:
+        raise OcmoError("interactive planner returned an empty manifest")
+    return manifest + "\n"
+
+
+def build_planning_feedback_prompt(original_prompt: str, invalid_yaml: str, error: str, interactive: bool = False) -> str:
+    final_instruction = (
+        f"Return corrected YAML between {MANIFEST_START} and {MANIFEST_END} markers."
+        if interactive
+        else "Return corrected YAML only, no Markdown fences."
+    )
+    return f"""{original_prompt}
+
+Your previous response was invalid for ocmo/v1.
+
+Validation error:
+{error}
+
+Previous YAML:
+{invalid_yaml}
+
+{final_instruction}
+"""
+
+
+def build_planning_prompt(source_prompt: str, read_files: list[Path], workspace: Path | None = None, interactive: bool = False) -> str:
     read_list = "\n".join(f"- {path}" for path in read_files) or "- none"
+    workspace = workspace or Path.cwd().resolve()
+    output_rule = (
+        f"You may ask clarifying questions in the terminal before producing the manifest. When ready, output the final YAML between exact {MANIFEST_START} and {MANIFEST_END} markers."
+        if interactive
+        else "Output YAML only, no Markdown fences."
+    )
     return f"""Convert this mass-operation request into an ocmo/v1 YAML manifest.
 
 Rules:
-- Output YAML only, no Markdown fences.
+- {output_rule}
+- The top-level schema field must be exactly: schema: ocmo/v1.
+- Do not use apiVersion.
+- operation.workspace must be exactly: {workspace}
 - Keep operation.kind generic unless the user explicitly named a stable kind.
 - Use a common ocmo/v1 envelope: operation, runner, queue, policy, prompt, state, items.
+- Do not invent unsupported top-level sections or custom policy/runner/state fields.
+- runner.command must usually be opencode.
+- runner.mode must usually be run.
 - Use queue.concurrency: 1 when the request uses one git worktree or branch-changing workflow.
 - Use queue.autoWorktrees.enabled: true only when the user wants ocmo to create one git worktree per item.
 - Put task-specific fields under each item's payload.
 - If one item needs multiple agents or prompt phases, use items[].runs.mode: sequential and put runs under items[].runs.steps.
 - Use per-run prompt.template values when different agents need different instructions.
 - Use the top-level prompt.template only when every run can share the same template.
+- prompt.template and per-run prompt.template must be file paths, not inline YAML block text.
 - Use prompt.skills when a run must require opencode skills; list skill names without prose, for example [code-review].
 - Use per-run prompt.skills when different sequential runs need different required skills.
 - Do not use runs.mode: parallel; it is reserved for future support.
-- If a required value is ambiguous, set it to NEEDS_DECISION instead of guessing.
+- If a required value is ambiguous and you can ask terminal questions, ask before producing final YAML.
+- Do not leave NEEDS_DECISION in required runtime fields when the user can answer.
+- If a required value is still ambiguous after questions, set it to NEEDS_DECISION instead of guessing.
 - Refer to read-only source files only as evidence; do not modify them.
+
+Canonical shape:
+schema: ocmo/v1
+operation:
+  id: example-operation
+  kind: generic
+  description: Example operation description.
+  workspace: {workspace}
+runner:
+  command: opencode
+  mode: run
+  agent: build
+  model: null
+  attach: null
+  timeoutSeconds: 14400
+  dangerouslySkipPermissions: false
+selection:
+  default: uncompleted
+queue:
+  concurrency: 1
+  order: manifest
+  stopOnFailure: false
+  autoWorktrees:
+    enabled: false
+policy:
+  worktree: single
+prompt:
+  template: .ocmo/prompts/example.md
+  skills: []
+state:
+  path: .ocmo/state/example-operation.json
+items:
+  - id: ITEM-001
+    title: Example item
+    status: pending
+    payload: {{}}
 
 Read-only source files available to inspect:
 {read_list}

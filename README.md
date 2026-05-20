@@ -440,19 +440,26 @@ When auto worktrees are enabled, `--dry-run` also prints the planned worktree pa
 ### `ocmo plan`
 
 ```powershell
-ocmo plan --from <prompt-file> --out <manifest> [--read <source-file>] [--model <model>] [--agent <agent>] [--dry-run]
+ocmo plan --from <prompt-file> --out <manifest> [--workspace <path>] [--read <source-file>] [--model <model>] [--agent <agent>] [--interactive] [--dry-run]
 ```
 
 Example:
 
 ```powershell
 ocmo plan `
+  --workspace "C:\path\to\target-repo" `
   --from prompt.txt `
   --read "C:\path\to\source-data.csv" `
   --out ocmo/example-operation.yaml
 ```
 
 `plan` asks `opencode` to convert a natural-language mass-operation request into an `ocmo/v1` manifest. It can attach read-only source files such as CSV exports, text files, or other planning inputs. If the request needs multiple agents or phases per item, the planning prompt tells `opencode` to use `items[].runs.mode: sequential` and per-run `prompt.template` values.
+
+`--workspace` sets the target repository for planning and is passed to `opencode run --dir`. If omitted, it defaults to the current working directory. The planner is instructed to use the resolved workspace path as `operation.workspace`.
+
+`--interactive` allows the planning agent to ask terminal questions before returning the final manifest. In interactive mode, `ocmo` expects the final YAML between `OCMO_MANIFEST_START` and `OCMO_MANIFEST_END` markers, extracts only that YAML, validates it, and writes it to `--out`.
+
+Planner output is validated before it is written. Invalid YAML or invalid `ocmo/v1` shape is retried with validator feedback up to `--max-attempts` times, defaulting to 3.
 
 Planning does not execute operation items. It should only produce a manifest and any prompt template needed for review.
 
