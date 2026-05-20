@@ -25,6 +25,8 @@ MANIFEST_END = "OCMO_MANIFEST_END"
 FILE_START = "OCMO_FILE_START"
 FILE_END = "OCMO_FILE_END"
 TERMINAL_STATUSES = {"completed", "failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"}
+MISSING_PLACEHOLDER = object()
+ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 
 
 class OcmoError(Exception):
@@ -449,10 +451,62 @@ def render_prompt(
         "skill_commands": "\n".join(f"/{skill}" for skill in skills),
         "skill_names": ", ".join(skills),
     }
-    rendered = template.safe_substitute(context)
+    rendered = render_brace_placeholders(template.safe_substitute(context), context, manifest, item, operation, execution, run)
     if rendered_skill_instructions:
         return f"{rendered_skill_instructions}\n\n{rendered}"
     return rendered
+
+
+def render_brace_placeholders(
+    text: str,
+    context: dict[str, str],
+    manifest: dict[str, Any],
+    item: dict[str, Any],
+    operation: dict[str, Any],
+    execution: dict[str, Any],
+    run: dict[str, Any],
+) -> str:
+    roots = {
+        "manifest": manifest,
+        "operation": operation,
+        "policy": manifest.get("policy", {}),
+        "item": item,
+        "payload": item.get("payload", {}),
+        "execution": execution,
+        "run": run,
+    }
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1).strip()
+        if name in context:
+            return context[name]
+        value = resolve_brace_placeholder(name, roots)
+        if value is MISSING_PLACEHOLDER:
+            raise OcmoError(f"unresolved prompt placeholder: {{{{{name}}}}}")
+        return format_placeholder_value(value)
+
+    return re.sub(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}", replace, text)
+
+
+def resolve_brace_placeholder(name: str, roots: dict[str, Any]) -> Any:
+    parts = name.split(".")
+    if parts[0] not in roots:
+        return MISSING_PLACEHOLDER
+    current = roots[parts[0]]
+    for part in parts[1:]:
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return MISSING_PLACEHOLDER
+    return current
+
+
+def format_placeholder_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, indent=2, ensure_ascii=False)
+    return str(value)
 
 
 def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str, run_dir: Path | None = None, runner: dict[str, Any] | None = None) -> list[str]:
@@ -513,6 +567,8 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
         self.started = time.monotonic()
         self.live: Any = None
         self.console: Any = None
+        self.closed = threading.Event()
+        self.ticker: threading.Thread | None = None
 
     def __enter__(self) -> "LiveRunReporter":
         try:
@@ -523,12 +579,22 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
         self.console = Console()
         self.live = Live(self.render(), console=self.console, refresh_per_second=4, transient=False)
         self.live.__enter__()
+        self.closed.clear()
+        self.ticker = threading.Thread(target=self.tick, daemon=True)
+        self.ticker.start()
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.closed.set()
+        if self.ticker:
+            self.ticker.join(timeout=1)
         if self.live:
             self.live.update(self.render())
             self.live.__exit__(exc_type, exc, traceback)
+
+    def tick(self) -> None:
+        while not self.closed.wait(1):
+            self.refresh()
 
     def start(self, manifest: dict[str, Any], selected: list[dict[str, Any]], concurrency: int, auto_worktrees: dict[str, Any]) -> None:
         with self.lock:
@@ -681,7 +747,7 @@ def make_run_reporter(ui: str) -> PlainRunReporter:
 
 def subprocess_run_kwargs(reporter: PlainRunReporter) -> dict[str, Any]:
     if reporter.captures_subprocess_output:
-        return {"capture_output": True, "text": True}
+        return {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace"}
     return {}
 
 
@@ -700,6 +766,7 @@ def run_opencode_command(
     output_path: Path,
 ) -> subprocess.CompletedProcess:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    env = opencode_capture_env()
     with output_path.open("w", encoding="utf-8") as output:
         output.write(f"$ {format_command(command)}\n\n")
         output.flush()
@@ -708,9 +775,12 @@ def run_opencode_command(
                 command,
                 cwd=str(run_dir),
                 timeout=run_timeout,
-                stdout=output,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
             )
         except subprocess.TimeoutExpired:
             output.write(f"\n[ocmo] timed out after {run_timeout} seconds\n")
@@ -720,9 +790,23 @@ def run_opencode_command(
             output.write(f"\n[ocmo] failed to start: {exc}\n")
             output.flush()
             raise
+        cleaned_stdout = strip_ansi(completed.stdout or "")
+        output.write(cleaned_stdout)
         output.write(f"\n[ocmo] exit code: {completed.returncode}\n")
         output.flush()
-        return completed
+        return subprocess.CompletedProcess(completed.args, completed.returncode, stdout=cleaned_stdout, stderr=completed.stderr)
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def opencode_capture_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("NO_COLOR", "1")
+    env["FORCE_COLOR"] = "0"
+    env["TERM"] = "dumb"
+    return env
 
 
 def run_manifest(options: RunOptions) -> int:
@@ -1155,38 +1239,108 @@ def plan_manifest(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(planning_prompt)
         return 0
-    print(f"ocmo: planning with agent={args.agent} model={args.model or '<opencode-default>'}", file=sys.stderr)
-    print(f"ocmo: planning workspace={workspace}", file=sys.stderr)
-    print(f"ocmo: planning output={out_path}", file=sys.stderr)
     feedback = None
     previous_output = ""
-    for attempt in range(1, max_attempts + 1):
+    with make_plan_reporter(args, workspace, out_path, interactive) as reporter:
+        for attempt in range(1, max_attempts + 1):
+            reporter.attempt(attempt, max_attempts)
+            prompt = planning_prompt if feedback is None else build_planning_feedback_prompt(planning_prompt, previous_output, feedback, interactive)
+            command = build_plan_command(args, prompt, workspace, interactive)
+            returncode, output, error_output = run_plan_command(command, interactive)
+            if returncode != 0:
+                print(output, end="")
+                print(error_output, end="", file=sys.stderr)
+                return returncode
+            previous_output = output
+            try:
+                manifest_text, generated_files = parse_plan_output(output, interactive)
+                manifest = load_manifest_text(manifest_text)
+                validate_manifest_schema(manifest, out_path)
+                validate_generated_plan_files(manifest, out_path, generated_files)
+            except (OcmoError, yaml.YAMLError) as exc:
+                feedback = str(exc)
+                reporter.invalid(attempt, max_attempts, feedback)
+                continue
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            write_generated_plan_files(out_path, generated_files)
+            out_path.write_text(manifest_text, encoding="utf-8")
+            reporter.wrote(out_path, generated_files)
+            return 0
+    raise OcmoError(f"planner did not produce a valid ocmo/v1 manifest after {max_attempts} attempts: {feedback}")
+
+
+class PlainPlanReporter:
+    def __init__(self, args: argparse.Namespace, workspace: Path, out_path: Path) -> None:
+        self.args = args
+        self.workspace = workspace
+        self.out_path = out_path
+
+    def __enter__(self) -> "PlainPlanReporter":
+        print(f"ocmo: planning with agent={self.args.agent} model={self.args.model or '<opencode-default>'}", file=sys.stderr)
+        print(f"ocmo: planning workspace={self.workspace}", file=sys.stderr)
+        print(f"ocmo: planning output={self.out_path}", file=sys.stderr)
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+    def attempt(self, attempt: int, max_attempts: int) -> None:
         print(f"ocmo: planner attempt {attempt}/{max_attempts}", file=sys.stderr)
-        prompt = planning_prompt if feedback is None else build_planning_feedback_prompt(planning_prompt, previous_output, feedback, interactive)
-        command = build_plan_command(args, prompt, workspace, interactive)
-        returncode, output, error_output = run_plan_command(command, interactive)
-        if returncode != 0:
-            print(output, end="")
-            print(error_output, end="", file=sys.stderr)
-            return returncode
-        previous_output = output
-        try:
-            manifest_text, generated_files = parse_plan_output(output, interactive)
-            manifest = load_manifest_text(manifest_text)
-            validate_manifest_schema(manifest, out_path)
-            validate_generated_plan_files(manifest, out_path, generated_files)
-        except (OcmoError, yaml.YAMLError) as exc:
-            feedback = str(exc)
-            print(f"ocmo: planner output invalid on attempt {attempt}/{max_attempts}: {feedback}", file=sys.stderr)
-            continue
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        write_generated_plan_files(out_path, generated_files)
-        out_path.write_text(manifest_text, encoding="utf-8")
+
+    def invalid(self, attempt: int, max_attempts: int, feedback: str) -> None:
+        print(f"ocmo: planner output invalid on attempt {attempt}/{max_attempts}: {feedback}", file=sys.stderr)
+
+    def wrote(self, out_path: Path, generated_files: dict[Path, str]) -> None:
         print(f"wrote: {out_path}")
         for relative_path in sorted(generated_files, key=str):
             print(f"wrote: {out_path.parent / relative_path}")
-        return 0
-    raise OcmoError(f"planner did not produce a valid ocmo/v1 manifest after {max_attempts} attempts: {feedback}")
+
+
+class RichPlanReporter(PlainPlanReporter):  # pragma: no cover
+    def __init__(self, args: argparse.Namespace, workspace: Path, out_path: Path) -> None:
+        super().__init__(args, workspace, out_path)
+        self.started = time.monotonic()
+        self.status: Any = None
+
+    def __enter__(self) -> "RichPlanReporter":
+        from rich.console import Console
+
+        console = Console(stderr=True)
+        self.status = console.status(self.status_text("starting"), spinner="dots")
+        self.status.__enter__()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self.status:
+            self.status.__exit__(exc_type, exc, traceback)
+
+    def attempt(self, attempt: int, max_attempts: int) -> None:
+        if self.status:
+            self.status.update(self.status_text(f"attempt {attempt}/{max_attempts}"))
+
+    def invalid(self, attempt: int, max_attempts: int, feedback: str) -> None:
+        if self.status:
+            self.status.update(self.status_text(f"attempt {attempt}/{max_attempts} invalid: {feedback[:80]}"))
+
+    def wrote(self, out_path: Path, generated_files: dict[Path, str]) -> None:
+        if self.status:
+            self.status.update(self.status_text("writing files"))
+        super().wrote(out_path, generated_files)
+
+    def status_text(self, phase: str) -> str:
+        elapsed = format_duration(time.monotonic() - self.started)
+        model = self.args.model or "<opencode-default>"
+        return f"ocmo plan {phase} | agent={self.args.agent} model={model} elapsed={elapsed} output={self.out_path}"
+
+
+def make_plan_reporter(args: argparse.Namespace, workspace: Path, out_path: Path, interactive: bool) -> PlainPlanReporter:
+    if interactive or not sys.stderr.isatty():
+        return PlainPlanReporter(args, workspace, out_path)
+    try:
+        import rich  # noqa: F401
+    except ImportError:
+        return PlainPlanReporter(args, workspace, out_path)
+    return RichPlanReporter(args, workspace, out_path)  # pragma: no cover
 
 
 def plan_workspace(args: argparse.Namespace) -> Path:
@@ -1224,9 +1378,9 @@ def build_plan_command(args: argparse.Namespace, prompt: str, workspace: Path, i
 
 def run_plan_command(command: list[str], interactive: bool) -> tuple[int, str, str]:
     if not interactive:
-        completed = subprocess.run(command, capture_output=True, text=True)
+        completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
         return completed.returncode, completed.stdout, completed.stderr
-    process = subprocess.Popen(command, stdin=None, stdout=subprocess.PIPE, stderr=None, text=True)
+    process = subprocess.Popen(command, stdin=None, stdout=subprocess.PIPE, stderr=None, text=True, encoding="utf-8", errors="replace")
     output_parts = []
     assert process.stdout is not None
     for line in process.stdout:

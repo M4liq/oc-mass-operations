@@ -283,6 +283,36 @@ class SelectionAndRenderingTests(OcmoTestCase):
         self.assertIn("C:/worktree", rendered)
         self.assertIn('"name": "Alpha"', rendered)
 
+    def test_render_prompt_supports_brace_dotted_placeholders(self) -> None:
+        self.prompt.write_text(
+            "Range {{payload.rangeStart}}-{{ payload.rangeEnd }} for {{item.id}}/{{item_id}} in {{operation.id}} run {{run.id}} at {{execution.worktreePath}} payload {{payload}}",
+            encoding="utf-8",
+        )
+        manifest = self.load()
+        item = manifest["items"][0]
+        item["payload"] = {"rangeStart": 41, "rangeEnd": 48, "optional": None}
+        self.prompt.write_text(self.prompt.read_text(encoding="utf-8") + " optional {{payload.optional}}", encoding="utf-8")
+
+        rendered = cli.render_prompt(manifest, item, self.manifest_path, execution={"worktreePath": "C:/wt"})
+
+        self.assertIn("Range 41-48 for 1/1 in test-op run default at C:/wt", rendered)
+        self.assertIn('"rangeStart": 41', rendered)
+        self.assertTrue(rendered.endswith("optional "))
+
+    def test_render_prompt_rejects_unknown_brace_placeholder(self) -> None:
+        self.prompt.write_text("Range {{payload.missing}}", encoding="utf-8")
+        manifest = self.load()
+
+        with self.assertRaisesRegex(cli.OcmoError, r"unresolved prompt placeholder: \{\{payload\.missing\}\}"):
+            cli.render_prompt(manifest, manifest["items"][0], self.manifest_path)
+
+        self.prompt.write_text("Range {{missing.value}}", encoding="utf-8")
+        with self.assertRaisesRegex(cli.OcmoError, r"unresolved prompt placeholder: \{\{missing\.value\}\}"):
+            cli.render_prompt(manifest, manifest["items"][0], self.manifest_path)
+
+    def test_format_placeholder_value_handles_none(self) -> None:
+        self.assertEqual(cli.format_placeholder_value(None), "")
+
     def test_render_prompt_prepends_deterministic_skill_instructions(self) -> None:
         self.prompt.write_text("Skills: $skill_names\nCommands:\n$skill_commands\n$item_id", encoding="utf-8")
         manifest = self.load()
@@ -367,8 +397,7 @@ class RunManifestTests(OcmoTestCase):
 
         def fake_run(command: list[str], **kwargs):
             calls.append(command)
-            kwargs["stdout"].write(f"agent output for {command[-1]}\n")
-            return subprocess.CompletedProcess(command, 0)
+            return subprocess.CompletedProcess(command, 0, stdout=f"agent output for {command[-1]}\n")
 
         with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
@@ -385,6 +414,28 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(state["items"]["1"]["runs"]["two"]["outputPath"], "outputs/1__two.txt")
         self.assertIn("agent output for", (self.root / "outputs" / "1__one.txt").read_text(encoding="utf-8"))
         self.assertIn("[ocmo] exit code: 0", (self.root / "outputs" / "1__two.txt").read_text(encoding="utf-8"))
+
+    def test_run_manifest_writes_clean_utf8_output_files(self) -> None:
+        manifest = self.load()
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+
+        def fake_run(command: list[str], **kwargs):
+            self.assertEqual(kwargs["stdout"], subprocess.PIPE)
+            self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
+            self.assertEqual(kwargs["encoding"], "utf-8")
+            self.assertEqual(kwargs["errors"], "replace")
+            self.assertEqual(kwargs["env"]["NO_COLOR"], "1")
+            self.assertEqual(kwargs["env"]["FORCE_COLOR"], "0")
+            self.assertEqual(kwargs["env"]["TERM"], "dumb")
+            return subprocess.CompletedProcess(command, 0, stdout="\x1b[0mhello\x1b[31m red\x1b[0m\n")
+
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 0)
+        output = (self.root / "outputs" / "1__default.txt").read_text(encoding="utf-8")
+        self.assertIn("hello red", output)
+        self.assertNotIn("\x1b", output)
 
     def test_run_manifest_stops_later_runs_after_failure(self) -> None:
         manifest = self.load()
@@ -952,10 +1003,11 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         self.assertEqual(cli.item_runtime({"started": None}, 40), "-")
         self.assertEqual(cli.item_runtime({"started": 10, "ended": None}, 40), "00:30")
         self.assertEqual(cli.item_runtime({"started": 10, "ended": 20}, 40), "00:10")
+        self.assertEqual(cli.strip_ansi("\x1b[0mred\x1b[31m"), "red")
         self.assertEqual(cli.subprocess_run_kwargs(reporter), {})
 
         live_like = mock.Mock(captures_subprocess_output=True)
-        self.assertEqual(cli.subprocess_run_kwargs(live_like), {"capture_output": True, "text": True})
+        self.assertEqual(cli.subprocess_run_kwargs(live_like), {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace"})
         with mock.patch("sys.stdout.isatty", return_value=False):
             self.assertIsInstance(cli.make_run_reporter("auto"), cli.PlainRunReporter)
         with mock.patch("sys.stdout.isatty", return_value=True), mock.patch.dict("sys.modules", {"rich": None}):
@@ -1006,6 +1058,9 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         self.assertIn("--file", run.call_args.args[0])
         self.assertIn(str(read_file), run.call_args.args[0])
         self.assertEqual(out.read_text(encoding="utf-8"), self.planned_manifest_text())
+
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
 
         failed = subprocess.CompletedProcess(["opencode"], 3, stdout="out", stderr="err")
         stdout = io.StringIO()
@@ -1156,6 +1211,25 @@ Generated template for $item_id
         self.assertIn("--dir", command)
         self.assertEqual(out.read_text(encoding="utf-8"), self.planned_manifest_text())
         self.assertIn("Question before final YAML", stdout.getvalue())
+
+    def test_plan_reporter_selection_and_plain_output(self) -> None:
+        args = mock.Mock(agent="build", model=None)
+        with mock.patch("sys.stderr.isatty", return_value=False):
+            self.assertIsInstance(cli.make_plan_reporter(args, self.workspace, self.manifest_path, False), cli.PlainPlanReporter)
+        with mock.patch("sys.stderr.isatty", return_value=True), mock.patch.dict("sys.modules", {"rich": None}):
+            self.assertIsInstance(cli.make_plan_reporter(args, self.workspace, self.manifest_path, False), cli.PlainPlanReporter)
+        self.assertIsInstance(cli.make_plan_reporter(args, self.workspace, self.manifest_path, True), cli.PlainPlanReporter)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        reporter = cli.PlainPlanReporter(args, self.workspace, self.manifest_path)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), reporter:
+            reporter.attempt(1, 3)
+            reporter.invalid(1, 3, "bad yaml")
+            reporter.wrote(self.manifest_path, {Path("prompts/a.md"): "A"})
+        self.assertIn("planner attempt 1/3", stderr.getvalue())
+        self.assertIn("planner output invalid", stderr.getvalue())
+        self.assertIn("wrote:", stdout.getvalue())
 
     def test_plan_manifest_interactive_rejects_missing_markers(self) -> None:
         prompt = self.root / "request.txt"
