@@ -462,7 +462,31 @@ ocmo plan `
 
 `--workspace` sets the target repository for planning and is passed to `opencode run --dir`. If omitted, it defaults to the current working directory. The planner is instructed to use the resolved workspace path as `operation.workspace`.
 
-If `--out` is omitted, the manifest is written under the workspace using the prompt file name: `<workspace>/.ocmo/<prompt-stem>/manifest.yaml`. The planning prompt also tells `opencode` to place generated prompt templates in that same operation folder, for example `prompts/example.md`, and to use `state.json` for operation state. Pass `--out` to override the manifest path.
+If `--out` is omitted, the manifest is written under the resolved workspace using the input prompt file name. The default manifest name is always `manifest.yaml`:
+
+```text
+<workspace>/
+  .ocmo/
+    <prompt-stem>/
+      manifest.yaml
+      state.json
+      prompts/
+        <generated-template>.md
+```
+
+For example, running this from `C:\repo\docs`:
+
+```powershell
+ocmo plan --from business-taxonomy-prompt.txt
+```
+
+writes the manifest to:
+
+```text
+C:\repo\docs\.ocmo\business-taxonomy-prompt\manifest.yaml
+```
+
+Generated prompt templates should be written under the same operation folder, usually as `prompts/<name>.md`, and referenced from the manifest using paths relative to `manifest.yaml`, such as `prompts/business-taxonomy-review.md`. The default state path guidance is `state.json`. Pass `--out` to override the manifest path.
 
 When the generated manifest references prompt templates that do not already exist, the planner must return them as file blocks after the manifest. `ocmo plan` writes those files relative to the manifest directory and rejects unsafe paths such as absolute paths or `..` segments:
 
