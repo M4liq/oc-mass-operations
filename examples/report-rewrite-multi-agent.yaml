@@ -1,0 +1,87 @@
+schema: ocmo/v1
+
+operation:
+  id: report-rewrite-multi-agent-example
+  kind: generic
+  description: Rewrite and review selected report-like work items with multiple agents per item.
+  workspace: ..
+
+runner:
+  command: opencode
+  mode: run
+  model: openai/gpt-5.5
+  attach: null
+  timeoutSeconds: 14400
+  dangerouslySkipPermissions: false
+
+selection:
+  default: uncompleted
+
+queue:
+  concurrency: 1
+  order: manifest
+  stopOnFailure: false
+  autoWorktrees:
+    enabled: false
+    root: .ocmo/worktrees
+    baseBranch: main
+    branchPattern: ocmo/{operation_id}/{item_id}
+    setup: []
+    teardown: []
+    cleanup: never
+
+policy:
+  worktree: single
+  baseBranch: main
+
+prompt:
+  template: prompts/report-rewrite.md
+
+state:
+  path: ../.ocmo/state/report-rewrite-multi-agent-example.json
+
+items:
+  - id: WORK-001
+    title: ExampleReportOne
+    status: pending
+    payload:
+      workItemKey: WORK-001
+      targetName: ExampleReportOne
+      branch: feature/WORK-001_example-report-one
+      reviewer: reviewer-user
+      assignee: assignee-user
+    runs:
+      mode: sequential
+      steps:
+        - id: implement
+          agent: build
+          prompt:
+            template: prompts/report-implement.md
+        - id: review
+          agent: review
+          prompt:
+            template: prompts/report-review.md
+        - id: fix
+          agent: build
+          prompt:
+            template: prompts/report-fix.md
+  - id: WORK-002
+    title: ExampleReportTwo
+    status: pending
+    payload:
+      workItemKey: WORK-002
+      targetName: ExampleReportTwo
+      branch: feature/WORK-002_example-report-two
+      reviewer: reviewer-user
+      assignee: assignee-user
+    runs:
+      mode: sequential
+      steps:
+        - id: implement
+          agent: build
+          prompt:
+            template: prompts/report-implement.md
+        - id: review
+          agent: review
+          prompt:
+            template: prompts/report-review.md

@@ -74,8 +74,11 @@ def main(argv: list[str] | None = None) -> int:
             manifest = load_manifest(args.manifest)
             validate_manifest(manifest, args.manifest)
             for item in select_items(manifest, args.select):
-                print(render_prompt(manifest, item, args.manifest))
-                print("\n" + "=" * 80 + "\n")
+                runs = item_runs(manifest, item)
+                for run in runs:
+                    print(f"# item {item['id']} / run {run['id']}")
+                    print(render_prompt(manifest, item, args.manifest, run=run, runs=runs))
+                    print("\n" + "=" * 80 + "\n")
             return 0
         if args.command == "plan":
             return plan_manifest(args)
@@ -144,6 +147,69 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> None:
         if item_key in seen:
             raise OcmoError(f"duplicate item id: {item_key}")
         seen.add(item_key)
+        validate_item_runs(manifest, item, manifest_path, index)
+
+
+def validate_item_runs(manifest: dict[str, Any], item: dict[str, Any], manifest_path: Path, item_index: int) -> None:
+    runs = item.get("runs")
+    if runs is None:
+        return
+    if not isinstance(runs, dict):
+        raise OcmoError(f"items[{item_index}].runs must be a mapping")
+    mode = runs.get("mode", "sequential")
+    if mode != "sequential":
+        raise OcmoError(f"items[{item_index}].runs.mode must be sequential")
+    steps = runs.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise OcmoError(f"items[{item_index}].runs.steps must be a non-empty list")
+    seen = set()
+    for step_index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            raise OcmoError(f"items[{item_index}].runs.steps[{step_index}] must be a mapping")
+        run_id = step.get("id")
+        if run_id is None or not str(run_id).strip():
+            raise OcmoError(f"items[{item_index}].runs.steps[{step_index}].id is required")
+        run_key = str(run_id)
+        if run_key in seen:
+            raise OcmoError(f"duplicate run id for item {item['id']}: {run_key}")
+        seen.add(run_key)
+        timeout_seconds = step.get("timeoutSeconds")
+        if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or timeout_seconds < 1):
+            raise OcmoError(f"items[{item_index}].runs.steps[{step_index}].timeoutSeconds must be a positive integer")
+        prompt = step.get("prompt")
+        if prompt is not None:
+            if not isinstance(prompt, dict):
+                raise OcmoError(f"items[{item_index}].runs.steps[{step_index}].prompt must be a mapping")
+            template = require_string(prompt, "template")
+            template_path = resolve_manifest_path(manifest_path, template)
+            if not template_path.exists():
+                raise OcmoError(f"prompt template not found: {template_path}")
+
+
+def item_runs(manifest: dict[str, Any], item: dict[str, Any]) -> list[dict[str, Any]]:
+    runs = item.get("runs")
+    if runs is None:
+        runner = manifest.get("runner", {})
+        return [{"id": "default", "mode": "sequential", "index": 1, **runner}]
+    steps = runs["steps"]
+    result = []
+    for index, step in enumerate(steps, start=1):
+        result.append({"mode": runs.get("mode", "sequential"), "index": index, **step, "id": str(step["id"])})
+    return result
+
+
+def effective_runner(manifest: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
+    runner = dict(manifest.get("runner", {}))
+    for key, value in run.items():
+        if key not in {"id", "index", "mode", "prompt"}:
+            runner[key] = value
+    return runner
+
+
+def effective_prompt(manifest: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
+    prompt = dict(manifest.get("prompt", {}))
+    prompt.update(run.get("prompt", {}) or {})
+    return prompt
 
 
 def require_mapping(parent: dict[str, Any], key: str) -> dict[str, Any]:
@@ -249,8 +315,19 @@ def expand_selector(selector: str) -> set[str]:
     return result
 
 
-def render_prompt(manifest: dict[str, Any], item: dict[str, Any], manifest_path: Path, execution: dict[str, Any] | None = None) -> str:
-    template_path = resolve_manifest_path(manifest_path, manifest["prompt"]["template"])
+def render_prompt(
+    manifest: dict[str, Any],
+    item: dict[str, Any],
+    manifest_path: Path,
+    execution: dict[str, Any] | None = None,
+    run: dict[str, Any] | None = None,
+    runs: list[dict[str, Any]] | None = None,
+) -> str:
+    run = run or item_runs(manifest, item)[0]
+    runs = runs or [run]
+    runner = effective_runner(manifest, run)
+    prompt = effective_prompt(manifest, run)
+    template_path = resolve_manifest_path(manifest_path, prompt["template"])
     template = Template(template_path.read_text(encoding="utf-8"))
     operation = manifest.get("operation", {})
     execution = execution or {}
@@ -268,13 +345,20 @@ def render_prompt(manifest: dict[str, Any], item: dict[str, Any], manifest_path:
         "worktree_path": str(execution.get("worktreePath", "")),
         "source_workspace": str(execution.get("sourceWorkspace", operation.get("workspace", ""))),
         "branch_name": str(execution.get("branchName", "")),
+        "run_json": json.dumps(run, indent=2, ensure_ascii=False),
+        "run_id": str(run.get("id", "")),
+        "run_agent": str(runner.get("agent", "")),
+        "run_model": str(runner.get("model", "")),
+        "run_index": str(run.get("index", "")),
+        "run_count": str(len(runs)),
+        "run_mode": str(run.get("mode", "sequential")),
     }
     return template.safe_substitute(context)
 
 
-def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str, run_dir: Path | None = None) -> list[str]:
+def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str, run_dir: Path | None = None, runner: dict[str, Any] | None = None) -> list[str]:
     operation = manifest["operation"]
-    runner = manifest["runner"]
+    runner = runner or manifest["runner"]
     command = [runner.get("command", "opencode"), runner.get("mode", "run")]
     if runner.get("agent"):
         command += ["--agent", str(runner["agent"])]
@@ -295,7 +379,7 @@ def run_manifest(options: RunOptions) -> int:
     validate_manifest(manifest, options.manifest_path)
     selected = select_items(manifest, options.select)
     concurrency = options.concurrency if options.concurrency is not None else manifest.get("queue", {}).get("concurrency", 1)
-    timeout_seconds = options.timeout_seconds if options.timeout_seconds is not None else manifest.get("runner", {}).get("timeoutSeconds")
+    timeout_seconds = options.timeout_seconds
     auto_worktrees = auto_worktrees_config(manifest)
     if concurrency < 1:
         raise OcmoError("concurrency must be a positive integer")
@@ -313,18 +397,22 @@ def run_manifest(options: RunOptions) -> int:
         for item in selected:
             execution = worktree_execution(manifest, options.manifest_path, item) if auto_worktrees["enabled"] else {}
             run_dir = Path(execution["worktreePath"]) if execution else None
-            prompt_text = render_prompt(manifest, item, options.manifest_path, execution)
-            command = build_command(manifest, options.manifest_path, prompt_text, run_dir)
-            print(f"# item {item['id']}")
-            if execution:
-                print(f"# worktree: {execution['worktreePath']}")
-                print(f"# branch: {execution['branchName']}")
-            print(format_command(command))
-            if timeout_seconds:
-                print(f"# timeout: {timeout_seconds} seconds")
-            print("\n--- prompt ---\n")
-            print(prompt_text)
-            print("\n" + "=" * 80 + "\n")
+            runs = item_runs(manifest, item)
+            for run in runs:
+                runner = effective_runner(manifest, run)
+                run_timeout = timeout_seconds if timeout_seconds is not None else runner.get("timeoutSeconds")
+                prompt_text = render_prompt(manifest, item, options.manifest_path, execution, run, runs)
+                command = build_command(manifest, options.manifest_path, prompt_text, run_dir, runner)
+                print(f"# item {item['id']} / run {run['id']}")
+                if execution:
+                    print(f"# worktree: {execution['worktreePath']}")
+                    print(f"# branch: {execution['branchName']}")
+                print(format_command(command))
+                if run_timeout:
+                    print(f"# timeout: {run_timeout} seconds")
+                print("\n--- prompt ---\n")
+                print(prompt_text)
+                print("\n" + "=" * 80 + "\n")
         return 0
 
     if not options.yes:
@@ -368,38 +456,57 @@ def run_item(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any]
             worktree_code = prepare_worktree(manifest, manifest_path, item, execution, auto_worktrees, state)
             if worktree_code != 0:
                 return worktree_code
-        prompt_text = render_prompt(manifest, item, manifest_path, execution)
-        command = build_command(manifest, manifest_path, prompt_text, run_dir)
+        runs = item_runs(manifest, item)
     except (OSError, OcmoError) as exc:
         state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
         print(f"[{item_id}] failed before start: {exc}")
         return 1
-    state.mark(item_id, "running", {"startedAt": utc_now(), "command": command_without_prompt(command), "timeoutSeconds": timeout_seconds, **execution})
-    print(f"[{item_id}] starting")
-    try:
-        completed = subprocess.run(command, cwd=str(run_dir), timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        state.mark(item_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": timeout_seconds})
-        print(f"[{item_id}] timed out after {timeout_seconds} seconds")
-        cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
-        return 124
-    except OSError as exc:
-        state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
-        print(f"[{item_id}] failed to start: {exc}")
-        cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
-        return cleanup_code or 1
-    if completed.returncode == 0:
-        state.mark(item_id, "completed", {"completedAt": utc_now(), "exitCode": 0})
-        print(f"[{item_id}] completed")
-    else:
-        state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": completed.returncode})
-        print(f"[{item_id}] failed: exit {completed.returncode}")
-    cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=completed.returncode == 0)
-    if cleanup_code != 0 and completed.returncode == 0:
+    state.mark(item_id, "running", {"startedAt": utc_now(), "runCount": len(runs), **execution})
+    for run in runs:
+        runner = effective_runner(manifest, run)
+        run_timeout = timeout_seconds if timeout_seconds is not None else runner.get("timeoutSeconds")
+        try:
+            prompt_text = render_prompt(manifest, item, manifest_path, execution, run, runs)
+            command = build_command(manifest, manifest_path, prompt_text, run_dir, runner)
+        except (OSError, OcmoError) as exc:
+            state.mark_run(item_id, str(run["id"]), "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
+            state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
+            print(f"[{item_id}/{run['id']}] failed before start: {exc}")
+            cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
+            return cleanup_code or 1
+        state.mark_run(item_id, str(run["id"]), "running", {"startedAt": utc_now(), "command": command_without_prompt(command), "timeoutSeconds": run_timeout})
+        print(f"[{item_id}/{run['id']}] starting")
+        try:
+            completed = subprocess.run(command, cwd=str(run_dir), timeout=run_timeout)
+        except subprocess.TimeoutExpired:
+            state.mark_run(item_id, str(run["id"]), "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout})
+            state.mark(item_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout, **execution})
+            print(f"[{item_id}/{run['id']}] timed out after {run_timeout} seconds")
+            cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
+            return 124
+        except OSError as exc:
+            state.mark_run(item_id, str(run["id"]), "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
+            state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
+            print(f"[{item_id}/{run['id']}] failed to start: {exc}")
+            cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
+            return cleanup_code or 1
+        if completed.returncode == 0:
+            state.mark_run(item_id, str(run["id"]), "completed", {"completedAt": utc_now(), "exitCode": 0})
+            print(f"[{item_id}/{run['id']}] completed")
+        else:
+            state.mark_run(item_id, str(run["id"]), "failed", {"completedAt": utc_now(), "exitCode": completed.returncode})
+            state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": completed.returncode, **execution})
+            print(f"[{item_id}/{run['id']}] failed: exit {completed.returncode}")
+            cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
+            return cleanup_code or completed.returncode
+    state.mark(item_id, "completed", {"completedAt": utc_now(), "exitCode": 0, **execution})
+    print(f"[{item_id}] completed")
+    cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=True)
+    if cleanup_code != 0:
         state.mark(item_id, "cleanup_failed", {"completedAt": utc_now(), "exitCode": cleanup_code, **execution})
         print(f"[{item_id}] cleanup failed: exit {cleanup_code}")
         return cleanup_code
-    return completed.returncode
+    return 0
 
 
 def worktree_execution(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any]) -> dict[str, Any]:
@@ -573,6 +680,18 @@ class StateStore:
             data["updatedAt"] = utc_now()
             self._write(data)
 
+    def mark_run(self, item_id: str, run_id: str, status: str, patch: dict[str, Any]) -> None:
+        with self.lock:
+            data = self._read()
+            data.setdefault("items", {})
+            item_state = data["items"].setdefault(item_id, {})
+            runs = item_state.setdefault("runs", {})
+            run_state = runs.setdefault(run_id, {})
+            run_state.update(patch)
+            run_state["status"] = status
+            data["updatedAt"] = utc_now()
+            self._write(data)
+
     def patch(self, item_id: str, patch: dict[str, Any]) -> None:
         with self.lock:
             data = self._read()
@@ -647,6 +766,10 @@ Rules:
 - Use queue.concurrency: 1 when the request uses one git worktree or branch-changing workflow.
 - Use queue.autoWorktrees.enabled: true only when the user wants ocmo to create one git worktree per item.
 - Put task-specific fields under each item's payload.
+- If one item needs multiple agents or prompt phases, use items[].runs.mode: sequential and put runs under items[].runs.steps.
+- Use per-run prompt.template values when different agents need different instructions.
+- Use the top-level prompt.template only when every run can share the same template.
+- Do not use runs.mode: parallel; it is reserved for future support.
 - If a required value is ambiguous, set it to NEEDS_DECISION instead of guessing.
 - Refer to read-only source files only as evidence; do not modify them.
 
