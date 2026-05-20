@@ -22,6 +22,8 @@ import yaml
 DONE_STATUSES = {"completed", "done", "skipped"}
 MANIFEST_START = "OCMO_MANIFEST_START"
 MANIFEST_END = "OCMO_MANIFEST_END"
+FILE_START = "OCMO_FILE_START"
+FILE_END = "OCMO_FILE_END"
 TERMINAL_STATUSES = {"completed", "failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"}
 
 
@@ -1081,16 +1083,20 @@ def plan_manifest(args: argparse.Namespace) -> int:
             return returncode
         previous_output = output
         try:
-            manifest_text = extract_marked_manifest(output) if interactive else output
+            manifest_text, generated_files = parse_plan_output(output, interactive)
             manifest = load_manifest_text(manifest_text)
             validate_manifest_schema(manifest, out_path)
+            validate_generated_plan_files(manifest, out_path, generated_files)
         except (OcmoError, yaml.YAMLError) as exc:
             feedback = str(exc)
             print(f"ocmo: planner output invalid on attempt {attempt}/{max_attempts}: {feedback}", file=sys.stderr)
             continue
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        write_generated_plan_files(out_path, generated_files)
         out_path.write_text(manifest_text, encoding="utf-8")
         print(f"wrote: {out_path}")
+        for relative_path in sorted(generated_files, key=str):
+            print(f"wrote: {out_path.parent / relative_path}")
         return 0
     raise OcmoError(f"planner did not produce a valid ocmo/v1 manifest after {max_attempts} attempts: {feedback}")
 
@@ -1141,6 +1147,17 @@ def run_plan_command(command: list[str], interactive: bool) -> tuple[int, str, s
     return process.wait(), "".join(output_parts), ""
 
 
+def parse_plan_output(text: str, require_manifest_markers: bool) -> tuple[str, dict[Path, str]]:
+    has_manifest_markers = MANIFEST_START in text or MANIFEST_END in text
+    if require_manifest_markers or has_manifest_markers:
+        manifest_text = extract_marked_manifest(text)
+    elif FILE_START in text or FILE_END in text:
+        raise OcmoError(f"planner file blocks require {MANIFEST_START} and {MANIFEST_END} markers")
+    else:
+        manifest_text = text
+    return manifest_text, extract_plan_files(text)
+
+
 def extract_marked_manifest(text: str) -> str:
     start = text.find(MANIFEST_START)
     end = text.find(MANIFEST_END)
@@ -1152,11 +1169,71 @@ def extract_marked_manifest(text: str) -> str:
     return manifest + "\n"
 
 
+def extract_plan_files(text: str) -> dict[Path, str]:
+    pattern = re.compile(rf"^{FILE_START}\s+(.+?)\s*$\r?\n(.*?)^\s*{FILE_END}\s*$", re.MULTILINE | re.DOTALL)
+    files: dict[Path, str] = {}
+    for match in pattern.finditer(text):
+        relative_path = safe_plan_file_path(match.group(1).strip())
+        content = match.group(2)
+        if relative_path in files:
+            raise OcmoError(f"duplicate generated file block: {relative_path}")
+        files[relative_path] = content
+    if FILE_START in text and not files:
+        raise OcmoError(f"planner file blocks must use {FILE_START} <relative-path> and {FILE_END} markers")
+    return files
+
+
+def safe_plan_file_path(value: str) -> Path:
+    path = Path(value)
+    if not value or path.is_absolute() or path.drive or ".." in path.parts or path == Path("."):
+        raise OcmoError(f"generated file path must be relative and stay under the manifest directory: {value}")
+    return path
+
+
+def validate_generated_plan_files(manifest: dict[str, Any], manifest_path: Path, generated_files: dict[Path, str]) -> None:
+    missing = []
+    for template in plan_template_paths(manifest):
+        template_path = Path(template)
+        if template_path.is_absolute():
+            if not template_path.exists():
+                missing.append(template)
+            continue
+        relative_template = safe_plan_file_path(template)
+        resolved_template = resolve_manifest_path(manifest_path, template)
+        if relative_template not in generated_files and not resolved_template.exists():
+            missing.append(template)
+    if missing:
+        raise OcmoError(f"planner referenced prompt template but did not generate it: {missing[0]}")
+
+
+def plan_template_paths(manifest: dict[str, Any]) -> list[str]:
+    templates = [str(manifest["prompt"]["template"])]
+    for item in manifest.get("items", []):
+        runs = item.get("runs") if isinstance(item, dict) else None
+        if not isinstance(runs, dict):
+            continue
+        steps = runs.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            prompt = step.get("prompt") if isinstance(step, dict) else None
+            if isinstance(prompt, dict) and "template" in prompt:
+                templates.append(str(prompt["template"]))
+    return templates
+
+
+def write_generated_plan_files(manifest_path: Path, generated_files: dict[Path, str]) -> None:
+    for relative_path, content in generated_files.items():
+        path = manifest_path.parent / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
 def build_planning_feedback_prompt(original_prompt: str, invalid_yaml: str, error: str, interactive: bool = False) -> str:
     final_instruction = (
-        f"Return corrected YAML between {MANIFEST_START} and {MANIFEST_END} markers."
+        f"Return corrected YAML between {MANIFEST_START} and {MANIFEST_END} markers, followed by any required {FILE_START} file blocks."
         if interactive
-        else "Return corrected YAML only, no Markdown fences."
+        else f"Return corrected output only, no Markdown fences. If the manifest references generated prompt templates, wrap the YAML in {MANIFEST_START}/{MANIFEST_END} and include {FILE_START} file blocks."
     )
     return f"""{original_prompt}
 
@@ -1179,9 +1256,9 @@ def build_planning_prompt(source_prompt: str, read_files: list[Path], workspace:
     prompt_dir = artifact_dir / "prompts"
     state_path = artifact_dir / "state.json"
     output_rule = (
-        f"You may ask clarifying questions in the terminal before producing the manifest. When ready, output the final YAML between exact {MANIFEST_START} and {MANIFEST_END} markers."
+        f"You may ask clarifying questions in the terminal before producing the manifest. When ready, output the final YAML between exact {MANIFEST_START} and {MANIFEST_END} markers, followed by any generated prompt template file blocks."
         if interactive
-        else "Output YAML only, no Markdown fences."
+        else f"If the manifest references generated prompt template files, output a bundle: YAML between exact {MANIFEST_START} and {MANIFEST_END} markers, then one file block per generated file. If no files are generated, output YAML only. Never use Markdown fences."
     )
     return f"""Convert this mass-operation request into an ocmo/v1 YAML manifest.
 
@@ -1204,6 +1281,10 @@ Rules:
 - prompt.template and per-run prompt.template must be file paths, not inline YAML block text.
 - Put generated prompt templates under: {prompt_dir}
 - Use prompt template paths relative to the manifest file, for example: prompts/example.md
+- Every generated prompt template referenced by the manifest must be included after the manifest as a file block:
+  {FILE_START} prompts/example.md
+  <template content>
+  {FILE_END}
 - Use this state path unless the user explicitly requested a different state location: {state_path}
 - Use a state path relative to the manifest file, for example: state.json
 - Use prompt.skills when a run must require opencode skills; list skill names without prose, for example [code-review].

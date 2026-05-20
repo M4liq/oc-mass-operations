@@ -69,7 +69,8 @@ items:
     def load(self, extra: str = "") -> dict:
         return cli.load_manifest(self.write_manifest(extra))
 
-    def planned_manifest_text(self, template: str = ".ocmo/prompts/generated.md") -> str:
+    def planned_manifest_text(self, template: str | None = None) -> str:
+        template = template or self.prompt.as_posix()
         return f"""schema: ocmo/v1
 operation:
   id: planned-op
@@ -1031,6 +1032,65 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         self.assertIn("build", captured["command"])
         self.assertIn("prompts/example.md", captured["command"][-1])
         self.assertIn("state.json", captured["command"][-1])
+
+    def test_plan_manifest_writes_generated_prompt_template_files(self) -> None:
+        prompt = self.root / "request.txt"
+        prompt.write_text("Request", encoding="utf-8")
+        out = self.root / "planned" / "manifest.yaml"
+        manifest_text = self.planned_manifest_text("prompts/generated.md")
+        output = f"""{cli.MANIFEST_START}
+{manifest_text}{cli.MANIFEST_END}
+{cli.FILE_START} prompts/generated.md
+Generated template for $item_id
+{cli.FILE_END}
+"""
+
+        with mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["opencode"], 0, stdout=output, stderr="")), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[], out=out, model=None, agent="build", dry_run=False, max_attempts=1, workspace=self.workspace, interactive=False))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(out.read_text(encoding="utf-8"), manifest_text)
+        self.assertEqual((out.parent / "prompts" / "generated.md").read_text(encoding="utf-8"), "Generated template for $item_id\n")
+
+    def test_plan_output_rejects_unsafe_duplicate_and_missing_generated_files(self) -> None:
+        with self.assertRaisesRegex(cli.OcmoError, "require OCMO_MANIFEST_START"):
+            cli.parse_plan_output(f"{cli.FILE_START} prompts/a.md\nA\n{cli.FILE_END}\n", require_manifest_markers=False)
+
+        with self.assertRaisesRegex(cli.OcmoError, "file blocks must use"):
+            cli.extract_plan_files(f"{cli.FILE_START} prompts/a.md\nA\n")
+
+        unsafe = f"{cli.MANIFEST_START}\n{self.planned_manifest_text()}{cli.MANIFEST_END}\n{cli.FILE_START} ../bad.md\nA\n{cli.FILE_END}\n"
+        with self.assertRaisesRegex(cli.OcmoError, "relative and stay under"):
+            cli.parse_plan_output(unsafe, require_manifest_markers=False)
+
+        duplicate = f"{cli.FILE_START} prompts/a.md\nA\n{cli.FILE_END}\n{cli.FILE_START} prompts/a.md\nB\n{cli.FILE_END}\n"
+        with self.assertRaisesRegex(cli.OcmoError, "duplicate"):
+            cli.extract_plan_files(duplicate)
+
+        manifest = cli.load_manifest_text(self.planned_manifest_text("prompts/missing.md"))
+        with self.assertRaisesRegex(cli.OcmoError, "did not generate"):
+            cli.validate_generated_plan_files(manifest, self.root / "planned" / "manifest.yaml", {})
+
+        manifest = cli.load_manifest_text(self.planned_manifest_text(str(self.root / "absent.md")))
+        with self.assertRaisesRegex(cli.OcmoError, "did not generate"):
+            cli.validate_generated_plan_files(manifest, self.root / "planned" / "manifest.yaml", {})
+
+        multi_run = cli.load_manifest_text(
+            self.planned_manifest_text("prompts/default.md")
+            + "  - id: ITEM-002\n"
+            + "    status: pending\n"
+            + "    payload: {}\n"
+            + "    runs:\n"
+            + "      mode: sequential\n"
+            + "      steps:\n"
+            + "        - id: review\n"
+            + "          prompt:\n"
+            + "            template: prompts/review.md\n"
+        )
+        self.assertEqual(cli.plan_template_paths(multi_run), ["prompts/default.md", "prompts/review.md"])
+        multi_run["items"][1]["runs"]["steps"].append({"id": "no-prompt"})
+        multi_run["items"].append({"id": "bad-runs", "runs": {"steps": "not-a-list"}})
+        self.assertEqual(cli.plan_template_paths(multi_run), ["prompts/default.md", "prompts/review.md"])
 
     def test_plan_manifest_interactive_extracts_marked_yaml(self) -> None:
         prompt = self.root / "request.txt"

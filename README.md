@@ -464,9 +464,23 @@ ocmo plan `
 
 If `--out` is omitted, the manifest is written under the workspace using the prompt file name: `<workspace>/.ocmo/<prompt-stem>/manifest.yaml`. The planning prompt also tells `opencode` to place generated prompt templates in that same operation folder, for example `prompts/example.md`, and to use `state.json` for operation state. Pass `--out` to override the manifest path.
 
+When the generated manifest references prompt templates that do not already exist, the planner must return them as file blocks after the manifest. `ocmo plan` writes those files relative to the manifest directory and rejects unsafe paths such as absolute paths or `..` segments:
+
+```text
+OCMO_MANIFEST_START
+schema: ocmo/v1
+...
+prompt:
+  template: prompts/example.md
+OCMO_MANIFEST_END
+OCMO_FILE_START prompts/example.md
+Prompt template contents for $item_id
+OCMO_FILE_END
+```
+
 `--agent` defaults to `build`.
 
-`--interactive` allows the planning agent to ask terminal questions before returning the final manifest. In interactive mode, `ocmo` expects the final YAML between `OCMO_MANIFEST_START` and `OCMO_MANIFEST_END` markers, extracts only that YAML, validates it, and writes it to the resolved output path.
+`--interactive` allows the planning agent to ask terminal questions before returning the final manifest. In interactive mode, `ocmo` expects the final YAML between `OCMO_MANIFEST_START` and `OCMO_MANIFEST_END` markers, extracts only that YAML, writes any generated file blocks, validates the result, and writes the manifest to the resolved output path.
 
 Planner output is validated before it is written. Invalid YAML or invalid `ocmo/v1` shape is retried with validator feedback up to `--max-attempts` times, defaulting to 3.
 
