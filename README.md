@@ -410,13 +410,15 @@ If `manifest-or-directory` is omitted, `run` uses `manifest.yaml` in the current
 
 `run` validates the manifest, selects items, renders prompts, and starts `opencode run` processes for each selected item. Items without `runs` start one process. Items with `runs.mode: sequential` start one process per step, in step order. It writes durable state to `state.path` and marks each item as it moves through the queue.
 
+Each `opencode run` process writes its combined stdout/stderr to a separate text file under `outputs/` beside the manifest. Output files are named `<item-id>__<run-id>.txt` with unsafe filename characters replaced. The run state records each file as `outputPath`, for example `outputs/WORK-001__default.txt`, so long-running agents can be inspected without relying on terminal output.
+
 If `queue.autoWorktrees.enabled: true`, `run` also creates one native git worktree per selected item, runs configured setup commands, runs `opencode` inside that worktree, and applies configured teardown and cleanup behavior.
 
 `run` asks for confirmation before starting work unless `--yes` or `-y` is provided.
 
 By default, `run` uses `--ui auto`. In an interactive terminal, `auto` uses a live Rich dashboard showing selected item count, current item status, active run step, per-item progress, runtime, and recent events. When stdout is redirected or `rich` is unavailable, `auto` falls back to plain line-oriented output. Use `--ui plain` for stable logs or CI output. Use `--ui live` to require the live terminal dashboard.
 
-In live UI mode, child `opencode run` output is captured so concurrent agents do not corrupt the dashboard. The dashboard reports that output was produced and shows recent output context as events instead of streaming each child process directly into the terminal.
+In live UI mode, child `opencode run` output is redirected to `outputs/` so concurrent agents do not corrupt the dashboard.
 
 Options:
 
@@ -476,6 +478,8 @@ If `--out` is omitted, the manifest is written under the resolved workspace usin
       state.json
       prompts/
         <generated-template>.md
+      outputs/
+        <item-id>__<run-id>.txt
 ```
 
 For example, running this from `C:\repo\docs`:

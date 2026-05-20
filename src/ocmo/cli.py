@@ -656,6 +656,46 @@ def subprocess_run_kwargs(reporter: PlainRunReporter) -> dict[str, Any]:
     return {}
 
 
+def run_output_path(manifest_path: Path, item_id: str, run_id: str) -> Path:
+    return manifest_path.parent / "outputs" / f"{slugify(item_id)}__{slugify(run_id)}.txt"
+
+
+def relative_to_manifest(path: Path, manifest_path: Path) -> str:
+    return path.relative_to(manifest_path.parent).as_posix()
+
+
+def run_opencode_command(
+    command: list[str],
+    run_dir: Path,
+    run_timeout: int | None,
+    output_path: Path,
+) -> subprocess.CompletedProcess:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as output:
+        output.write(f"$ {format_command(command)}\n\n")
+        output.flush()
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(run_dir),
+                timeout=run_timeout,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except subprocess.TimeoutExpired:
+            output.write(f"\n[ocmo] timed out after {run_timeout} seconds\n")
+            output.flush()
+            raise
+        except OSError as exc:
+            output.write(f"\n[ocmo] failed to start: {exc}\n")
+            output.flush()
+            raise
+        output.write(f"\n[ocmo] exit code: {completed.returncode}\n")
+        output.flush()
+        return completed
+
+
 def run_manifest(options: RunOptions) -> int:
     manifest = load_manifest(options.manifest_path)
     validate_manifest(manifest, options.manifest_path)
@@ -769,10 +809,21 @@ def run_item(
             reporter.run(item_id, run_id, "failed", f"failed before start: {exc}")
             cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
             return cleanup_code or 1
-        state.mark_run(item_id, run_id, "running", {"startedAt": utc_now(), "command": command_without_prompt(command), "timeoutSeconds": run_timeout})
+        output_path = run_output_path(manifest_path, item_id, run_id)
+        state.mark_run(
+            item_id,
+            run_id,
+            "running",
+            {
+                "startedAt": utc_now(),
+                "command": command_without_prompt(command),
+                "timeoutSeconds": run_timeout,
+                "outputPath": relative_to_manifest(output_path, manifest_path),
+            },
+        )
         reporter.run(item_id, run_id, "running", "starting")
         try:
-            completed = subprocess.run(command, cwd=str(run_dir), timeout=run_timeout, **subprocess_run_kwargs(reporter))
+            completed = run_opencode_command(command, run_dir, run_timeout, output_path)
         except subprocess.TimeoutExpired:
             state.mark_run(item_id, run_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout})
             state.mark(item_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout, **execution})

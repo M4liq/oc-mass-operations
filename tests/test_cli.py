@@ -367,6 +367,7 @@ class RunManifestTests(OcmoTestCase):
 
         def fake_run(command: list[str], **kwargs):
             calls.append(command)
+            kwargs["stdout"].write(f"agent output for {command[-1]}\n")
             return subprocess.CompletedProcess(command, 0)
 
         with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
@@ -380,6 +381,10 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(state["items"]["1"]["status"], "completed")
         self.assertEqual(state["items"]["1"]["runs"]["one"]["status"], "completed")
         self.assertEqual(state["items"]["1"]["runs"]["two"]["status"], "completed")
+        self.assertEqual(state["items"]["1"]["runs"]["one"]["outputPath"], "outputs/1__one.txt")
+        self.assertEqual(state["items"]["1"]["runs"]["two"]["outputPath"], "outputs/1__two.txt")
+        self.assertIn("agent output for", (self.root / "outputs" / "1__one.txt").read_text(encoding="utf-8"))
+        self.assertIn("[ocmo] exit code: 0", (self.root / "outputs" / "1__two.txt").read_text(encoding="utf-8"))
 
     def test_run_manifest_stops_later_runs_after_failure(self) -> None:
         manifest = self.load()
@@ -408,6 +413,8 @@ class RunManifestTests(OcmoTestCase):
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["items"]["1"]["status"], "timed_out")
         self.assertEqual(state["items"]["1"]["runs"]["default"]["status"], "timed_out")
+        self.assertEqual(state["items"]["1"]["runs"]["default"]["outputPath"], "outputs/1__default.txt")
+        self.assertIn("[ocmo] timed out after 1 seconds", (self.root / "outputs" / "1__default.txt").read_text(encoding="utf-8"))
 
     def test_no_selected_items_returns_zero(self) -> None:
         manifest = self.load()
