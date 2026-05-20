@@ -349,7 +349,7 @@ Sequential run behavior:
 | Inspect rendered prompt text | `ocmo render <manifest> --select <selector>` |
 | Inspect the full execution plan | `ocmo run <manifest> --select <selector> --dry-run` |
 | Execute selected items | `ocmo run <manifest> --select <selector> --yes` |
-| Generate a manifest draft | `ocmo plan --from <prompt-file> --out <manifest>` |
+| Generate a manifest draft | `ocmo plan --from <prompt-file>` |
 
 ### `ocmo validate`
 
@@ -446,7 +446,7 @@ When auto worktrees are enabled, `--dry-run` also prints the planned worktree pa
 ### `ocmo plan`
 
 ```powershell
-ocmo plan --from <prompt-file> --out <manifest> [--workspace <path>] [--read <source-file>] [--model <model>] [--agent <agent>] [--interactive] [--dry-run]
+ocmo plan --from <prompt-file> [--out <manifest>] [--workspace <path>] [--read <source-file>] [--model <model>] [--agent <agent>] [--interactive] [--dry-run]
 ```
 
 Example:
@@ -455,15 +455,18 @@ Example:
 ocmo plan `
   --workspace "C:\path\to\target-repo" `
   --from prompt.txt `
-  --read "C:\path\to\source-data.csv" `
-  --out ocmo/example-operation.yaml
+  --read "C:\path\to\source-data.csv"
 ```
 
 `plan` asks `opencode` to convert a natural-language mass-operation request into an `ocmo/v1` manifest. It can attach read-only source files such as CSV exports, text files, or other planning inputs. If the request needs multiple agents or phases per item, the planning prompt tells `opencode` to use `items[].runs.mode: sequential` and per-run `prompt.template` values.
 
 `--workspace` sets the target repository for planning and is passed to `opencode run --dir`. If omitted, it defaults to the current working directory. The planner is instructed to use the resolved workspace path as `operation.workspace`.
 
-`--interactive` allows the planning agent to ask terminal questions before returning the final manifest. In interactive mode, `ocmo` expects the final YAML between `OCMO_MANIFEST_START` and `OCMO_MANIFEST_END` markers, extracts only that YAML, validates it, and writes it to `--out`.
+If `--out` is omitted, the manifest is written under the workspace using the prompt file name: `<workspace>/.ocmo/<prompt-stem>/manifest.yaml`. The planning prompt also tells `opencode` to place generated prompt templates in that same operation folder, for example `prompts/example.md`, and to use `state.json` for operation state. Pass `--out` to override the manifest path.
+
+`--agent` defaults to `build`.
+
+`--interactive` allows the planning agent to ask terminal questions before returning the final manifest. In interactive mode, `ocmo` expects the final YAML between `OCMO_MANIFEST_START` and `OCMO_MANIFEST_END` markers, extracts only that YAML, validates it, and writes it to the resolved output path.
 
 Planner output is validated before it is written. Invalid YAML or invalid `ocmo/v1` shape is retried with validator feedback up to `--max-attempts` times, defaulting to 3.
 
@@ -472,7 +475,7 @@ Planning does not execute operation items. It should only produce a manifest and
 Use `--dry-run` to print the planning prompt without starting `opencode`:
 
 ```powershell
-ocmo plan --from prompt.txt --out ocmo/example-operation.yaml --dry-run
+ocmo plan --from prompt.txt --dry-run
 ```
 
 ## Selection Rules

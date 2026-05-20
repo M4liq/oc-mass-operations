@@ -599,17 +599,15 @@ class CliEntrypointTests(OcmoTestCase):
     def test_plan_dry_run_prints_prompt_without_subprocess(self) -> None:
         request = self.root / "request.txt"
         request.write_text("Rewrite the reports", encoding="utf-8")
-        out = self.root / "out.yaml"
         stdout = io.StringIO()
 
         with mock.patch("ocmo.cli.subprocess.run") as run, contextlib.redirect_stdout(stdout):
-            code = cli.main(["plan", "--from", str(request), "--out", str(out), "--dry-run"])
+            code = cli.main(["plan", "--from", str(request), "--dry-run"])
 
         self.assertEqual(code, 0)
         self.assertIn("Convert this mass-operation request", stdout.getvalue())
         self.assertIn("Rewrite the reports", stdout.getvalue())
         run.assert_not_called()
-        self.assertFalse(out.exists())
 
 
 class EdgeCaseCoverageTests(OcmoTestCase):
@@ -1013,6 +1011,26 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         self.assertIn("--dir", captured["command"])
         self.assertIn(str(workspace.resolve()), captured["command"])
         self.assertIn(f"operation.workspace must be exactly: {workspace.resolve()}", captured["command"][-1])
+
+    def test_plan_manifest_defaults_output_under_workspace_artifact_folder(self) -> None:
+        prompt = self.root / "business-taxonomy-prompt.txt"
+        prompt.write_text("Request", encoding="utf-8")
+        expected = self.workspace / ".ocmo" / "business-taxonomy-prompt" / "manifest.yaml"
+        captured = {}
+
+        def fake_plan_run(command, **kwargs):
+            captured["command"] = command
+            return subprocess.CompletedProcess(command, 0, stdout=self.planned_manifest_text(), stderr="")
+
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_plan_run), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main(["plan", "--from", str(prompt), "--workspace", str(self.workspace), "--max-attempts", "1"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(expected.read_text(encoding="utf-8"), self.planned_manifest_text())
+        self.assertIn("--agent", captured["command"])
+        self.assertIn("build", captured["command"])
+        self.assertIn("prompts/example.md", captured["command"][-1])
+        self.assertIn("state.json", captured["command"][-1])
 
     def test_plan_manifest_interactive_extracts_marked_yaml(self) -> None:
         prompt = self.root / "request.txt"

@@ -63,10 +63,10 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser = subparsers.add_parser("plan", help="Ask opencode to convert a prompt into an ocmo manifest")
     plan_parser.add_argument("--from", dest="from_file", required=True, type=Path, help="Natural-language operation prompt")
     plan_parser.add_argument("--read", dest="read_files", action="append", default=[], type=Path, help="Read-only source file to attach/inspect")
-    plan_parser.add_argument("--out", required=True, type=Path, help="Manifest output path")
+    plan_parser.add_argument("--out", type=Path, help="Manifest output path; defaults to <workspace>/.ocmo/<prompt-stem>/manifest.yaml")
     plan_parser.add_argument("--workspace", type=Path, help="Target workspace for planning; defaults to the current directory")
     plan_parser.add_argument("--model", help="opencode model")
-    plan_parser.add_argument("--agent", default="plan", help="opencode agent to use for planning")
+    plan_parser.add_argument("--agent", default="build", help="opencode agent to use for planning")
     plan_parser.add_argument("--max-attempts", type=int, default=3, help="Maximum planner correction attempts")
     plan_parser.add_argument("--interactive", action="store_true", help="Allow the planner to ask terminal questions before returning marked YAML")
     plan_parser.add_argument("--dry-run", action="store_true", help="Print the planning prompt only")
@@ -1056,15 +1056,18 @@ def plan_manifest(args: argparse.Namespace) -> int:
     if missing:
         raise OcmoError(f"read-only source file not found: {missing[0]}")
     workspace = plan_workspace(args)
+    out_path = plan_output_path(args, workspace)
+    artifact_dir = plan_artifact_dir(args, workspace, out_path)
     configured_interactive = getattr(args, "interactive", False)
     interactive = configured_interactive if isinstance(configured_interactive, bool) else False
     source_prompt = args.from_file.read_text(encoding="utf-8")
-    planning_prompt = build_planning_prompt(source_prompt, args.read_files, workspace, interactive)
+    planning_prompt = build_planning_prompt(source_prompt, args.read_files, workspace, interactive, artifact_dir)
     if args.dry_run:
         print(planning_prompt)
         return 0
     print(f"ocmo: planning with agent={args.agent} model={args.model or '<opencode-default>'}", file=sys.stderr)
     print(f"ocmo: planning workspace={workspace}", file=sys.stderr)
+    print(f"ocmo: planning output={out_path}", file=sys.stderr)
     feedback = None
     previous_output = ""
     for attempt in range(1, max_attempts + 1):
@@ -1080,14 +1083,14 @@ def plan_manifest(args: argparse.Namespace) -> int:
         try:
             manifest_text = extract_marked_manifest(output) if interactive else output
             manifest = load_manifest_text(manifest_text)
-            validate_manifest_schema(manifest, args.out)
+            validate_manifest_schema(manifest, out_path)
         except (OcmoError, yaml.YAMLError) as exc:
             feedback = str(exc)
             print(f"ocmo: planner output invalid on attempt {attempt}/{max_attempts}: {feedback}", file=sys.stderr)
             continue
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(manifest_text, encoding="utf-8")
-        print(f"wrote: {args.out}")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(manifest_text, encoding="utf-8")
+        print(f"wrote: {out_path}")
         return 0
     raise OcmoError(f"planner did not produce a valid ocmo/v1 manifest after {max_attempts} attempts: {feedback}")
 
@@ -1097,6 +1100,19 @@ def plan_workspace(args: argparse.Namespace) -> Path:
     if isinstance(configured, Path):
         return configured.resolve()
     return Path.cwd().resolve()
+
+
+def plan_output_path(args: argparse.Namespace, workspace: Path) -> Path:
+    configured = getattr(args, "out", None)
+    if isinstance(configured, Path):
+        return configured.resolve()
+    return workspace / ".ocmo" / args.from_file.stem / "manifest.yaml"
+
+
+def plan_artifact_dir(args: argparse.Namespace, workspace: Path, out_path: Path) -> Path:
+    if isinstance(getattr(args, "out", None), Path):
+        return out_path.parent
+    return workspace / ".ocmo" / args.from_file.stem
 
 
 def build_plan_command(args: argparse.Namespace, prompt: str, workspace: Path, interactive: bool = False) -> list[str]:
@@ -1156,9 +1172,12 @@ Previous YAML:
 """
 
 
-def build_planning_prompt(source_prompt: str, read_files: list[Path], workspace: Path | None = None, interactive: bool = False) -> str:
+def build_planning_prompt(source_prompt: str, read_files: list[Path], workspace: Path | None = None, interactive: bool = False, artifact_dir: Path | None = None) -> str:
     read_list = "\n".join(f"- {path}" for path in read_files) or "- none"
     workspace = workspace or Path.cwd().resolve()
+    artifact_dir = artifact_dir or workspace / ".ocmo" / "planned-operation"
+    prompt_dir = artifact_dir / "prompts"
+    state_path = artifact_dir / "state.json"
     output_rule = (
         f"You may ask clarifying questions in the terminal before producing the manifest. When ready, output the final YAML between exact {MANIFEST_START} and {MANIFEST_END} markers."
         if interactive
@@ -1183,6 +1202,10 @@ Rules:
 - Use per-run prompt.template values when different agents need different instructions.
 - Use the top-level prompt.template only when every run can share the same template.
 - prompt.template and per-run prompt.template must be file paths, not inline YAML block text.
+- Put generated prompt templates under: {prompt_dir}
+- Use prompt template paths relative to the manifest file, for example: prompts/example.md
+- Use this state path unless the user explicitly requested a different state location: {state_path}
+- Use a state path relative to the manifest file, for example: state.json
 - Use prompt.skills when a run must require opencode skills; list skill names without prose, for example [code-review].
 - Use per-run prompt.skills when different sequential runs need different required skills.
 - Do not use runs.mode: parallel; it is reserved for future support.
@@ -1217,10 +1240,10 @@ queue:
 policy:
   worktree: single
 prompt:
-  template: .ocmo/prompts/example.md
+  template: prompts/example.md
   skills: []
 state:
-  path: .ocmo/state/example-operation.json
+  path: state.json
 items:
   - id: ITEM-001
     title: Example item
