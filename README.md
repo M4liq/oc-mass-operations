@@ -390,7 +390,7 @@ For `ocmo render`, `$worktree_path` and `$branch_name` are empty. `$source_works
 ### `ocmo run`
 
 ```powershell
-ocmo run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--dry-run] [--yes]
+ocmo run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--allow-shared-worktree-concurrency] [--dry-run] [--yes]
 ```
 
 Examples:
@@ -426,10 +426,11 @@ Options:
 - `--concurrency <count>`: overrides `queue.concurrency` for this invocation.
 - `--timeout-seconds <seconds>`: overrides manifest timeouts for every `opencode run` process in this invocation.
 - `--ui auto|live|plain`: controls non-dry-run terminal output; defaults to `auto`.
+- `--allow-shared-worktree-concurrency`: allows `concurrency > 1` with `policy.worktree: single` for this `run` invocation.
 - `--dry-run`: previews execution without starting work or writing state.
 - `--yes`, `-y`: skips the confirmation prompt for non-dry runs.
 
-`--concurrency` and `--timeout-seconds` must be positive integers. If `policy.worktree: single`, concurrency must be `1`. `policy.worktree: single` cannot be combined with `queue.autoWorktrees.enabled: true`.
+`--concurrency` and `--timeout-seconds` must be positive integers. If `policy.worktree: single`, concurrency must be `1` unless `--allow-shared-worktree-concurrency` is passed. `policy.worktree: single` cannot be combined with `queue.autoWorktrees.enabled: true`.
 
 ### `ocmo run --dry-run`
 
@@ -571,7 +572,9 @@ queue:
   concurrency: 1
 ```
 
-If you pass `--concurrency 2` with `policy.worktree: single`, `ocmo` fails before starting work.
+If you pass `--concurrency 2` with `policy.worktree: single`, `ocmo` fails before starting work unless you also pass `--allow-shared-worktree-concurrency`. That override is run-only and does not make `ocmo validate` accept a manifest whose `queue.concurrency` is above `1` with `policy.worktree: single`.
+
+Use `--allow-shared-worktree-concurrency` only when concurrent agents are safe to run in the same workspace. Agents can otherwise conflict through shared files, branch state, the git index, generated artifacts, or dependency caches.
 
 Parallel execution is appropriate only when items do not mutate shared state or when each item has a separate workspace/worktree.
 

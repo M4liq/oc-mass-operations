@@ -40,6 +40,7 @@ class RunOptions:
     dry_run: bool
     yes: bool
     ui: str = "auto"
+    allow_shared_worktree_concurrency: bool = False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,6 +55,11 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--dry-run", action="store_true", help="Print commands/prompts without running opencode")
     run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for non-dry runs")
     run_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for non-dry runs")
+    run_parser.add_argument(
+        "--allow-shared-worktree-concurrency",
+        action="store_true",
+        help="Allow concurrency > 1 with policy.worktree=single",
+    )
 
     validate_parser = subparsers.add_parser("validate", help="Validate a manifest")
     validate_parser.add_argument("manifest", type=Path)
@@ -77,7 +83,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "run":
             manifest_path = run_manifest_path(args.manifest)
-            return run_manifest(RunOptions(manifest_path, args.select, args.concurrency, args.timeout_seconds, args.dry_run, args.yes, args.ui))
+            return run_manifest(
+                RunOptions(
+                    manifest_path,
+                    args.select,
+                    args.concurrency,
+                    args.timeout_seconds,
+                    args.dry_run,
+                    args.yes,
+                    args.ui,
+                    args.allow_shared_worktree_concurrency,
+                )
+            )
         if args.command == "validate":
             manifest = load_manifest(args.manifest)
             validate_manifest(manifest, args.manifest)
@@ -122,8 +139,8 @@ def load_manifest_text(text: str) -> dict[str, Any]:
     return data
 
 
-def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> None:
-    validate_manifest_schema(manifest, manifest_path)
+def validate_manifest(manifest: dict[str, Any], manifest_path: Path, allow_shared_worktree_concurrency: bool = False) -> None:
+    validate_manifest_schema(manifest, manifest_path, allow_shared_worktree_concurrency)
     workspace = manifest["operation"]["workspace"]
     if not resolve_manifest_path(manifest_path, workspace).exists():
         raise OcmoError(f"operation.workspace does not exist: {workspace}")
@@ -138,7 +155,7 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> None:
         validate_item_run_paths(item, manifest_path, index)
 
 
-def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path) -> None:
+def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path, allow_shared_worktree_concurrency: bool = False) -> None:
     if manifest.get("schema") != "ocmo/v1":
         raise OcmoError("manifest schema must be ocmo/v1")
     operation = require_mapping(manifest, "operation")
@@ -157,7 +174,7 @@ def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path) -> N
     if auto_worktrees["enabled"]:
         validate_auto_worktrees(auto_worktrees)
     policy = manifest.get("policy", {})
-    if isinstance(policy, dict) and policy.get("worktree") == "single" and concurrency > 1:
+    if isinstance(policy, dict) and policy.get("worktree") == "single" and concurrency > 1 and not allow_shared_worktree_concurrency:
         raise OcmoError("policy.worktree=single requires queue.concurrency=1")
     if isinstance(policy, dict) and policy.get("worktree") == "single" and auto_worktrees["enabled"]:
         raise OcmoError("policy.worktree=single cannot be used with queue.autoWorktrees.enabled=true")
@@ -698,7 +715,7 @@ def run_opencode_command(
 
 def run_manifest(options: RunOptions) -> int:
     manifest = load_manifest(options.manifest_path)
-    validate_manifest(manifest, options.manifest_path)
+    validate_manifest(manifest, options.manifest_path, options.allow_shared_worktree_concurrency)
     selected = select_items(manifest, options.select)
     concurrency = options.concurrency if options.concurrency is not None else manifest.get("queue", {}).get("concurrency", 1)
     timeout_seconds = options.timeout_seconds
@@ -707,8 +724,8 @@ def run_manifest(options: RunOptions) -> int:
         raise OcmoError("concurrency must be a positive integer")
     if timeout_seconds is not None and timeout_seconds < 1:
         raise OcmoError("timeout must be a positive integer")
-    if manifest.get("policy", {}).get("worktree") == "single" and concurrency > 1:
-        raise OcmoError("policy.worktree=single cannot run with concurrency > 1")
+    if manifest.get("policy", {}).get("worktree") == "single" and concurrency > 1 and not options.allow_shared_worktree_concurrency:
+        raise OcmoError("policy.worktree=single cannot run with concurrency > 1; pass --allow-shared-worktree-concurrency to override")
     if manifest.get("policy", {}).get("worktree") == "single" and auto_worktrees["enabled"]:  # pragma: no cover
         raise OcmoError("policy.worktree=single cannot be used with queue.autoWorktrees.enabled=true")
     if not selected:

@@ -444,11 +444,26 @@ class RunManifestTests(OcmoTestCase):
         with self.assertRaisesRegex(cli.OcmoError, "policy.worktree=single cannot run with concurrency > 1"):
             cli.run_manifest(cli.RunOptions(self.manifest_path, "1", 2, None, True, False))
 
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", 2, None, True, False, allow_shared_worktree_concurrency=True))
+        self.assertEqual(code, 0)
+        self.assertIn("# item 1 / run default", stdout.getvalue())
+
+        manifest["queue"]["concurrency"] = 2
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(cli.OcmoError, "policy.worktree=single requires queue.concurrency=1"):
+            cli.validate_manifest(manifest, self.manifest_path)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, True, False, allow_shared_worktree_concurrency=True))
+        self.assertEqual(code, 0)
+
+        manifest["queue"]["concurrency"] = 1
         manifest["queue"]["autoWorktrees"] = {"enabled": True, "baseBranch": "main"}
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
         with mock.patch("ocmo.cli.ensure_git_repository"):
             with self.assertRaisesRegex(cli.OcmoError, "autoWorktrees.enabled=true"):
-                cli.run_manifest(cli.RunOptions(self.manifest_path, "1", 1, None, True, False))
+                cli.run_manifest(cli.RunOptions(self.manifest_path, "1", 1, None, True, False, allow_shared_worktree_concurrency=True))
 
     def test_confirmation_decline_cancels_run(self) -> None:
         self.write_manifest()
@@ -608,6 +623,11 @@ class CliEntrypointTests(OcmoTestCase):
             code = cli.main(["run", str(manifest_dir), "--dry-run"])
         self.assertEqual(code, 0)
         self.assertEqual(run.call_args.args[0].manifest_path, manifest_dir / "manifest.yaml")
+
+        with mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
+            code = cli.main(["run", "--allow-shared-worktree-concurrency", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertTrue(run.call_args.args[0].allow_shared_worktree_concurrency)
 
         self.assertEqual(cli.run_manifest_path(self.manifest_path), self.manifest_path)
 
