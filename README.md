@@ -83,6 +83,14 @@ queue:
   concurrency: 1
   order: manifest
   stopOnFailure: false
+  autoWorktrees:
+    enabled: false
+    root: .ocmo/worktrees
+    baseBranch: main
+    branchPattern: ocmo/{operation_id}/{item_id}
+    setup: []
+    teardown: []
+    cleanup: never
 
 policy:
   worktree: single
@@ -134,8 +142,9 @@ items:
 - `concurrency`: maximum active `opencode run` processes.
 - `order`: currently `manifest`; items run in manifest order.
 - `stopOnFailure`: reserved for stricter failure handling.
+- `autoWorktrees`: optional per-item git worktree creation and setup.
 
-`policy` is not interpreted deeply by `ocmo`, except for one safety rule: if `policy.worktree` is `single`, `ocmo` rejects `concurrency > 1`.
+`policy` is not interpreted deeply by `ocmo`, except for worktree safety rules: if `policy.worktree` is `single`, `ocmo` rejects `concurrency > 1` and rejects `queue.autoWorktrees.enabled: true`.
 
 `prompt.template` points to the per-item prompt template.
 
@@ -197,59 +206,147 @@ Available variables:
 - `$item_id`: current item ID
 - `$item_title`: current item title, if present
 - `$item_file`: current item file, if present
+- `$worktree_path`: created per-item worktree path when auto worktrees are enabled
+- `$source_workspace`: original `operation.workspace` path when auto worktrees are enabled
+- `$branch_name`: created per-item branch name when auto worktrees are enabled
 
 The prompt template should tell `opencode` exactly how to complete one item and how to stop. The template should also make clear that the agent must not work on any other item.
 
-## Commands
+## Command Reference
 
-Validate a manifest:
+Use these commands to validate manifests, inspect prompts, preview execution, run queues, and generate manifests from rough requests.
+
+| Task | Command |
+| --- | --- |
+| Check manifest validity | `ocmo validate <manifest>` |
+| Inspect rendered prompt text | `ocmo render <manifest> --select <selector>` |
+| Inspect the full execution plan | `ocmo run <manifest> --select <selector> --dry-run` |
+| Execute selected items | `ocmo run <manifest> --select <selector> --yes` |
+| Generate a manifest draft | `ocmo plan --from <prompt-file> --out <manifest>` |
+
+### `ocmo validate`
+
+```powershell
+ocmo validate <manifest>
+```
+
+Example:
 
 ```powershell
 ocmo validate examples/report-rewrite.yaml
 ```
 
-Render prompts for selected items:
+`validate` loads the manifest and checks the static configuration before any queue work starts. It verifies the manifest schema, workspace path, runner settings, queue settings, prompt template path, item IDs, concurrency policy, timeout configuration, and auto-worktree configuration.
+
+`validate` does not render prompts, start `opencode`, create worktrees, run setup or teardown commands, write state, edit files, or mark items.
+
+### `ocmo render`
+
+```powershell
+ocmo render <manifest> [--select <selector>]
+```
+
+Example:
 
 ```powershell
 ocmo render examples/report-rewrite.yaml --select WORK-001
 ```
 
-Dry-run generated `opencode` commands and prompts:
+`render` is a prompt-only preview. It validates the manifest, applies selection rules, renders `prompt.template` once for each selected item, and prints the resulting prompt text to stdout.
+
+`render` is intentionally read-only. It does not start `opencode`, build or print the final `opencode run` command, create worktrees, run setup or teardown commands, write state, edit files, apply concurrency, apply timeouts, or mark items.
+
+Use `render` when you only need to inspect the text that will be sent to an agent. Use `ocmo run --dry-run` when you need to inspect the actual execution command, timeout, and auto-worktree path or branch.
+
+Templates are rendered with these variables:
+
+- `$operation_json`: JSON representation of `operation`.
+- `$policy_json`: JSON representation of `policy`.
+- `$item_json`: JSON representation of the selected item.
+- `$payload_json`: JSON representation of `item.payload`.
+- `$operation_id`: `operation.id`.
+- `$operation_kind`: `operation.kind`, defaulting to `generic`.
+- `$workspace`: `operation.workspace` as written in the manifest.
+- `$item_id`: selected item ID.
+- `$item_title`: selected item title, or an empty string.
+- `$item_file`: selected item file, or an empty string.
+- `$worktree_path`: generated worktree path when an execution context provides one; empty for `ocmo render`.
+- `$source_workspace`: source workspace path when an execution context provides one; otherwise `operation.workspace`.
+- `$branch_name`: generated branch name when an execution context provides one; empty for `ocmo render`.
+
+### `ocmo run`
+
+```powershell
+ocmo run <manifest> [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--dry-run] [--yes]
+```
+
+Examples:
+
+```powershell
+ocmo run examples/report-rewrite.yaml --select uncompleted --yes
+ocmo run examples/report-rewrite.yaml --select WORK-001,WORK-002 --yes
+ocmo run examples/taxonomy-docs.yaml --select 41-48,93-96 --yes
+ocmo run examples/report-rewrite.yaml --concurrency 1 --yes
+ocmo run examples/report-rewrite.yaml --timeout-seconds 7200 --yes
+```
+
+`run` validates the manifest, selects items, renders one prompt per item, and starts one `opencode run` process per selected item. It writes durable state to `state.path` and marks each item as it moves through the queue.
+
+If `queue.autoWorktrees.enabled: true`, `run` also creates one native git worktree per selected item, runs configured setup commands, runs `opencode` inside that worktree, and applies configured teardown and cleanup behavior.
+
+`run` asks for confirmation before starting work unless `--yes` or `-y` is provided.
+
+Options:
+
+- `--select <selector>`: overrides `selection.default`; accepts `all`, `pending`, `uncompleted`, exact IDs, comma-separated IDs, numeric ranges, or mixed ranges and IDs.
+- `--concurrency <count>`: overrides `queue.concurrency` for this invocation.
+- `--timeout-seconds <seconds>`: overrides `runner.timeoutSeconds` for this invocation.
+- `--dry-run`: previews execution without starting work or writing state.
+- `--yes`, `-y`: skips the confirmation prompt for non-dry runs.
+
+`--concurrency` and `--timeout-seconds` must be positive integers. If `policy.worktree: single`, concurrency must be `1`. `policy.worktree: single` cannot be combined with `queue.autoWorktrees.enabled: true`.
+
+### `ocmo run --dry-run`
+
+```powershell
+ocmo run <manifest> --select <selector> --dry-run
+```
+
+Example:
 
 ```powershell
 ocmo run examples/report-rewrite.yaml --select WORK-001 --dry-run
 ```
 
-`--dry-run` validates the manifest, applies the selection, renders the prompt for every selected item, and prints the `opencode run` command that would be launched. It does not start `opencode`, write state, edit files, or mark items as completed or failed.
+`--dry-run` validates the manifest, applies selection rules, renders the prompt for each selected item, and prints the `opencode run` command that would be launched.
 
-Run all uncompleted items:
+When auto worktrees are enabled, `--dry-run` also prints the planned worktree path and branch name. When a timeout is configured, it prints the effective timeout.
+
+`--dry-run` does not start `opencode`, create worktrees, run setup or teardown commands, write state, edit files, clean up worktrees, or mark items.
+
+### `ocmo plan`
 
 ```powershell
-ocmo run examples/report-rewrite.yaml --select uncompleted --yes
+ocmo plan --from <prompt-file> --out <manifest> [--read <source-file>] [--model <model>] [--agent <agent>] [--dry-run]
 ```
 
-Run specific items:
+Example:
 
 ```powershell
-ocmo run examples/report-rewrite.yaml --select WORK-001,WORK-002 --yes
+ocmo plan `
+  --from prompt.txt `
+  --read "C:\path\to\source-data.csv" `
+  --out ocmo/example-operation.yaml
 ```
 
-Run numeric manifest IDs:
+`plan` asks `opencode` to convert a natural-language mass-operation request into an `ocmo/v1` manifest. It can attach read-only source files such as CSV exports, text files, or other planning inputs.
+
+Planning does not execute operation items. It should only produce a manifest and any prompt template needed for review.
+
+Use `--dry-run` to print the planning prompt without starting `opencode`:
 
 ```powershell
-ocmo run examples/taxonomy-docs.yaml --select 41-48,93-96 --yes
-```
-
-Override concurrency:
-
-```powershell
-ocmo run examples/report-rewrite.yaml --concurrency 1 --yes
-```
-
-Override the per-item timeout:
-
-```powershell
-ocmo run examples/report-rewrite.yaml --timeout-seconds 7200 --yes
+ocmo plan --from prompt.txt --out ocmo/example-operation.yaml --dry-run
 ```
 
 ## Selection Rules
@@ -303,6 +400,51 @@ If you pass `--concurrency 2` with `policy.worktree: single`, `ocmo` fails befor
 
 Parallel execution is appropriate only when items do not mutate shared state or when each item has a separate workspace/worktree.
 
+## Auto Worktrees
+
+Set `queue.autoWorktrees.enabled: true` to have `ocmo` create one git worktree per selected item. Each selected item gets its own branch, setup commands, and isolated `opencode run --dir <worktree>` process.
+
+```yaml
+queue:
+  concurrency: 3
+  autoWorktrees:
+    enabled: true
+    root: .ocmo/worktrees
+    baseBranch: main
+    branchPattern: ocmo/{operation_id}/{item_id}
+    setup:
+      - npm ci
+    teardown: []
+    cleanup: never
+
+policy:
+  worktree: per-item
+  baseBranch: main
+```
+
+`autoWorktrees` fields:
+
+- `enabled`: when true, creates one git worktree per selected item.
+- `root`: directory for generated worktrees. Relative paths are resolved under `operation.workspace`.
+- `baseBranch`: branch or commit used as the worktree base. Defaults to `policy.baseBranch`, then the current branch.
+- `branchPattern`: branch name template. Supports `{operation_id}`, `{item_id}`, and `{item_slug}`.
+- `setup`: shell command or list of shell commands run inside the worktree after creation.
+- `teardown`: shell command or list of shell commands run before cleanup removes a worktree.
+- `cleanup`: `never`, `onSuccess`, or `always`. The default is `never` so completed work remains available for review.
+
+Setup and teardown commands receive these environment variables:
+
+- `OCMO_SOURCE_WORKSPACE`: original `operation.workspace` path.
+- `OCMO_WORKTREE_PATH`: generated worktree path.
+- `OCMO_BRANCH_NAME`: generated branch name.
+- `PASEO_SOURCE_CHECKOUT_PATH`: alias for the original workspace path.
+- `PASEO_WORKTREE_PATH`: alias for the generated worktree path.
+- `PASEO_BRANCH_NAME`: alias for the generated branch name.
+
+`ocmo` uses native `git worktree` commands. It does not require the Paseo daemon and does not start Paseo services or terminals. If the target worktree path already exists, `ocmo` fails that item instead of reusing the directory.
+
+`--dry-run` prints the planned worktree path, branch, timeout, command, and prompt. It does not create a worktree, run setup, start `opencode`, write state, or clean anything up.
+
 ## Timeouts
 
 Use `runner.timeoutSeconds` to prevent stale or runaway `opencode run` processes.
@@ -324,30 +466,12 @@ ocmo run examples/report-rewrite.yaml --timeout-seconds 7200 --yes
 
 `--dry-run` prints the effective timeout but does not start any process or write timeout state.
 
-## Planning From An Unstructured Request
-
-`ocmo plan` asks `opencode` to convert a natural-language mass-operation request into an `ocmo/v1` manifest. It can attach read-only source files such as CSV exports, text files, or other planning inputs.
-
-```powershell
-ocmo plan `
-  --from prompt.txt `
-  --read "C:\path\to\source-data.csv" `
-  --out ocmo/example-operation.yaml
-```
-
-Planning does not execute operation items. It should only produce a manifest and any prompt template needed for review.
-
-Use `--dry-run` to inspect the planning prompt sent to `opencode`:
-
-```powershell
-ocmo plan --from prompt.txt --out ocmo/example-operation.yaml --dry-run
-```
-
 ## Example: Generic Report Rewrite Workflow
 
 See:
 
 - `examples/report-rewrite.yaml`
+- `examples/report-rewrite-auto-worktrees.yaml`
 - `examples/prompts/report-rewrite.md`
 
 The example models a generic workflow where each report-like artifact is processed independently:
@@ -363,6 +487,8 @@ If review finds issues, run a fix pass and review again.
 All identifiers in the example are synthetic. They are intended to show the manifest shape without embedding real tracker IDs, employee names, reviewer handles, report names, or local filesystem paths.
 
 Because the example uses a single git worktree, it sets `queue.concurrency: 1`.
+
+To run the same shape of workflow with isolated per-item worktrees, set `policy.worktree: per-item`, set `queue.autoWorktrees.enabled: true`, and increase `queue.concurrency` to the number of parallel items you want.
 
 ## Example Item
 
@@ -392,6 +518,7 @@ State is separate from the manifest. The manifest defines intended work. The sta
 - completion time
 - exit code
 - command metadata
+- worktree path and branch metadata when auto worktrees are enabled
 
 Failed items remain selectable through `uncompleted` unless you mark them completed or skipped in the manifest.
 

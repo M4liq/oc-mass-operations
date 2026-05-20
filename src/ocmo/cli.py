@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import os
 import json
 import re
 import subprocess
@@ -115,9 +116,15 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path) -> None:
     concurrency = queue.get("concurrency", 1)
     if not isinstance(concurrency, int) or concurrency < 1:
         raise OcmoError("queue.concurrency must be a positive integer")
+    auto_worktrees = auto_worktrees_config(manifest)
+    if auto_worktrees["enabled"]:
+        validate_auto_worktrees(auto_worktrees)
+        ensure_git_repository(resolve_manifest_path(manifest_path, workspace))
     policy = manifest.get("policy", {})
     if isinstance(policy, dict) and policy.get("worktree") == "single" and concurrency > 1:
         raise OcmoError("policy.worktree=single requires queue.concurrency=1")
+    if isinstance(policy, dict) and policy.get("worktree") == "single" and auto_worktrees["enabled"]:
+        raise OcmoError("policy.worktree=single cannot be used with queue.autoWorktrees.enabled=true")
     prompt = require_mapping(manifest, "prompt")
     template = require_string(prompt, "template")
     template_path = resolve_manifest_path(manifest_path, template)
@@ -151,6 +158,51 @@ def require_string(parent: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise OcmoError(f"{key} must be a non-empty string")
     return value
+
+
+def auto_worktrees_config(manifest: dict[str, Any]) -> dict[str, Any]:
+    config = manifest.get("queue", {}).get("autoWorktrees", {})
+    if config is None:
+        return {"enabled": False}
+    if isinstance(config, bool):
+        return {"enabled": config}
+    if not isinstance(config, dict):
+        raise OcmoError("queue.autoWorktrees must be a mapping")
+    return {"enabled": False, **config}
+
+
+def validate_auto_worktrees(config: dict[str, Any]) -> None:
+    if not isinstance(config.get("enabled"), bool):
+        raise OcmoError("queue.autoWorktrees.enabled must be a boolean")
+    for key in ("root", "baseBranch", "branchPattern", "cleanup"):
+        value = config.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise OcmoError(f"queue.autoWorktrees.{key} must be a non-empty string")
+    cleanup = config.get("cleanup", "never")
+    if cleanup not in {"never", "onSuccess", "always"}:
+        raise OcmoError("queue.autoWorktrees.cleanup must be never, onSuccess, or always")
+    for key in ("setup", "teardown"):
+        normalize_scripts(config.get(key), f"queue.autoWorktrees.{key}")
+    try:
+        str(config.get("branchPattern", "ocmo/{operation_id}/{item_id}")).format(operation_id="operation", item_id="item", item_slug="item")
+    except (KeyError, ValueError, IndexError) as exc:
+        raise OcmoError(f"invalid queue.autoWorktrees.branchPattern: {exc}") from exc
+
+
+def normalize_scripts(value: Any, field: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value):
+        return value
+    raise OcmoError(f"{field} must be a string or list of non-empty strings")
+
+
+def ensure_git_repository(path: Path) -> None:
+    completed = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=str(path), capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise OcmoError(f"operation.workspace must be inside a git repository when auto worktrees are enabled: {path}")
 
 
 def resolve_manifest_path(manifest_path: Path, value: str) -> Path:
@@ -194,10 +246,11 @@ def expand_selector(selector: str) -> set[str]:
     return result
 
 
-def render_prompt(manifest: dict[str, Any], item: dict[str, Any], manifest_path: Path) -> str:
+def render_prompt(manifest: dict[str, Any], item: dict[str, Any], manifest_path: Path, execution: dict[str, Any] | None = None) -> str:
     template_path = resolve_manifest_path(manifest_path, manifest["prompt"]["template"])
     template = Template(template_path.read_text(encoding="utf-8"))
     operation = manifest.get("operation", {})
+    execution = execution or {}
     context = {
         "operation_json": json.dumps(operation, indent=2, ensure_ascii=False),
         "policy_json": json.dumps(manifest.get("policy", {}), indent=2, ensure_ascii=False),
@@ -209,11 +262,14 @@ def render_prompt(manifest: dict[str, Any], item: dict[str, Any], manifest_path:
         "item_id": str(item.get("id", "")),
         "item_title": str(item.get("title", "")),
         "item_file": str(item.get("file", "")),
+        "worktree_path": str(execution.get("worktreePath", "")),
+        "source_workspace": str(execution.get("sourceWorkspace", operation.get("workspace", ""))),
+        "branch_name": str(execution.get("branchName", "")),
     }
     return template.safe_substitute(context)
 
 
-def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str) -> list[str]:
+def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str, run_dir: Path | None = None) -> list[str]:
     operation = manifest["operation"]
     runner = manifest["runner"]
     command = [runner.get("command", "opencode"), runner.get("mode", "run")]
@@ -227,7 +283,7 @@ def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: st
         command += ["--title", str(runner["title"])]
     if runner.get("dangerouslySkipPermissions"):
         command.append("--dangerously-skip-permissions")
-    command += ["--dir", str(resolve_manifest_path(manifest_path, operation["workspace"])), prompt_text]
+    command += ["--dir", str(run_dir or resolve_manifest_path(manifest_path, operation["workspace"])), prompt_text]
     return command
 
 
@@ -237,21 +293,29 @@ def run_manifest(options: RunOptions) -> int:
     selected = select_items(manifest, options.select)
     concurrency = options.concurrency if options.concurrency is not None else manifest.get("queue", {}).get("concurrency", 1)
     timeout_seconds = options.timeout_seconds if options.timeout_seconds is not None else manifest.get("runner", {}).get("timeoutSeconds")
+    auto_worktrees = auto_worktrees_config(manifest)
     if concurrency < 1:
         raise OcmoError("concurrency must be a positive integer")
     if timeout_seconds is not None and timeout_seconds < 1:
         raise OcmoError("timeout must be a positive integer")
     if manifest.get("policy", {}).get("worktree") == "single" and concurrency > 1:
         raise OcmoError("policy.worktree=single cannot run with concurrency > 1")
+    if manifest.get("policy", {}).get("worktree") == "single" and auto_worktrees["enabled"]:
+        raise OcmoError("policy.worktree=single cannot be used with queue.autoWorktrees.enabled=true")
     if not selected:
         print("No items selected.")
         return 0
 
     if options.dry_run:
         for item in selected:
-            prompt_text = render_prompt(manifest, item, options.manifest_path)
-            command = build_command(manifest, options.manifest_path, prompt_text)
+            execution = worktree_execution(manifest, options.manifest_path, item) if auto_worktrees["enabled"] else {}
+            run_dir = Path(execution["worktreePath"]) if execution else None
+            prompt_text = render_prompt(manifest, item, options.manifest_path, execution)
+            command = build_command(manifest, options.manifest_path, prompt_text, run_dir)
             print(f"# item {item['id']}")
+            if execution:
+                print(f"# worktree: {execution['worktreePath']}")
+                print(f"# branch: {execution['branchName']}")
             print(format_command(command))
             if timeout_seconds:
                 print(f"# timeout: {timeout_seconds} seconds")
@@ -262,7 +326,8 @@ def run_manifest(options: RunOptions) -> int:
 
     if not options.yes:
         timeout_text = f", timeout={timeout_seconds}s" if timeout_seconds else ""
-        print(f"About to run {len(selected)} item(s) with concurrency={concurrency}{timeout_text}.")
+        worktree_text = ", autoWorktrees=true" if auto_worktrees["enabled"] else ""
+        print(f"About to run {len(selected)} item(s) with concurrency={concurrency}{timeout_text}{worktree_text}.")
         answer = input("Continue? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled.")
@@ -272,7 +337,7 @@ def run_manifest(options: RunOptions) -> int:
     state.ensure_operation(manifest)
     results: list[int] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(run_item, manifest, options.manifest_path, item, state, timeout_seconds) for item in selected]
+        futures = [executor.submit(run_item, manifest, options.manifest_path, item, state, timeout_seconds, auto_worktrees) for item in selected]
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result())
 
@@ -281,17 +346,24 @@ def run_manifest(options: RunOptions) -> int:
     return 0
 
 
-def run_item(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], state: "StateStore", timeout_seconds: int | None) -> int:
+def run_item(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], state: "StateStore", timeout_seconds: int | None, auto_worktrees: dict[str, Any]) -> int:
     item_id = str(item["id"])
-    prompt_text = render_prompt(manifest, item, manifest_path)
-    command = build_command(manifest, manifest_path, prompt_text)
-    state.mark(item_id, "running", {"startedAt": utc_now(), "command": command_without_prompt(command), "timeoutSeconds": timeout_seconds})
+    execution = worktree_execution(manifest, manifest_path, item) if auto_worktrees["enabled"] else {}
+    run_dir = Path(execution["worktreePath"]) if execution else resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])
+    if execution:
+        worktree_code = prepare_worktree(manifest, manifest_path, item, execution, auto_worktrees, state)
+        if worktree_code != 0:
+            return worktree_code
+    prompt_text = render_prompt(manifest, item, manifest_path, execution)
+    command = build_command(manifest, manifest_path, prompt_text, run_dir)
+    state.mark(item_id, "running", {"startedAt": utc_now(), "command": command_without_prompt(command), "timeoutSeconds": timeout_seconds, **execution})
     print(f"[{item_id}] starting")
     try:
-        completed = subprocess.run(command, cwd=str(resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])), timeout=timeout_seconds)
+        completed = subprocess.run(command, cwd=str(run_dir), timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         state.mark(item_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": timeout_seconds})
         print(f"[{item_id}] timed out after {timeout_seconds} seconds")
+        cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False)
         return 124
     if completed.returncode == 0:
         state.mark(item_id, "completed", {"completedAt": utc_now(), "exitCode": 0})
@@ -299,7 +371,122 @@ def run_item(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any]
     else:
         state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": completed.returncode})
         print(f"[{item_id}] failed: exit {completed.returncode}")
+    cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=completed.returncode == 0)
     return completed.returncode
+
+
+def worktree_execution(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any]) -> dict[str, Any]:
+    config = auto_worktrees_config(manifest)
+    source_workspace = resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])
+    root_value = config.get("root", ".ocmo/worktrees")
+    root = resolve_worktree_root(source_workspace, root_value)
+    operation_id = str(manifest["operation"]["id"])
+    item_id = str(item["id"])
+    item_slug = slugify(item_id)
+    branch_pattern = config.get("branchPattern", "ocmo/{operation_id}/{item_id}")
+    try:
+        branch_name = branch_pattern.format(operation_id=slugify(operation_id), item_id=item_slug, item_slug=item_slug)
+    except (KeyError, ValueError, IndexError) as exc:
+        raise OcmoError(f"invalid queue.autoWorktrees.branchPattern: {exc}") from exc
+    worktree_path = root / slugify(operation_id) / item_slug
+    base_branch = config.get("baseBranch") or manifest.get("policy", {}).get("baseBranch") or current_branch(source_workspace)
+    return {
+        "sourceWorkspace": str(source_workspace),
+        "worktreePath": str(worktree_path),
+        "branchName": branch_name,
+        "baseBranch": base_branch,
+    }
+
+
+def resolve_worktree_root(source_workspace: Path, value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (source_workspace / path).resolve()
+
+
+def prepare_worktree(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], execution: dict[str, Any], config: dict[str, Any], state: "StateStore") -> int:
+    item_id = str(item["id"])
+    source_workspace = Path(execution["sourceWorkspace"])
+    worktree_path = Path(execution["worktreePath"])
+    branch_name = execution["branchName"]
+    base_branch = execution["baseBranch"]
+    state.mark(item_id, "creating_worktree", {"worktreeStartedAt": utc_now(), **execution})
+    print(f"[{item_id}] creating worktree {worktree_path}")
+    if worktree_path.exists():
+        state.mark(item_id, "worktree_failed", {"completedAt": utc_now(), "exitCode": 1, "error": f"worktree path already exists: {worktree_path}", **execution})
+        print(f"[{item_id}] worktree path already exists: {worktree_path}")
+        return 1
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    command = ["git", "worktree", "add", "-b", branch_name, str(worktree_path), base_branch]
+    completed = subprocess.run(command, cwd=str(source_workspace))
+    if completed.returncode != 0:
+        state.mark(item_id, "worktree_failed", {"completedAt": utc_now(), "exitCode": completed.returncode, **execution})
+        print(f"[{item_id}] worktree creation failed: exit {completed.returncode}")
+        return completed.returncode
+    state.mark(item_id, "worktree_ready", {"worktreeCompletedAt": utc_now(), **execution})
+    setup_code = run_scripts("setup", normalize_scripts(config.get("setup"), "queue.autoWorktrees.setup"), worktree_path, execution, item_id)
+    if setup_code != 0:
+        state.mark(item_id, "setup_failed", {"completedAt": utc_now(), "exitCode": setup_code, **execution})
+        cleanup_worktree(manifest, manifest_path, item, execution, config, state, success=False)
+        return setup_code
+    if config.get("setup"):
+        state.mark(item_id, "setup_completed", {"setupCompletedAt": utc_now(), **execution})
+    return 0
+
+
+def cleanup_worktree(manifest: dict[str, Any], manifest_path: Path, item: dict[str, Any], execution: dict[str, Any], config: dict[str, Any], state: "StateStore", success: bool) -> None:
+    if not execution:
+        return
+    cleanup = config.get("cleanup", "never")
+    should_cleanup = cleanup == "always" or (cleanup == "onSuccess" and success)
+    if not should_cleanup:
+        return
+    item_id = str(item["id"])
+    worktree_path = Path(execution["worktreePath"])
+    teardown_code = run_scripts("teardown", normalize_scripts(config.get("teardown"), "queue.autoWorktrees.teardown"), worktree_path, execution, item_id)
+    if teardown_code != 0:
+        state.patch(item_id, {"teardownStatus": "failed", "teardownCompletedAt": utc_now(), "teardownExitCode": teardown_code, **execution})
+        return
+    source_workspace = resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])
+    completed = subprocess.run(["git", "worktree", "remove", str(worktree_path)], cwd=str(source_workspace))
+    if completed.returncode == 0:
+        state.patch(item_id, {"worktreeStatus": "removed", "worktreeRemovedAt": utc_now(), **execution})
+    else:
+        state.patch(item_id, {"worktreeStatus": "remove_failed", "worktreeRemoveExitCode": completed.returncode, **execution})
+
+
+def run_scripts(kind: str, scripts: list[str], cwd: Path, execution: dict[str, Any], item_id: str) -> int:
+    for script in scripts:
+        print(f"[{item_id}] {kind}: {script}")
+        completed = subprocess.run(script, cwd=str(cwd), shell=True, env=worktree_env(execution))
+        if completed.returncode != 0:
+            print(f"[{item_id}] {kind} failed: exit {completed.returncode}")
+            return completed.returncode
+    return 0
+
+
+def worktree_env(execution: dict[str, Any]) -> dict[str, str]:
+    env = dict(os.environ)
+    env["OCMO_SOURCE_WORKSPACE"] = execution["sourceWorkspace"]
+    env["OCMO_WORKTREE_PATH"] = execution["worktreePath"]
+    env["OCMO_BRANCH_NAME"] = execution["branchName"]
+    env["PASEO_SOURCE_CHECKOUT_PATH"] = execution["sourceWorkspace"]
+    env["PASEO_WORKTREE_PATH"] = execution["worktreePath"]
+    env["PASEO_BRANCH_NAME"] = execution["branchName"]
+    return env
+
+
+def current_branch(path: Path) -> str:
+    completed = subprocess.run(["git", "branch", "--show-current"], cwd=str(path), capture_output=True, text=True)
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise OcmoError("queue.autoWorktrees.baseBranch is required when current git branch cannot be detected")
+    return completed.stdout.strip()
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+    return slug.strip("-._") or "item"
 
 
 def state_path(manifest: dict[str, Any], manifest_path: Path) -> Path:
@@ -331,6 +518,15 @@ class StateStore:
             item_state = data["items"].setdefault(item_id, {})
             item_state.update(patch)
             item_state["status"] = status
+            data["updatedAt"] = utc_now()
+            self._write(data)
+
+    def patch(self, item_id: str, patch: dict[str, Any]) -> None:
+        with self.lock:
+            data = self._read()
+            data.setdefault("items", {})
+            item_state = data["items"].setdefault(item_id, {})
+            item_state.update(patch)
             data["updatedAt"] = utc_now()
             self._write(data)
 
@@ -397,6 +593,7 @@ Rules:
 - Keep operation.kind generic unless the user explicitly named a stable kind.
 - Use a common ocmo/v1 envelope: operation, runner, queue, policy, prompt, state, items.
 - Use queue.concurrency: 1 when the request uses one git worktree or branch-changing workflow.
+- Use queue.autoWorktrees.enabled: true only when the user wants ocmo to create one git worktree per item.
 - Put task-specific fields under each item's payload.
 - If a required value is ambiguous, set it to NEEDS_DECISION instead of guessing.
 - Refer to read-only source files only as evidence; do not modify them.

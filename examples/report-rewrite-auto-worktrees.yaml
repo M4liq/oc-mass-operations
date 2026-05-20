@@ -1,9 +1,9 @@
 schema: ocmo/v1
 
 operation:
-  id: report-rewrite-example
+  id: report-rewrite-auto-worktrees-example
   kind: generic
-  description: Rewrite selected report-like work items from a tracker export.
+  description: Rewrite selected report-like work items using per-item worktrees.
   workspace: ..
 
 runner:
@@ -19,11 +19,11 @@ selection:
   default: uncompleted
 
 queue:
-  concurrency: 1
+  concurrency: 3
   order: manifest
   stopOnFailure: false
   autoWorktrees:
-    enabled: false
+    enabled: true
     root: .ocmo/worktrees
     baseBranch: main
     branchPattern: ocmo/{operation_id}/{item_id}
@@ -32,7 +32,7 @@ queue:
     cleanup: never
 
 policy:
-  worktree: single
+  worktree: per-item
   baseBranch: main
   reviewLoop:
     enabled: true
@@ -42,7 +42,7 @@ prompt:
   template: prompts/report-rewrite.md
 
 state:
-  path: ../.ocmo/state/report-rewrite-example.json
+  path: ../.ocmo/state/report-rewrite-auto-worktrees-example.json
 
 items:
   - id: WORK-001
@@ -61,14 +61,5 @@ items:
       workItemKey: WORK-002
       targetName: ExampleReportTwo
       branch: feature/WORK-002_example-report-two
-      reviewer: reviewer-user
-      assignee: assignee-user
-  - id: WORK-003
-    title: ExampleReportThree
-    status: pending
-    payload:
-      workItemKey: WORK-003
-      targetName: ExampleReportThree
-      branch: feature/WORK-003_example-report-three
       reviewer: reviewer-user
       assignee: assignee-user
