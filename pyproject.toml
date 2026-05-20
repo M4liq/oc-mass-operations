@@ -10,8 +10,23 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6.0"]
 
+[project.optional-dependencies]
+test = ["coverage>=7.0"]
+
 [project.scripts]
 ocmo = "ocmo.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.coverage.run]
+branch = true
+source = ["ocmo"]
+omit = ["src/ocmo/__main__.py"]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+exclude_also = [
+  "if __name__ == .__main__.:",
+]

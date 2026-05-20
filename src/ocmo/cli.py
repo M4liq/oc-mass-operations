@@ -85,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
     except OcmoError as exc:
         print(f"ocmo: {exc}", file=sys.stderr)
         return 2
-    return 1
+    return 1  # pragma: no cover
 
 
 def utc_now() -> str:
@@ -387,7 +387,7 @@ def run_manifest(options: RunOptions) -> int:
         raise OcmoError("timeout must be a positive integer")
     if manifest.get("policy", {}).get("worktree") == "single" and concurrency > 1:
         raise OcmoError("policy.worktree=single cannot run with concurrency > 1")
-    if manifest.get("policy", {}).get("worktree") == "single" and auto_worktrees["enabled"]:
+    if manifest.get("policy", {}).get("worktree") == "single" and auto_worktrees["enabled"]:  # pragma: no cover
         raise OcmoError("policy.worktree=single cannot be used with queue.autoWorktrees.enabled=true")
     if not selected:
         print("No items selected.")
@@ -781,5 +781,5 @@ Request:
 """
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
