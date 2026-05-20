@@ -1,0 +1,65 @@
+schema: ocmo/v1
+
+operation:
+  id: report-rewrite-example
+  kind: generic
+  description: Rewrite selected report-like work items from a tracker export.
+  workspace: ..
+
+runner:
+  command: opencode
+  mode: run
+  agent: build
+  model: openai/gpt-5.5
+  attach: null
+  dangerouslySkipPermissions: false
+
+selection:
+  default: uncompleted
+
+queue:
+  concurrency: 1
+  order: manifest
+  stopOnFailure: false
+
+policy:
+  worktree: single
+  baseBranch: main
+  reviewLoop:
+    enabled: true
+    maxAttempts: 3
+
+prompt:
+  template: prompts/report-rewrite.md
+
+state:
+  path: ../.ocmo/state/report-rewrite-example.json
+
+items:
+  - id: WORK-001
+    title: ExampleReportOne
+    status: pending
+    payload:
+      workItemKey: WORK-001
+      targetName: ExampleReportOne
+      branch: feature/WORK-001_example-report-one
+      reviewer: reviewer-user
+      assignee: assignee-user
+  - id: WORK-002
+    title: ExampleReportTwo
+    status: pending
+    payload:
+      workItemKey: WORK-002
+      targetName: ExampleReportTwo
+      branch: feature/WORK-002_example-report-two
+      reviewer: reviewer-user
+      assignee: assignee-user
+  - id: WORK-003
+    title: ExampleReportThree
+    status: pending
+    payload:
+      workItemKey: WORK-003
+      targetName: ExampleReportThree
+      branch: feature/WORK-003_example-report-three
+      reviewer: reviewer-user
+      assignee: assignee-user
