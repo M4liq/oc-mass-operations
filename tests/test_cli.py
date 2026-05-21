@@ -650,6 +650,197 @@ class RunManifestTests(OcmoTestCase):
             cli.run_manifest(cli.RunOptions(self.manifest_path, "1", 0, None, True, False))
         with self.assertRaisesRegex(cli.OcmoError, "timeout must be a positive integer"):
             cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, 0, True, False))
+        with self.assertRaisesRegex(cli.OcmoError, "--detach cannot be used with --dry-run"):
+            cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, True, False, detach=True))
+
+    def test_detached_run_starts_child_and_writes_metadata(self) -> None:
+        self.write_manifest()
+        registry = self.root / "registry"
+        captured = {}
+
+        class FakeProcess:
+            pid = 12345
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return FakeProcess()
+
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.detached_run_id", return_value="ocmo-test"), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(stdout):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", 2, 9, False, False, detach=True))
+
+        self.assertEqual(code, 0)
+        self.assertIn("--yes", captured["command"])
+        self.assertIn("--ui", captured["command"])
+        self.assertNotIn("--detach", captured["command"])
+        self.assertEqual(captured["kwargs"]["stdin"], subprocess.DEVNULL)
+        local_record = self.root / ".ocmo" / "runs" / "ocmo-test.json"
+        global_record = registry / "ocmo-test.json"
+        self.assertTrue(local_record.exists())
+        self.assertTrue(global_record.exists())
+        metadata = json.loads(global_record.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["pid"], 12345)
+        self.assertEqual(metadata["concurrency"], 2)
+        self.assertEqual(metadata["timeoutSeconds"], 9)
+        self.assertIn("status: ocmo status --run-id ocmo-test", stdout.getvalue())
+
+    def test_status_and_list_show_detached_runs_and_manifest_state(self) -> None:
+        self.write_manifest()
+        registry = self.root / "registry"
+        state = {
+            "updatedAt": "now",
+            "items": {
+                "1": {"status": "running"},
+                "2": {"status": "completed"},
+            },
+        }
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        record = {
+            "schema": "ocmo-detached-run/v1",
+            "runId": "ocmo-active",
+            "pid": 123,
+            "startedAt": "then",
+            "manifestPath": str(self.manifest_path),
+            "statePath": str(self.root / "state.json"),
+            "logPath": str(self.root / ".ocmo" / "runs" / "ocmo-active.log"),
+        }
+        (registry).mkdir()
+        (registry / "ocmo-active.json").write_text(json.dumps(record), encoding="utf-8")
+        local_runs = self.root / ".ocmo" / "runs"
+        local_runs.mkdir(parents=True)
+        (local_runs / "ocmo-active.json").write_text(json.dumps(record), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=True), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["status"]), 0)
+            self.assertEqual(cli.main(["list"]), 0)
+            self.assertEqual(cli.main(["status", "--run-id", "ocmo-active"]), 0)
+            self.assertEqual(cli.main(["status", str(self.manifest_path)]), 0)
+
+        output = stdout.getvalue()
+        self.assertIn("ocmo-active active", output)
+        self.assertIn("manifest:", output)
+        self.assertIn("items: completed=1, running=1", output)
+
+    def test_status_errors_for_missing_run_id_and_filters_inactive(self) -> None:
+        registry = self.root / "registry"
+        registry.mkdir()
+        (registry / "inactive.json").write_text(json.dumps({"runId": "inactive", "pid": 99}), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["status"]), 0)
+            self.assertEqual(cli.main(["status", "--all"]), 0)
+        self.assertIn("No active detached ocmo runs.", stdout.getvalue())
+        self.assertIn("inactive inactive", stdout.getvalue())
+
+        stderr = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["status", "--run-id", "missing"]), 2)
+        self.assertIn("detached run not found", stderr.getvalue())
+
+    def test_detached_helper_edge_cases(self) -> None:
+        self.write_manifest()
+        manifest = cli.load_manifest(self.manifest_path)
+        registry = self.root / "registry"
+        self.assertRegex(cli.detached_run_id(), r"^ocmo-\d{8}-\d{6}-[0-9a-f]{6}$")
+        with mock.patch.dict("os.environ", {"LOCALAPPDATA": str(self.root / "local")}, clear=True):
+            self.assertEqual(cli.global_detached_runs_dir(), self.root / "local" / "ocmo" / "runs")
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch("ocmo.cli.os.name", "nt"), mock.patch("pathlib.Path.home", return_value=self.root / "home"):
+            self.assertEqual(cli.global_detached_runs_dir(), self.root / "home" / ".local" / "state" / "ocmo" / "runs")
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch("ocmo.cli.os.name", "posix"), mock.patch("pathlib.Path.home", return_value=self.root / "home"):
+            self.assertEqual(cli.global_detached_runs_dir(), self.root / "home" / ".local" / "state" / "ocmo" / "runs")
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch("ocmo.cli.os.name", "nt"), mock.patch("pathlib.Path.home", return_value=self.root / "home"):
+            self.assertEqual(cli.global_detached_runs_dir(), self.root / "home" / ".local" / "state" / "ocmo" / "runs")
+        command = cli.detached_child_command(cli.RunOptions(self.manifest_path, None, None, None, False, False, allow_shared_worktree_concurrency=True))
+        self.assertIn("--allow-shared-worktree-concurrency", command)
+
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.detached_run_id", return_value="ocmo-fail"), mock.patch("ocmo.cli.subprocess.Popen", side_effect=OSError("nope")):
+            with self.assertRaisesRegex(cli.OcmoError, "could not start detached run"):
+                cli.start_detached_run(cli.RunOptions(self.manifest_path, None, None, None, False, False), manifest, 1, None)
+
+        with mock.patch("ocmo.cli.os.name", "posix"), mock.patch("ocmo.cli.os.kill", side_effect=ProcessLookupError):
+            self.assertFalse(cli.process_is_alive(123))
+        with mock.patch("ocmo.cli.os.name", "posix"), mock.patch("ocmo.cli.os.kill", side_effect=PermissionError):
+            self.assertTrue(cli.process_is_alive(123))
+        with mock.patch("ocmo.cli.os.name", "posix"), mock.patch("ocmo.cli.os.kill", side_effect=OSError):
+            self.assertFalse(cli.process_is_alive(123))
+        with mock.patch("ocmo.cli.os.name", "posix"), mock.patch("ocmo.cli.os.kill", side_effect=SystemError):
+            self.assertFalse(cli.process_is_alive(123))
+        with mock.patch("ocmo.cli.os.name", "posix"), mock.patch("ocmo.cli.os.kill", return_value=None):
+            self.assertTrue(cli.process_is_alive(123))
+        self.assertFalse(cli.process_is_alive("bad"))
+
+        active_task = subprocess.CompletedProcess(["tasklist"], 0, stdout='"python.exe","123","Console","1","1,024 K"\n')
+        inactive_task = subprocess.CompletedProcess(["tasklist"], 0, stdout="INFO: No tasks are running which match the specified criteria.\n")
+        failed_task = subprocess.CompletedProcess(["tasklist"], 1, stdout="")
+        with mock.patch("ocmo.cli.os.name", "nt"), mock.patch("ocmo.cli.windows_process_is_alive", return_value=True):
+            self.assertTrue(cli.process_is_alive(123))
+        with mock.patch("ocmo.cli.subprocess.run", return_value=active_task):
+            self.assertTrue(cli.windows_process_is_alive(123))
+        with mock.patch("ocmo.cli.subprocess.run", return_value=inactive_task):
+            self.assertFalse(cli.windows_process_is_alive(123))
+        with mock.patch("ocmo.cli.subprocess.run", return_value=failed_task):
+            self.assertFalse(cli.windows_process_is_alive(123))
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=OSError):
+            self.assertFalse(cli.windows_process_is_alive(123))
+
+        registry.mkdir(exist_ok=True)
+        (registry / "bad.json").write_text("{", encoding="utf-8")
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}):
+            self.assertEqual(cli.detached_records(include_inactive=True), [])
+
+    def test_status_local_lookup_and_empty_state_branches(self) -> None:
+        generated_dir = self.root / ".ocmo" / "generated"
+        generated_dir.mkdir(parents=True)
+        generated_manifest = generated_dir / "manifest.yaml"
+        manifest = self.load()
+        manifest["state"]["path"] = "missing-state.json"
+        generated_manifest.write_text(yaml_dump(manifest), encoding="utf-8")
+        record = {"runId": "local-only", "pid": 0, "startedAt": "then", "statePath": str(self.root / "missing.json")}
+        local_path = cli.local_detached_record_path(generated_manifest, "local-only")
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_text(json.dumps(record), encoding="utf-8")
+        (local_path.parent / "bad.json").write_text("{", encoding="utf-8")
+
+        old_cwd = Path.cwd()
+        try:
+            import os as test_os
+
+            test_os.chdir(self.root)
+            self.assertEqual(cli.find_detached_record("local-only"), local_path)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli.print_manifest_status(generated_manifest, include_inactive=True)
+                cli.print_detached_record(record, details=True)
+                cli.print_state_summary({"items": {"x": "bad"}})
+        finally:
+            test_os.chdir(old_cwd)
+        output = stdout.getvalue()
+        self.assertIn("items: none", output)
+        self.assertIn("items: unknown=1", output)
+
+        inactive_record = cli.local_detached_record_path(generated_manifest, "inactive")
+        inactive_record.write_text(json.dumps({"runId": "inactive", "pid": 2}), encoding="utf-8")
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
+            cli.print_manifest_status(generated_manifest, include_inactive=False)
+        self.assertNotIn("detached runs:", stdout.getvalue())
+
+        active_record = cli.local_detached_record_path(generated_manifest, "active")
+        active_record.write_text(json.dumps({"runId": "active", "pid": 1}), encoding="utf-8")
+        inactive_record = cli.local_detached_record_path(generated_manifest, "inactive")
+        inactive_record.write_text(json.dumps({"runId": "inactive", "pid": 2}), encoding="utf-8")
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.process_is_alive", side_effect=lambda pid: pid == 1), contextlib.redirect_stdout(stdout):
+            cli.print_manifest_status(generated_manifest, include_inactive=False)
+        self.assertIn("detached runs:", stdout.getvalue())
+        self.assertIn("active active", stdout.getvalue())
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
+            cli.print_manifest_status(generated_manifest, include_inactive=False)
+        self.assertNotIn("detached runs:", stdout.getvalue())
 
     def test_run_manifest_rejects_single_worktree_runtime_conflicts(self) -> None:
         manifest = self.load()
@@ -978,6 +1169,76 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertIn("Convert this mass-operation request", stdout.getvalue())
         self.assertIn("Rewrite the reports", stdout.getvalue())
         run.assert_not_called()
+
+    def test_skill_path_prints_opencode_skill_destination(self) -> None:
+        skills_dir = self.root / "skills-dir"
+        stdout = io.StringIO()
+
+        with mock.patch.dict("os.environ", {"OCMO_OPENCODE_SKILLS_DIR": str(skills_dir)}, clear=True), contextlib.redirect_stdout(stdout):
+            code = cli.main(["skill", "path"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue().strip(), str(skills_dir / "ocmo-plan-grill" / "SKILL.md"))
+
+    def test_skill_install_writes_source_and_is_idempotent(self) -> None:
+        source = self.root / "source-skill.md"
+        source.write_text("skill text\n", encoding="utf-8")
+        skills_dir = self.root / "skills-dir"
+        destination = skills_dir / "ocmo-plan-grill" / "SKILL.md"
+        stdout = io.StringIO()
+        env = {"OCMO_SKILL_SOURCE": str(source), "OCMO_OPENCODE_SKILLS_DIR": str(skills_dir)}
+
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
+            first_code = cli.main(["skill", "install"])
+            second_code = cli.main(["skill", "install"])
+
+        self.assertEqual(first_code, 0)
+        self.assertEqual(second_code, 0)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "skill text\n")
+        output = stdout.getvalue()
+        self.assertIn("installed:", output)
+        self.assertIn("already installed:", output)
+        self.assertIn("restart opencode", output)
+
+    def test_skill_install_requires_force_for_different_existing_file(self) -> None:
+        source = self.root / "source-skill.md"
+        source.write_text("new skill\n", encoding="utf-8")
+        skills_dir = self.root / "skills-dir"
+        destination = skills_dir / "ocmo-plan-grill" / "SKILL.md"
+        destination.parent.mkdir(parents=True)
+        destination.write_text("old skill\n", encoding="utf-8")
+        env = {"OCMO_SKILL_SOURCE": str(source), "OCMO_OPENCODE_SKILLS_DIR": str(skills_dir)}
+
+        stderr = io.StringIO()
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stderr(stderr):
+            code = cli.main(["skill", "install"])
+
+        self.assertEqual(code, 2)
+        self.assertIn("--force", stderr.getvalue())
+        self.assertEqual(destination.read_text(encoding="utf-8"), "old skill\n")
+
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
+            force_code = cli.main(["skill", "install", "--force"])
+
+        self.assertEqual(force_code, 0)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "new skill\n")
+
+    def test_skill_source_errors_when_configured_path_is_missing(self) -> None:
+        with mock.patch.dict("os.environ", {"OCMO_SKILL_SOURCE": str(self.root / "missing.md")}, clear=True):
+            with self.assertRaisesRegex(cli.OcmoError, "configured skill source not found"):
+                cli.bundled_skill_path()
+
+    def test_skill_source_finds_repo_skill_without_override(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(cli.bundled_skill_path().name, "SKILL.md")
+
+    def test_skill_source_errors_when_repo_skill_cannot_be_found(self) -> None:
+        fake_cli = self.root / "isolated" / "src" / "ocmo" / "cli.py"
+
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch("ocmo.cli.__file__", str(fake_cli)):
+            with self.assertRaisesRegex(cli.OcmoError, "bundled skill file not found"):
+                cli.bundled_skill_path()
 
 
 class EdgeCaseCoverageTests(OcmoTestCase):

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ PLAN_AGENT = "build"
 RUN_AGENT = "build"
 ARTIFACT_ROOT = "artifacts"
 ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+OCMO_SKILL_NAME = "ocmo-plan-grill"
 
 
 class OcmoError(Exception):
@@ -49,6 +51,7 @@ class RunOptions:
     ui: str = "auto"
     allow_shared_worktree_concurrency: bool = False
     preview_all: bool = False
+    detach: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--all", action="store_true", help="With --dry-run, print every rendered prompt instead of a compact preview")
     run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for non-dry runs")
     run_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for non-dry runs")
+    run_parser.add_argument("--detach", action="store_true", help="Start ocmo run in the background and return immediately")
     run_parser.add_argument(
         "--allow-shared-worktree-concurrency",
         action="store_true",
@@ -95,6 +99,22 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--interactive", action="store_true", help="Allow the planner to ask terminal questions before returning marked YAML")
     plan_parser.add_argument("--dry-run", action="store_true", help="Print the planning prompt only")
 
+    status_parser = subparsers.add_parser("status", help="Show detached run sessions and manifest state")
+    status_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
+    status_parser.add_argument("--run-id", help="Show one detached run session")
+    status_parser.add_argument("--all", action="store_true", help="Include inactive detached run sessions")
+
+    list_parser = subparsers.add_parser("list", help="List detached run sessions")
+    list_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
+    list_parser.add_argument("--run-id", help="Show one detached run session")
+    list_parser.add_argument("--all", action="store_true", help="Include inactive detached run sessions")
+
+    skill_parser = subparsers.add_parser("skill", help="Manage the bundled OCMO opencode skill")
+    skill_subparsers = skill_parser.add_subparsers(dest="skill_command", required=True)
+    skill_install_parser = skill_subparsers.add_parser("install", help="Install the bundled opencode planning skill")
+    skill_install_parser.add_argument("--force", action="store_true", help="Overwrite an existing different skill file")
+    skill_subparsers.add_parser("path", help="Print the target opencode skill path")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
@@ -110,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.ui,
                     args.allow_shared_worktree_concurrency,
                     args.all,
+                    args.detach,
                 )
             )
         if args.command == "validate":
@@ -132,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "plan":
             return plan_manifest(args)
+        if args.command in {"status", "list"}:
+            return status_runs(args)
+        if args.command == "skill":
+            return skill_command(args)
     except OcmoError as exc:
         print(f"ocmo: {exc}", file=sys.stderr)
         return 2
@@ -140,6 +165,54 @@ def main(argv: list[str] | None = None) -> int:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def skill_command(args: argparse.Namespace) -> int:
+    if args.skill_command == "path":
+        print(opencode_skill_path())
+        return 0
+    if args.skill_command == "install":
+        install_skill(force=args.force)
+        return 0
+    return 1  # pragma: no cover
+
+
+def install_skill(force: bool = False) -> Path:
+    source = bundled_skill_path()
+    destination = opencode_skill_path()
+    source_text = source.read_text(encoding="utf-8")
+    if destination.exists():
+        destination_text = destination.read_text(encoding="utf-8")
+        if destination_text == source_text:
+            print(f"already installed: {destination}")
+            return destination
+        if not force:
+            raise OcmoError(f"skill already exists and differs: {destination}; pass --force to overwrite")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(source_text, encoding="utf-8")
+    print(f"installed: {destination}")
+    print("restart opencode to load the skill")
+    return destination
+
+
+def opencode_skill_path() -> Path:
+    root = os.environ.get("OCMO_OPENCODE_SKILLS_DIR")
+    skills_dir = Path(root) if root else Path.home() / ".config" / "opencode" / "skills"
+    return skills_dir / OCMO_SKILL_NAME / "SKILL.md"
+
+
+def bundled_skill_path() -> Path:
+    configured = os.environ.get("OCMO_SKILL_SOURCE")
+    if configured:
+        path = Path(configured)
+        if path.exists():
+            return path
+        raise OcmoError(f"configured skill source not found: {path}")
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "skills" / OCMO_SKILL_NAME / "SKILL.md"
+        if candidate.exists():
+            return candidate
+    raise OcmoError("bundled skill file not found; install from the cloned ocmo repository")
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -1061,6 +1134,11 @@ def run_manifest(options: RunOptions) -> int:
         print("No items selected.")
         return 0
 
+    if options.detach:
+        if options.dry_run:
+            raise OcmoError("--detach cannot be used with --dry-run")
+        return start_detached_run(options, manifest, concurrency, timeout_seconds)
+
     if options.dry_run:
         previews = []
         for item in selected:
@@ -1117,6 +1195,218 @@ def run_manifest(options: RunOptions) -> int:
     if any(code != 0 for code in results):
         return 1
     return 0
+
+
+def start_detached_run(options: RunOptions, manifest: dict[str, Any], concurrency: int, timeout_seconds: int | None) -> int:
+    run_id = detached_run_id()
+    local_dir = detached_runs_dir(options.manifest_path)
+    local_dir.mkdir(parents=True, exist_ok=True)
+    log_path = local_dir / f"{run_id}.log"
+    command = detached_child_command(options)
+    log = log_path.open("w", encoding="utf-8")
+    try:
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, close_fds=True)
+    except OSError as exc:
+        log.close()
+        raise OcmoError(f"could not start detached run: {exc}") from exc
+    log.close()
+    state = state_path(manifest, options.manifest_path)
+    metadata = {
+        "schema": "ocmo-detached-run/v1",
+        "runId": run_id,
+        "pid": process.pid,
+        "startedAt": utc_now(),
+        "manifestPath": str(options.manifest_path.resolve()),
+        "statePath": str(state),
+        "logPath": str(log_path.resolve()),
+        "workspace": str(resolve_manifest_path(options.manifest_path, manifest["operation"]["workspace"])),
+        "command": command,
+        "select": options.select,
+        "concurrency": concurrency,
+        "timeoutSeconds": timeout_seconds,
+    }
+    write_detached_metadata(local_dir / f"{run_id}.json", metadata)
+    write_detached_metadata(global_detached_run_path(run_id), metadata)
+    print(f"detached: {run_id}")
+    print(f"pid: {process.pid}")
+    print(f"log: {relative_to_manifest(log_path, options.manifest_path)}")
+    print(f"status: ocmo status --run-id {run_id}")
+    return 0
+
+
+def detached_child_command(options: RunOptions) -> list[str]:
+    command = [sys.executable, "-m", "ocmo", "run", str(options.manifest_path.resolve())]
+    if options.select:
+        command += ["--select", options.select]
+    if options.concurrency is not None:
+        command += ["--concurrency", str(options.concurrency)]
+    if options.timeout_seconds is not None:
+        command += ["--timeout-seconds", str(options.timeout_seconds)]
+    command += ["--ui", "plain", "--yes"]
+    if options.allow_shared_worktree_concurrency:
+        command.append("--allow-shared-worktree-concurrency")
+    return command
+
+
+def detached_run_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"ocmo-{stamp}-{uuid.uuid4().hex[:6]}"
+
+
+def detached_runs_dir(manifest_path: Path) -> Path:
+    return manifest_path.parent / ".ocmo" / "runs"
+
+
+def local_detached_record_path(manifest_path: Path, run_id: str) -> Path:
+    return detached_runs_dir(manifest_path) / f"{run_id}.json"
+
+
+def global_detached_runs_dir() -> Path:
+    configured = os.environ.get("OCMO_RUN_REGISTRY")
+    if configured:
+        return Path(configured)
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA")
+        if root:
+            return Path(root) / "ocmo" / "runs"
+    return Path.home() / ".local" / "state" / "ocmo" / "runs"
+
+
+def global_detached_run_path(run_id: str) -> Path:
+    return global_detached_runs_dir() / f"{run_id}.json"
+
+
+def write_detached_metadata(path: Path, metadata: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def read_json_file(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def process_is_alive(pid: Any) -> bool:
+    if not isinstance(pid, int) or pid < 1:
+        return False
+    if os.name == "nt":
+        return windows_process_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, SystemError):
+        return False
+    return True
+
+
+def windows_process_is_alive(pid: int) -> bool:
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    return any(f'"{pid}"' in line for line in result.stdout.splitlines())
+
+
+def status_runs(args: argparse.Namespace) -> int:
+    if args.run_id:
+        path = find_detached_record(args.run_id)
+        if path is None:
+            raise OcmoError(f"detached run not found: {args.run_id}")
+        print_detached_record(read_json_file(path), details=True)
+        return 0
+    if args.manifest:
+        print_manifest_status(infer_manifest_path(args.manifest), include_inactive=args.all)
+        return 0
+    records = detached_records(include_inactive=args.all)
+    if not records:
+        qualifier = "" if args.all else " active"
+        print(f"No{qualifier} detached ocmo runs.")
+        return 0
+    for record in records:
+        print_detached_record(record, details=False)
+    return 0
+
+
+def find_detached_record(run_id: str) -> Path | None:
+    path = global_detached_run_path(run_id)
+    if path.exists():
+        return path
+    for path in [Path.cwd() / ".ocmo" / "runs" / f"{run_id}.json", *Path.cwd().glob(".ocmo/*/manifest.yaml")]:
+        candidate = path if path.suffix == ".json" else local_detached_record_path(path, run_id)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def detached_records(include_inactive: bool) -> list[dict[str, Any]]:
+    records = []
+    for path in sorted(global_detached_runs_dir().glob("*.json")):
+        try:
+            record = read_json_file(path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if include_inactive or process_is_alive(record.get("pid")):
+            records.append(record)
+    return records
+
+
+def print_manifest_status(manifest_path: Path, include_inactive: bool) -> None:
+    manifest = load_manifest(manifest_path)
+    path = state_path(manifest, manifest_path)
+    state = read_json_file(path) if path.exists() else {}
+    print(f"manifest: {manifest_path}")
+    print(f"state: {path}")
+    print_state_summary(state)
+    related = []
+    for record_path in sorted(detached_runs_dir(manifest_path).glob("*.json")):
+        try:
+            record = read_json_file(record_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if include_inactive or process_is_alive(record.get("pid")):
+            related.append(record)
+    if related:
+        print("detached runs:")
+        for record in related:
+            print_detached_record(record, details=False, prefix="  ")
+
+
+def print_detached_record(record: dict[str, Any], details: bool, prefix: str = "") -> None:
+    pid = record.get("pid")
+    status = "active" if process_is_alive(pid) else "inactive"
+    print(f"{prefix}{record.get('runId', '<unknown>')} {status} pid={pid} started={record.get('startedAt', '-')}")
+    if not details:
+        return
+    print(f"manifest: {record.get('manifestPath', '-')}")
+    print(f"state: {record.get('statePath', '-')}")
+    print(f"log: {record.get('logPath', '-')}")
+    path = record.get("statePath")
+    if isinstance(path, str) and Path(path).exists():
+        print_state_summary(read_json_file(Path(path)))
+
+
+def print_state_summary(state: dict[str, Any]) -> None:
+    items = state.get("items") if isinstance(state.get("items"), dict) else {}
+    if not items:
+        print("items: none")
+        return
+    counts: dict[str, int] = {}
+    for item in items.values():
+        status = str(item.get("status", "unknown")) if isinstance(item, dict) else "unknown"
+        counts[status] = counts.get(status, 0) + 1
+    print("items: " + ", ".join(f"{status}={counts[status]}" for status in sorted(counts)))
+    updated = state.get("updatedAt")
+    if updated:
+        print(f"updated: {updated}")
 
 
 def run_item(
