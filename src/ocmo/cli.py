@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--interactive", action="store_true", help="Allow the planner to ask terminal questions before returning marked YAML")
     plan_parser.add_argument("--dry-run", action="store_true", help="Print the planning prompt only")
 
-    status_parser = subparsers.add_parser("status", help="Show detached run sessions and manifest state")
+    status_parser = subparsers.add_parser("status", help="Show operation item and run status")
     status_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     status_parser.add_argument("--run-id", help="Show one detached run session")
     status_parser.add_argument("--all", action="store_true", help="Include inactive detached run sessions")
@@ -153,8 +153,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "plan":
             return plan_manifest(args)
-        if args.command in {"status", "list"}:
-            return status_runs(args)
+        if args.command == "status":
+            return status_operation(args)
+        if args.command == "list":
+            return list_runs(args)
         if args.command == "skill":
             return skill_command(args)
     except OcmoError as exc:
@@ -1316,7 +1318,7 @@ def windows_process_is_alive(pid: int) -> bool:
     return any(f'"{pid}"' in line for line in result.stdout.splitlines())
 
 
-def status_runs(args: argparse.Namespace) -> int:
+def list_runs(args: argparse.Namespace) -> int:
     if args.run_id:
         path = find_detached_record(args.run_id)
         if path is None:
@@ -1324,7 +1326,7 @@ def status_runs(args: argparse.Namespace) -> int:
         print_detached_record(read_json_file(path), details=True)
         return 0
     if args.manifest:
-        print_manifest_status(infer_manifest_path(args.manifest), include_inactive=args.all)
+        print_manifest_detached_runs(infer_manifest_path(args.manifest), include_inactive=args.all)
         return 0
     records = detached_records(include_inactive=args.all)
     if not records:
@@ -1333,6 +1335,24 @@ def status_runs(args: argparse.Namespace) -> int:
         return 0
     for record in records:
         print_detached_record(record, details=False)
+    return 0
+
+
+def status_operation(args: argparse.Namespace) -> int:
+    record = None
+    if args.run_id:
+        path = find_detached_record(args.run_id)
+        if path is None:
+            raise OcmoError(f"detached run not found: {args.run_id}")
+        record = read_json_file(path)
+        manifest_value = record.get("manifestPath")
+        if not isinstance(manifest_value, str):
+            print_detached_record(record, details=True)
+            return 0
+        manifest_path = Path(manifest_value)
+    else:
+        manifest_path = infer_manifest_path(args.manifest)
+    print_operation_status(manifest_path, include_inactive=args.all, selected_record=record)
     return 0
 
 
@@ -1359,7 +1379,7 @@ def detached_records(include_inactive: bool) -> list[dict[str, Any]]:
     return records
 
 
-def print_manifest_status(manifest_path: Path, include_inactive: bool) -> None:
+def print_manifest_detached_runs(manifest_path: Path, include_inactive: bool) -> None:
     manifest = load_manifest(manifest_path)
     path = state_path(manifest, manifest_path)
     state = read_json_file(path) if path.exists() else {}
@@ -1378,6 +1398,152 @@ def print_manifest_status(manifest_path: Path, include_inactive: bool) -> None:
         print("detached runs:")
         for record in related:
             print_detached_record(record, details=False, prefix="  ")
+
+
+def print_operation_status(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> None:
+    manifest = load_manifest(manifest_path)
+    path = state_path(manifest, manifest_path)
+    state = read_json_file(path) if path.exists() else {}
+    related = [selected_record] if selected_record else related_detached_records(manifest_path, include_inactive)
+    operation_id = manifest["operation"]["id"]
+    print(f"OC Mass Operations: {operation_id}")
+    print(f"manifest: {manifest_path}")
+    print(f"state: {path}")
+    for record in related:
+        if record:
+            print_detached_record(record, details=False, prefix="detached: ")
+    rows = operation_status_rows(manifest, state)
+    counts = operation_status_counts(rows)
+    updated = state.get("updatedAt") or "-"
+    print(
+        f"selected={len(rows)} running={counts['running']} completed={counts['completed']} "
+        f"failed={counts['failed']} pending={counts['pending']} updated={updated}"
+    )
+    if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
+        print("warning: detached run is inactive but state contains running items; run may be stale")
+    print_status_table(rows)
+
+
+def related_detached_records(manifest_path: Path, include_inactive: bool) -> list[dict[str, Any]]:
+    related = []
+    for record_path in sorted(detached_runs_dir(manifest_path).glob("*.json")):
+        try:
+            record = read_json_file(record_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if include_inactive or process_is_alive(record.get("pid")):
+            related.append(record)
+    return related
+
+
+def operation_status_rows(manifest: dict[str, Any], state: dict[str, Any]) -> list[dict[str, str]]:
+    item_states = state.get("items") if isinstance(state.get("items"), dict) else {}
+    manifest_items = {str(item["id"]): item for item in manifest.get("items", []) if isinstance(item, dict) and "id" in item}
+    item_ids = [str(item["id"]) for item in manifest.get("items", []) if isinstance(item, dict) and "id" in item]
+    for item_id in item_states:
+        if item_id not in manifest_items:
+            item_ids.append(item_id)
+    rows = []
+    now = datetime.now(timezone.utc)
+    for item_id in item_ids:
+        item = manifest_items.get(item_id, {"id": item_id})
+        item_state = item_states.get(item_id) if isinstance(item_states.get(item_id), dict) else {}
+        status = str(item_state.get("status") or item.get("status") or "pending")
+        runs = item_state.get("runs") if isinstance(item_state.get("runs"), dict) else {}
+        run_id, run_state = current_run_state(runs)
+        total = int(item_state.get("runCount") or len(item_runs(manifest, item)) or 1)
+        current = total if not runs and (status in TERMINAL_STATUSES or status in DONE_STATUSES) else started_run_count(runs)
+        progress = f"{current}/{total}"
+        rows.append(
+            {
+                "item": item_id,
+                "status": status,
+                "step": run_id or "-",
+                "progress": progress,
+                "runtime": persisted_item_runtime(item_state, now),
+                "detail": status_detail(item, item_state, run_state),
+            }
+        )
+    return rows
+
+
+def current_run_state(runs: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    if not runs:
+        return None, {}
+    for run_id, run_state in reversed(list(runs.items())):
+        if isinstance(run_state, dict) and run_state.get("status") == "running":
+            return str(run_id), run_state
+    run_id, run_state = list(runs.items())[-1]
+    return str(run_id), run_state if isinstance(run_state, dict) else {}
+
+
+def started_run_count(runs: dict[str, Any]) -> int:
+    return sum(1 for run in runs.values() if isinstance(run, dict) and str(run.get("status", "")) != "queued")
+
+
+def persisted_item_runtime(item_state: dict[str, Any], now: datetime) -> str:
+    started = parse_state_datetime(item_state.get("startedAt"))
+    if started is None:
+        return "-"
+    ended = parse_state_datetime(item_state.get("completedAt")) or now
+    return format_duration((ended - started).total_seconds())
+
+
+def parse_state_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def status_detail(item: dict[str, Any], item_state: dict[str, Any], run_state: dict[str, Any]) -> str:
+    for source in (run_state, item_state):
+        error = source.get("error")
+        if error:
+            return str(error)
+    output_path = run_state.get("outputPath")
+    if output_path:
+        return str(output_path)
+    worktree_path = item_state.get("worktreePath")
+    if worktree_path:
+        return str(worktree_path)
+    title = item.get("title")
+    if title:
+        return str(title)
+    return "-"
+
+
+def operation_status_counts(rows: list[dict[str, str]]) -> dict[str, int]:
+    counts = {"running": 0, "completed": 0, "failed": 0, "pending": 0}
+    for row in rows:
+        status = row["status"]
+        if status in DONE_STATUSES:
+            counts["completed"] += 1
+        elif status in {"failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"}:
+            counts["failed"] += 1
+        elif status in {"queued", "pending"}:
+            counts["pending"] += 1
+        else:
+            counts["running"] += 1
+    return counts
+
+
+def print_status_table(rows: list[dict[str, str]]) -> None:
+    headers = ["Item", "Status", "Step", "Progress", "Runtime", "Detail"]
+    keys = ["item", "status", "step", "progress", "runtime", "detail"]
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, key in enumerate(keys):
+            widths[index] = max(widths[index], len(row[key]))
+    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print("  ".join(row[key].ljust(widths[index]) for index, key in enumerate(keys)))
 
 
 def print_detached_record(record: dict[str, Any], details: bool, prefix: str = "") -> None:

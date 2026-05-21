@@ -685,14 +685,14 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(metadata["timeoutSeconds"], 9)
         self.assertIn("status: ocmo status --run-id ocmo-test", stdout.getvalue())
 
-    def test_status_and_list_show_detached_runs_and_manifest_state(self) -> None:
+    def test_list_shows_detached_runs_and_status_shows_operation_table(self) -> None:
         self.write_manifest()
         registry = self.root / "registry"
         state = {
             "updatedAt": "now",
             "items": {
-                "1": {"status": "running"},
-                "2": {"status": "completed"},
+                "1": {"status": "running", "startedAt": "2026-05-21T10:00:00+00:00", "runCount": 1, "runs": {"default": {"status": "running", "outputPath": "outputs/1__default.txt"}}},
+                "2": {"status": "completed", "startedAt": "2026-05-21T10:00:00+00:00", "completedAt": "2026-05-21T10:02:03+00:00", "runCount": 1, "runs": {"default": {"status": "completed", "outputPath": "outputs/2__default.txt"}}},
             },
         }
         (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -713,15 +713,19 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=True), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["status"]), 0)
             self.assertEqual(cli.main(["list"]), 0)
             self.assertEqual(cli.main(["status", "--run-id", "ocmo-active"]), 0)
             self.assertEqual(cli.main(["status", str(self.manifest_path)]), 0)
 
         output = stdout.getvalue()
         self.assertIn("ocmo-active active", output)
-        self.assertIn("manifest:", output)
-        self.assertIn("items: completed=1, running=1", output)
+        self.assertIn("OC Mass Operations: test-op", output)
+        self.assertIn("selected=2 running=1 completed=1 failed=0 pending=0 updated=now", output)
+        self.assertIn("Item", output)
+        self.assertIn("Progress", output)
+        self.assertIn("1     running", output)
+        self.assertIn("outputs/1__default.txt", output)
+        self.assertIn("02:03", output)
 
     def test_status_errors_for_missing_run_id_and_filters_inactive(self) -> None:
         registry = self.root / "registry"
@@ -730,14 +734,19 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["status"]), 0)
-            self.assertEqual(cli.main(["status", "--all"]), 0)
+            self.assertEqual(cli.main(["list"]), 0)
+            self.assertEqual(cli.main(["list", "--all"]), 0)
         self.assertIn("No active detached ocmo runs.", stdout.getvalue())
         self.assertIn("inactive inactive", stdout.getvalue())
 
         stderr = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stderr(stderr):
             self.assertEqual(cli.main(["status", "--run-id", "missing"]), 2)
+        self.assertIn("detached run not found", stderr.getvalue())
+
+        stderr = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["list", "--run-id", "missing"]), 2)
         self.assertIn("detached run not found", stderr.getvalue())
 
     def test_detached_helper_edge_cases(self) -> None:
@@ -812,7 +821,7 @@ class RunManifestTests(OcmoTestCase):
             self.assertEqual(cli.find_detached_record("local-only"), local_path)
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
-                cli.print_manifest_status(generated_manifest, include_inactive=True)
+                cli.print_manifest_detached_runs(generated_manifest, include_inactive=True)
                 cli.print_detached_record(record, details=True)
                 cli.print_state_summary({"items": {"x": "bad"}})
         finally:
@@ -825,7 +834,7 @@ class RunManifestTests(OcmoTestCase):
         inactive_record.write_text(json.dumps({"runId": "inactive", "pid": 2}), encoding="utf-8")
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
-            cli.print_manifest_status(generated_manifest, include_inactive=False)
+            cli.print_manifest_detached_runs(generated_manifest, include_inactive=False)
         self.assertNotIn("detached runs:", stdout.getvalue())
 
         active_record = cli.local_detached_record_path(generated_manifest, "active")
@@ -834,13 +843,148 @@ class RunManifestTests(OcmoTestCase):
         inactive_record.write_text(json.dumps({"runId": "inactive", "pid": 2}), encoding="utf-8")
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.process_is_alive", side_effect=lambda pid: pid == 1), contextlib.redirect_stdout(stdout):
-            cli.print_manifest_status(generated_manifest, include_inactive=False)
+            cli.print_manifest_detached_runs(generated_manifest, include_inactive=False)
         self.assertIn("detached runs:", stdout.getvalue())
         self.assertIn("active active", stdout.getvalue())
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
-            cli.print_manifest_status(generated_manifest, include_inactive=False)
+            cli.print_manifest_detached_runs(generated_manifest, include_inactive=False)
         self.assertNotIn("detached runs:", stdout.getvalue())
+
+    def test_status_without_state_shows_manifest_items_as_snapshot(self) -> None:
+        self.write_manifest()
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["status", str(self.manifest_path)]), 0)
+
+        output = stdout.getvalue()
+        self.assertIn("OC Mass Operations: test-op", output)
+        self.assertIn("selected=2 running=0 completed=1 failed=0 pending=1 updated=-", output)
+        self.assertIn("1     pending", output)
+        self.assertIn("2     completed", output)
+        self.assertIn("First", output)
+
+    def test_status_warns_when_detached_run_is_stale(self) -> None:
+        self.write_manifest()
+        state = {
+            "items": {
+                "1": {"status": "running", "startedAt": "2026-05-21T10:00:00+00:00", "runs": {"default": {"status": "running"}}},
+            },
+        }
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        record = {"runId": "stale", "pid": 99, "startedAt": "then", "manifestPath": str(self.manifest_path), "statePath": str(self.root / "state.json")}
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
+            cli.print_operation_status(self.manifest_path, include_inactive=True, selected_record=record)
+
+        output = stdout.getvalue()
+        self.assertIn("detached: stale inactive", output)
+        self.assertIn("warning: detached run is inactive but state contains running items", output)
+
+    def test_status_multistep_progress_uses_current_run(self) -> None:
+        manifest = self.load()
+        manifest["items"][0]["runs"] = {
+            "mode": "sequential",
+            "steps": [
+                {"id": "analyze", "prompt": {"template": self.prompt.as_posix()}},
+                {"id": "review", "prompt": {"template": self.prompt.as_posix()}},
+            ],
+        }
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        state = {
+            "items": {
+                "1": {
+                    "status": "running",
+                    "startedAt": "2026-05-21T10:00:00+00:00",
+                    "runCount": 2,
+                    "runs": {
+                        "analyze": {"status": "completed", "outputPath": "outputs/1__analyze.txt"},
+                        "review": {"status": "running", "outputPath": "outputs/1__review.txt"},
+                    },
+                }
+            }
+        }
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            cli.print_operation_status(self.manifest_path, include_inactive=False)
+
+        output = stdout.getvalue()
+        self.assertIn("review", output)
+        self.assertIn("2/2", output)
+        self.assertIn("outputs/1__review.txt", output)
+
+    def test_status_and_list_edge_branches(self) -> None:
+        self.write_manifest()
+        registry = self.root / "registry"
+        registry.mkdir()
+        state = {"updatedAt": "later", "items": {"1": {"status": "failed"}}}
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        record = {
+            "runId": "details",
+            "pid": 123,
+            "startedAt": "then",
+            "manifestPath": str(self.manifest_path),
+            "statePath": str(self.root / "state.json"),
+            "logPath": str(self.root / "run.log"),
+        }
+        (registry / "details.json").write_text(json.dumps(record), encoding="utf-8")
+        local_runs = self.root / ".ocmo" / "runs"
+        local_runs.mkdir(parents=True)
+        (local_runs / "aaa-inactive.json").write_text(json.dumps({"runId": "inactive-local", "pid": 0}), encoding="utf-8")
+        (local_runs / "details.json").write_text(json.dumps(record), encoding="utf-8")
+        (local_runs / "bad.json").write_text("{", encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", side_effect=lambda pid: pid == 123), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["list", "--run-id", "details"]), 0)
+            self.assertEqual(cli.main(["list", str(self.manifest_path)]), 0)
+            cli.print_operation_status(self.manifest_path, include_inactive=False)
+
+        output = stdout.getvalue()
+        self.assertIn("manifest:", output)
+        self.assertIn("updated: later", output)
+        self.assertIn("detached runs:", output)
+
+        fallback = registry / "fallback.json"
+        fallback.write_text(json.dumps({"runId": "fallback", "pid": 0, "startedAt": "then"}), encoding="utf-8")
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["status", "--run-id", "fallback"]), 0)
+        self.assertIn("fallback inactive", stdout.getvalue())
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.related_detached_records", return_value=[{}]), contextlib.redirect_stdout(stdout):
+            cli.print_operation_status(self.manifest_path, include_inactive=False, selected_record={})
+        self.assertIn("OC Mass Operations: test-op", stdout.getvalue())
+
+        related = cli.related_detached_records(self.manifest_path, include_inactive=True)
+        self.assertTrue(any(record.get("runId") == "details" for record in related))
+
+    def test_operation_status_helper_edge_cases(self) -> None:
+        manifest = self.load()
+        state = {
+            "items": {
+                "1": {"status": "failed", "startedAt": "not-a-date", "error": "item error"},
+                "2": {"status": "queued", "startedAt": "2026-05-21T10:00:00"},
+                "state-only": {"status": "running", "worktreePath": "wt-path", "runs": {"default": "bad"}},
+                "blank": {"status": "running"},
+            }
+        }
+
+        rows = cli.operation_status_rows(manifest, state)
+        counts = cli.operation_status_counts(rows)
+
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["pending"], 1)
+        self.assertEqual(counts["running"], 2)
+        self.assertIn("state-only", [row["item"] for row in rows])
+        self.assertIn("wt-path", [row["detail"] for row in rows])
+        self.assertIn("-", [row["detail"] for row in rows])
+        self.assertEqual(cli.parse_state_datetime("not-a-date"), None)
 
     def test_run_manifest_rejects_single_worktree_runtime_conflicts(self) -> None:
         manifest = self.load()
