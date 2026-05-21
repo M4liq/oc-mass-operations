@@ -103,13 +103,13 @@ class ValidationTests(OcmoTestCase):
         with self.assertRaisesRegex(cli.OcmoError, "operation.workspace does not exist"):
             cli.validate_manifest(manifest, self.manifest_path)
 
-    def test_single_worktree_rejects_concurrency_above_one(self) -> None:
+    def test_single_worktree_concurrency_above_one_warns_only_for_validation(self) -> None:
         manifest = self.load()
         manifest["policy"]["worktree"] = "single"
         manifest["queue"]["concurrency"] = 2
 
-        with self.assertRaisesRegex(cli.OcmoError, "policy.worktree=single requires queue.concurrency=1"):
-            cli.validate_manifest(manifest, self.manifest_path)
+        cli.validate_manifest(manifest, self.manifest_path)
+        self.assertIn("--allow-shared-worktree-concurrency", cli.shared_worktree_concurrency_warning(manifest) or "")
 
     def test_validates_multi_run_steps_and_per_run_templates(self) -> None:
         review_prompt = self.root / "review.md"
@@ -667,8 +667,7 @@ class RunManifestTests(OcmoTestCase):
 
         manifest["queue"]["concurrency"] = 2
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
-        with self.assertRaisesRegex(cli.OcmoError, "policy.worktree=single requires queue.concurrency=1"):
-            cli.validate_manifest(manifest, self.manifest_path)
+        cli.validate_manifest(manifest, self.manifest_path)
         with contextlib.redirect_stdout(io.StringIO()):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, True, False, allow_shared_worktree_concurrency=True))
         self.assertEqual(code, 0)
@@ -825,6 +824,61 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertIn("valid:", output)
         self.assertIn("# item 1 / run default", output)
 
+    def test_main_validate_and_render_warn_for_shared_single_worktree_concurrency(self) -> None:
+        manifest = self.load()
+        manifest["policy"]["worktree"] = "single"
+        manifest["queue"]["concurrency"] = 2
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            validate_code = cli.main(["validate", str(self.manifest_path)])
+            render_code = cli.main(["render", str(self.manifest_path), "--select", "1"])
+
+        self.assertEqual(validate_code, 0)
+        self.assertEqual(render_code, 0)
+        self.assertIn("valid:", stdout.getvalue())
+        self.assertIn("# item 1 / run default", stdout.getvalue())
+        self.assertEqual(stderr.getvalue().count("--allow-shared-worktree-concurrency"), 2)
+
+    def test_main_render_defaults_manifest_and_accepts_directory(self) -> None:
+        self.write_manifest()
+        manifest_dir = self.root / "operation"
+        manifest_dir.mkdir()
+        (manifest_dir / "manifest.yaml").write_text(self.manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), contextlib.redirect_stdout(stdout):
+            code = cli.main(["render", "--select", "1"])
+        self.assertEqual(code, 0)
+        self.assertIn("# item 1 / run default", stdout.getvalue())
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = cli.main(["render", str(manifest_dir), "--select", "1"])
+        self.assertEqual(code, 0)
+        self.assertIn("# item 1 / run default", stdout.getvalue())
+
+    def test_main_render_and_run_infer_single_generated_manifest(self) -> None:
+        self.write_manifest()
+        generated_dir = self.root / ".ocmo" / "generated-op"
+        generated_dir.mkdir(parents=True)
+        generated_manifest = generated_dir / "manifest.yaml"
+        generated_manifest.write_text(self.manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+        self.manifest_path.unlink()
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), contextlib.redirect_stdout(stdout):
+            code = cli.main(["render", "--select", "1"])
+        self.assertEqual(code, 0)
+        self.assertIn("# item 1 / run default", stdout.getvalue())
+
+        with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
+            code = cli.main(["run", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_args.args[0].manifest_path, generated_manifest)
+
     def test_main_render_compacts_many_prompts_unless_all_is_set(self) -> None:
         manifest = self.load()
         manifest["items"] = [
@@ -853,29 +907,31 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertIn("# item ITEM-3 / run default", stdout.getvalue())
 
     def test_main_run_defaults_manifest_and_accepts_directory(self) -> None:
+        self.write_manifest()
         manifest_dir = self.root / "operation"
         manifest_dir.mkdir()
 
-        with mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
+        with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
             code = cli.main(["run", "--dry-run"])
         self.assertEqual(code, 0)
-        self.assertEqual(run.call_args.args[0].manifest_path, Path("manifest.yaml"))
+        self.assertEqual(run.call_args.args[0].manifest_path, self.manifest_path)
 
         with mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
             code = cli.main(["run", str(manifest_dir), "--dry-run"])
         self.assertEqual(code, 0)
         self.assertEqual(run.call_args.args[0].manifest_path, manifest_dir / "manifest.yaml")
 
-        with mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
+        with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
             code = cli.main(["run", "--allow-shared-worktree-concurrency", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertTrue(run.call_args.args[0].allow_shared_worktree_concurrency)
 
-        with mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
+        with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
             code = cli.main(["run", "--dry-run", "--all"])
         self.assertEqual(code, 0)
         self.assertTrue(run.call_args.args[0].preview_all)
 
+        self.assertEqual(cli.infer_manifest_path(self.manifest_path), self.manifest_path)
         self.assertEqual(cli.run_manifest_path(self.manifest_path), self.manifest_path)
 
     def test_main_returns_two_for_ocmo_errors(self) -> None:
@@ -886,6 +942,29 @@ class CliEntrypointTests(OcmoTestCase):
 
         self.assertEqual(code, 2)
         self.assertIn("manifest not found", stderr.getvalue())
+
+    def test_main_render_and_run_report_missing_or_ambiguous_default_manifest(self) -> None:
+        empty_root = self.root / "empty"
+        empty_root.mkdir()
+        for command in ("run", "render"):
+            stderr = io.StringIO()
+            with mock.patch("ocmo.cli.Path.cwd", return_value=empty_root), contextlib.redirect_stderr(stderr):
+                code = cli.main([command])
+            self.assertEqual(code, 2)
+            self.assertIn("no generated manifests", stderr.getvalue())
+
+        generated_root = empty_root / ".ocmo"
+        (generated_root / "one").mkdir(parents=True)
+        (generated_root / "two").mkdir(parents=True)
+        (generated_root / "one" / "manifest.yaml").write_text("schema: ocmo/v1\n", encoding="utf-8")
+        (generated_root / "two" / "manifest.yaml").write_text("schema: ocmo/v1\n", encoding="utf-8")
+
+        for command in ("run", "render"):
+            stderr = io.StringIO()
+            with mock.patch("ocmo.cli.Path.cwd", return_value=empty_root), contextlib.redirect_stderr(stderr):
+                code = cli.main([command])
+            self.assertEqual(code, 2)
+            self.assertIn("multiple generated manifests", stderr.getvalue())
 
     def test_plan_dry_run_prints_prompt_without_subprocess(self) -> None:
         request = self.root / "request.txt"
@@ -1352,8 +1431,7 @@ class EdgeCaseCoverageTests(OcmoTestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(out.read_text(encoding="utf-8"), manifest_text)
-        with self.assertRaisesRegex(cli.OcmoError, "policy.worktree=single requires queue.concurrency=1"):
-            cli.validate_manifest_schema(cli.load_manifest(out), out)
+        cli.validate_manifest_schema(cli.load_manifest(out), out)
 
     def test_plan_manifest_writes_generated_prompt_template_files(self) -> None:
         prompt = self.root / "request.txt"

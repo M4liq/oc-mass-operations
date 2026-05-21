@@ -179,7 +179,7 @@ items:
 - `stopOnFailure`: reserved for stricter failure handling.
 - `autoWorktrees`: optional per-item git worktree creation and setup.
 
-`policy` is interpreted only for worktree safety rules. If `policy.worktree` is `single`, `ocmo` rejects `concurrency > 1` unless `ocmo run` is called with `--allow-shared-worktree-concurrency`, and rejects `queue.autoWorktrees.enabled: true`.
+`policy` is interpreted only for worktree safety rules. If `policy.worktree` is `single`, `validate` and `render` warn for `concurrency > 1`, and `ocmo run` rejects that combination unless called with `--allow-shared-worktree-concurrency`. `policy.worktree: single` always rejects `queue.autoWorktrees.enabled: true`.
 
 `prompt.template` points to the per-item prompt template. Optional `prompt.skills` is a list of opencode skill names that `ocmo` turns into deterministic slash-command instructions at the top of each rendered prompt.
 
@@ -371,7 +371,7 @@ By default, `produces.plan` writes to `artifacts/<item-id>/<step-id>/plan.md` be
 | Task | Command |
 | --- | --- |
 | Check manifest validity | `ocmo validate <manifest>` |
-| Inspect rendered prompt text | `ocmo render <manifest> --select <selector>` |
+| Inspect rendered prompt text | `ocmo render [manifest-or-directory] --select <selector>` |
 | Inspect the full execution plan | `ocmo run [manifest-or-directory] --select <selector> --dry-run` |
 | Execute selected items | `ocmo run [manifest-or-directory] --select <selector> --yes` |
 | Generate a manifest draft | `ocmo plan --from <prompt-file>` |
@@ -388,23 +388,27 @@ Example:
 ocmo validate examples/report-rewrite.yaml
 ```
 
-`validate` loads the manifest and checks static configuration before queue work starts. It verifies schema, workspace path, runner settings, queue settings, prompt template path, item IDs, concurrency policy, timeout configuration, and auto-worktree configuration.
+`validate` loads the manifest and checks static configuration before queue work starts. It verifies schema, workspace path, runner settings, queue settings, prompt template path, item IDs, concurrency policy, timeout configuration, and auto-worktree configuration. If `policy.worktree: single` uses `queue.concurrency > 1`, `validate` prints a warning instead of failing because `ocmo run` enforces the final safety gate.
 
 `validate` does not render prompts, start `opencode`, create worktrees, run setup or teardown commands, write state, edit files, or mark items.
 
 ### `ocmo render`
 
 ```powershell
-ocmo render <manifest> [--select <selector>] [--all]
+ocmo render [manifest-or-directory] [--select <selector>] [--all]
 ```
 
 Example:
 
 ```powershell
 ocmo render examples/report-rewrite.yaml --select WORK-001
+ocmo render --select uncompleted
+ocmo render .ocmo/business-taxonomy-prompt --select 41-48
 ```
 
-`render` is a prompt-only preview. It validates the manifest, applies selection rules, renders the effective prompt template once for each selected item/run pair, and prints the resulting prompt text to stdout. When more than three prompts are selected, it prints a compact preview by default: the first two prompts and the last prompt. Use `--all` to print every prompt.
+`render` is a prompt-only preview. It validates the manifest, applies selection rules, renders the effective prompt template once for each selected item/run pair, and prints the resulting prompt text to stdout. When more than three prompts are selected, it prints a compact preview by default: the first two prompts and the last prompt. Use `--all` to print every prompt. If `policy.worktree: single` uses `queue.concurrency > 1`, `render` prints the same warning as `validate` and continues.
+
+If `manifest-or-directory` is omitted, `render` uses the same manifest inference as `run`: first `manifest.yaml` in the current working directory, then a single generated manifest matching `.ocmo/*/manifest.yaml`. If multiple generated manifests exist, pass one explicitly. If `manifest-or-directory` is a directory, `render` uses `<directory>/manifest.yaml`.
 
 `render` is intentionally read-only. It does not start `opencode`, build or print the final `opencode run` command, create worktrees, run setup or teardown commands, write state, edit files, apply concurrency, apply timeouts, or mark items.
 
@@ -431,7 +435,7 @@ ocmo run --yes
 ocmo run .ocmo/business-taxonomy-prompt --yes
 ```
 
-If `manifest-or-directory` is omitted, `run` uses `manifest.yaml` in the current working directory. If `manifest-or-directory` is a directory, `run` uses `<directory>/manifest.yaml`. This matches the default folder layout produced by `ocmo plan`, so you can run from inside an operation folder with `ocmo run --yes` or from the workspace with `ocmo run .ocmo/<prompt-stem> --yes`.
+If `manifest-or-directory` is omitted, `run` uses `manifest.yaml` in the current working directory. If that file does not exist and exactly one generated manifest matches `.ocmo/*/manifest.yaml`, `run` uses it. If multiple generated manifests exist, pass one explicitly. If `manifest-or-directory` is a directory, `run` uses `<directory>/manifest.yaml`. This matches the default folder layout produced by `ocmo plan`, so you can run from inside an operation folder with `ocmo run --yes` or from the workspace with `ocmo run .ocmo/<prompt-stem> --yes`.
 
 `run` validates the manifest, selects items, renders prompts, and starts `opencode run` processes for each selected item. Items without `runs` start one process. Items with `runs.mode: sequential` start one process per step, in step order. It writes durable state to `state.path` and marks each item as it moves through the queue.
 
@@ -493,7 +497,7 @@ ocmo plan `
 
 `plan` asks `opencode` to convert a natural-language mass-operation request into an `ocmo/v1` manifest. It can attach read-only source files such as CSV exports, text files, or other planning inputs. If the request needs multiple phases per item, the planning prompt tells `opencode` to use `items[].runs.mode: sequential`, `agent: build`, and per-run `prompt.template` values.
 
-The planner is allowed to produce `policy.worktree: single` with `queue.concurrency > 1` only when the request explicitly says item scopes are non-overlapping and safe to run in one shared workspace. Run those manifests with `ocmo run --allow-shared-worktree-concurrency`; plain `ocmo validate` still rejects that combination as a safety default.
+The planner is allowed to produce `policy.worktree: single` with `queue.concurrency > 1` only when the request explicitly says item scopes are non-overlapping and safe to run in one shared workspace. `validate` and `render` warn for those manifests. Run them with `ocmo run --allow-shared-worktree-concurrency`.
 
 `--workspace` sets the target repository for planning and is passed to `opencode run --dir`. If omitted, it defaults to the current working directory. The planner is instructed to use the resolved workspace path as `operation.workspace`.
 
@@ -600,7 +604,7 @@ queue:
   concurrency: 1
 ```
 
-If you pass `--concurrency 2` with `policy.worktree: single`, `ocmo` fails before starting work unless you also pass `--allow-shared-worktree-concurrency`. The same flag is required when the manifest itself has `queue.concurrency` above `1` with `policy.worktree: single`. That override is run-only and does not make `ocmo validate` accept a manifest whose `queue.concurrency` is above `1` with `policy.worktree: single`.
+If you pass `--concurrency 2` with `policy.worktree: single`, `ocmo` fails before starting work unless you also pass `--allow-shared-worktree-concurrency`. The same flag is required when the manifest itself has `queue.concurrency` above `1` with `policy.worktree: single`. `validate` and `render` warn for that manifest-level combination but do not fail.
 
 Use `--allow-shared-worktree-concurrency` only when concurrent agents are safe to run in the same workspace. Agents can otherwise conflict through shared files, branch state, the git index, generated artifacts, or dependency caches.
 

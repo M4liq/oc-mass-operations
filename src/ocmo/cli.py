@@ -25,6 +25,7 @@ MANIFEST_END = "OCMO_MANIFEST_END"
 FILE_START = "OCMO_FILE_START"
 FILE_END = "OCMO_FILE_END"
 TERMINAL_STATUSES = {"completed", "failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"}
+SHARED_WORKTREE_CONCURRENCY_WARNING = "warning: policy.worktree=single with queue.concurrency > 1 requires non-overlapping item scopes; ocmo run requires --allow-shared-worktree-concurrency"
 MISSING_PLACEHOLDER = object()
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 PLAN_AGENT = "build"
@@ -62,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="Run operation items from a manifest")
-    run_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory; defaults to manifest.yaml")
+    run_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory; defaults to manifest.yaml or a single .ocmo/*/manifest.yaml")
     run_parser.add_argument("--select", help="Selection: all, pending, uncompleted, IDs, or ranges")
     run_parser.add_argument("--concurrency", type=int, help="Override queue.concurrency")
     run_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each item")
@@ -80,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     validate_parser.add_argument("manifest", type=Path)
 
     render_parser = subparsers.add_parser("render", help="Render prompts for selected items")
-    render_parser.add_argument("manifest", type=Path)
+    render_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory; defaults to manifest.yaml or a single .ocmo/*/manifest.yaml")
     render_parser.add_argument("--select", help="Selection: all, pending, uncompleted, IDs, or ranges")
     render_parser.add_argument("--all", action="store_true", help="Print every rendered prompt instead of a compact preview")
 
@@ -97,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
-            manifest_path = run_manifest_path(args.manifest)
+            manifest_path = infer_manifest_path(args.manifest)
             return run_manifest(
                 RunOptions(
                     manifest_path,
@@ -114,16 +115,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "validate":
             manifest = load_manifest(args.manifest)
             validate_manifest(manifest, args.manifest)
+            warn_shared_worktree_concurrency(manifest)
             print(f"valid: {args.manifest}")
             return 0
         if args.command == "render":
-            manifest = load_manifest(args.manifest)
-            validate_manifest(manifest, args.manifest)
+            manifest_path = infer_manifest_path(args.manifest)
+            manifest = load_manifest(manifest_path)
+            validate_manifest(manifest, manifest_path)
+            warn_shared_worktree_concurrency(manifest)
             previews = []
             for item in select_items(manifest, args.select):
                 runs = item_runs(manifest, item)
                 for run in runs:
-                    previews.append(PromptPreview(str(item["id"]), str(run["id"]), render_prompt(manifest, item, args.manifest, run=run, runs=runs)))
+                    previews.append(PromptPreview(str(item["id"]), str(run["id"]), render_prompt(manifest, item, manifest_path, run=run, runs=runs)))
             print_prompt_previews(previews, args.all)
             return 0
         if args.command == "plan":
@@ -195,8 +199,6 @@ def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path, allo
     if auto_worktrees["enabled"]:
         validate_auto_worktrees(auto_worktrees)
     policy = manifest.get("policy", {})
-    if isinstance(policy, dict) and policy.get("worktree") == "single" and concurrency > 1 and not allow_shared_worktree_concurrency:
-        raise OcmoError("policy.worktree=single requires queue.concurrency=1")
     if isinstance(policy, dict) and policy.get("worktree") == "single" and auto_worktrees["enabled"]:
         raise OcmoError("policy.worktree=single cannot be used with queue.autoWorktrees.enabled=true")
     prompt = require_mapping(manifest, "prompt")
@@ -264,6 +266,20 @@ def validate_item_runs(manifest: dict[str, Any], item: dict[str, Any], manifest_
         validate_consumes(step.get("consumes"), f"items[{item_index}].runs.steps[{step_index}].consumes", produced_by_step)
         produced_by_step[run_key] = validate_produces(step.get("produces"), f"items[{item_index}].runs.steps[{step_index}].produces")
         seen.add(run_key)
+
+
+def shared_worktree_concurrency_warning(manifest: dict[str, Any]) -> str | None:
+    policy = manifest.get("policy", {})
+    concurrency = manifest.get("queue", {}).get("concurrency", 1)
+    if isinstance(policy, dict) and policy.get("worktree") == "single" and isinstance(concurrency, int) and concurrency > 1:
+        return SHARED_WORKTREE_CONCURRENCY_WARNING
+    return None
+
+
+def warn_shared_worktree_concurrency(manifest: dict[str, Any]) -> None:
+    warning = shared_worktree_concurrency_warning(manifest)
+    if warning:
+        print(warning, file=sys.stderr)
 
 
 def validate_build_agent(value: Any, field: str) -> None:
@@ -1444,11 +1460,25 @@ def quote_arg(value: str) -> str:
     return '"' + value.replace('"', '\\"') + '"'
 
 
-def run_manifest_path(value: Path | None) -> Path:
-    path = value or Path("manifest.yaml")
+def infer_manifest_path(value: Path | None) -> Path:
+    if value is None:
+        default_path = Path.cwd() / "manifest.yaml"
+        if default_path.exists():
+            return default_path
+        generated = sorted((Path.cwd() / ".ocmo").glob("*/manifest.yaml"))
+        if len(generated) == 1:
+            return generated[0]
+        if len(generated) > 1:
+            raise OcmoError("multiple generated manifests found under .ocmo/*/manifest.yaml; pass one explicitly")
+        raise OcmoError("manifest not found: manifest.yaml, and no generated manifests found under .ocmo/*/manifest.yaml")
+    path = value
     if path.is_dir():
         return path / "manifest.yaml"
     return path
+
+
+def run_manifest_path(value: Path | None) -> Path:
+    return infer_manifest_path(value)
 
 
 def plan_manifest(args: argparse.Namespace) -> int:
