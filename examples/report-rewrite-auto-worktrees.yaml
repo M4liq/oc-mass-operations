@@ -2,13 +2,11 @@ schema: ocmo/v1
 
 operation:
   id: report-rewrite-auto-worktrees-example
-  kind: generic
   description: Rewrite selected report-like work items using per-item worktrees.
   workspace: ..
 
 runner:
   command: opencode
-  mode: run
   agent: build
   model: openai/gpt-5.5
   attach: null

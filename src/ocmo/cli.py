@@ -27,6 +27,10 @@ FILE_END = "OCMO_FILE_END"
 TERMINAL_STATUSES = {"completed", "failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"}
 MISSING_PLACEHOLDER = object()
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+PLAN_AGENT = "build"
+RUN_AGENT = "build"
+ARTIFACT_ROOT = "artifacts"
+ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 class OcmoError(Exception):
@@ -43,6 +47,14 @@ class RunOptions:
     yes: bool
     ui: str = "auto"
     allow_shared_worktree_concurrency: bool = False
+    preview_all: bool = False
+
+
+@dataclass(frozen=True)
+class PromptPreview:
+    item_id: str
+    run_id: str
+    text: str
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -55,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--concurrency", type=int, help="Override queue.concurrency")
     run_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each item")
     run_parser.add_argument("--dry-run", action="store_true", help="Print commands/prompts without running opencode")
+    run_parser.add_argument("--all", action="store_true", help="With --dry-run, print every rendered prompt instead of a compact preview")
     run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for non-dry runs")
     run_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for non-dry runs")
     run_parser.add_argument(
@@ -69,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     render_parser = subparsers.add_parser("render", help="Render prompts for selected items")
     render_parser.add_argument("manifest", type=Path)
     render_parser.add_argument("--select", help="Selection: all, pending, uncompleted, IDs, or ranges")
+    render_parser.add_argument("--all", action="store_true", help="Print every rendered prompt instead of a compact preview")
 
     plan_parser = subparsers.add_parser("plan", help="Ask opencode to convert a prompt into an ocmo manifest")
     plan_parser.add_argument("--from", dest="from_file", required=True, type=Path, help="Natural-language operation prompt")
@@ -76,7 +90,6 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--out", type=Path, help="Manifest output path; defaults to <workspace>/.ocmo/<prompt-stem>/manifest.yaml")
     plan_parser.add_argument("--workspace", type=Path, help="Target workspace for planning; defaults to the current directory")
     plan_parser.add_argument("--model", help="opencode model")
-    plan_parser.add_argument("--agent", default="build", help="opencode agent to use for planning")
     plan_parser.add_argument("--max-attempts", type=int, default=3, help="Maximum planner correction attempts")
     plan_parser.add_argument("--interactive", action="store_true", help="Allow the planner to ask terminal questions before returning marked YAML")
     plan_parser.add_argument("--dry-run", action="store_true", help="Print the planning prompt only")
@@ -95,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.yes,
                     args.ui,
                     args.allow_shared_worktree_concurrency,
+                    args.all,
                 )
             )
         if args.command == "validate":
@@ -105,12 +119,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "render":
             manifest = load_manifest(args.manifest)
             validate_manifest(manifest, args.manifest)
+            previews = []
             for item in select_items(manifest, args.select):
                 runs = item_runs(manifest, item)
                 for run in runs:
-                    print(f"# item {item['id']} / run {run['id']}")
-                    print(render_prompt(manifest, item, args.manifest, run=run, runs=runs))
-                    print("\n" + "=" * 80 + "\n")
+                    previews.append(PromptPreview(str(item["id"]), str(run["id"]), render_prompt(manifest, item, args.manifest, run=run, runs=runs)))
+            print_prompt_previews(previews, args.all)
             return 0
         if args.command == "plan":
             return plan_manifest(args)
@@ -163,8 +177,13 @@ def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path, allo
     operation = require_mapping(manifest, "operation")
     require_string(operation, "id")
     require_string(operation, "workspace")
+    if "kind" in operation:
+        raise OcmoError("operation.kind is no longer supported")
     runner = require_mapping(manifest, "runner")
     require_string(runner, "command")
+    validate_build_agent(runner.get("agent"), "runner.agent")
+    if "mode" in runner:
+        raise OcmoError("runner.mode is no longer supported; ocmo always uses opencode run")
     timeout_seconds = runner.get("timeoutSeconds")
     if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or timeout_seconds < 1):
         raise OcmoError("runner.timeoutSeconds must be a positive integer")
@@ -218,6 +237,7 @@ def validate_item_runs(manifest: dict[str, Any], item: dict[str, Any], manifest_
     if not isinstance(steps, list) or not steps:
         raise OcmoError(f"items[{item_index}].runs.steps must be a non-empty list")
     seen = set()
+    produced_by_step: dict[str, set[str]] = {}
     for step_index, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
             raise OcmoError(f"items[{item_index}].runs.steps[{step_index}] must be a mapping")
@@ -227,10 +247,10 @@ def validate_item_runs(manifest: dict[str, Any], item: dict[str, Any], manifest_
         run_key = str(run_id)
         if run_key in seen:
             raise OcmoError(f"duplicate run id for item {item['id']}: {run_key}")
-        seen.add(run_key)
         timeout_seconds = step.get("timeoutSeconds")
         if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or timeout_seconds < 1):
             raise OcmoError(f"items[{item_index}].runs.steps[{step_index}].timeoutSeconds must be a positive integer")
+        validate_build_agent(step.get("agent"), f"items[{item_index}].runs.steps[{step_index}].agent")
         prompt = step.get("prompt")
         if prompt is not None:
             if not isinstance(prompt, dict):
@@ -241,6 +261,140 @@ def validate_item_runs(manifest: dict[str, Any], item: dict[str, Any], manifest_
                     raise OcmoError("template must be a non-empty string")
                 validate_template_value(template, f"items[{item_index}].runs.steps[{step_index}].prompt.template")
             normalize_skills(prompt.get("skills"), f"items[{item_index}].runs.steps[{step_index}].prompt.skills")
+        validate_consumes(step.get("consumes"), f"items[{item_index}].runs.steps[{step_index}].consumes", produced_by_step)
+        produced_by_step[run_key] = validate_produces(step.get("produces"), f"items[{item_index}].runs.steps[{step_index}].produces")
+        seen.add(run_key)
+
+
+def validate_build_agent(value: Any, field: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not value.strip():
+        raise OcmoError(f"{field} must be build")
+    if value.strip() != RUN_AGENT:
+        raise OcmoError(f"{field} must be build")
+
+
+def validate_artifact_name(value: Any, field: str) -> None:
+    if not isinstance(value, str) or not value.strip() or not ARTIFACT_NAME_RE.fullmatch(value.strip()):
+        raise OcmoError(f"{field} artifact names must be non-empty and contain only letters, numbers, dots, underscores, or hyphens")
+
+
+def parse_artifact_reference(value: Any, field: str) -> tuple[str, str]:
+    if not isinstance(value, str) or "." not in value:
+        raise OcmoError(f"{field} must use step.artifact syntax")
+    step_id, artifact_id = value.split(".", 1)
+    validate_artifact_name(step_id, field)
+    validate_artifact_name(artifact_id, field)
+    return step_id, artifact_id
+
+
+def validate_produces(value: Any, field: str) -> set[str]:
+    if value is None:
+        return set()
+    if not isinstance(value, dict):
+        raise OcmoError(f"{field} must be a mapping")
+    artifact_ids: set[str] = set()
+    for artifact_id, config in value.items():
+        artifact_key = str(artifact_id)
+        if not ARTIFACT_NAME_RE.fullmatch(artifact_key):
+            raise OcmoError(f"{field}.{artifact_key} must be a simple artifact name")
+        if config is None:
+            artifact_ids.add(artifact_key)
+            continue
+        if not isinstance(config, dict):
+            raise OcmoError(f"{field}.{artifact_key} must be a mapping")
+        if "path" in config:
+            validate_artifact_path_template(config["path"], f"{field}.{artifact_key}.path")
+        if "required" in config and not isinstance(config["required"], bool):
+            raise OcmoError(f"{field}.{artifact_key}.required must be a boolean")
+        if "description" in config and not isinstance(config["description"], str):
+            raise OcmoError(f"{field}.{artifact_key}.description must be a string")
+        artifact_ids.add(artifact_key)
+    return artifact_ids
+
+
+def validate_consumes(value: Any, field: str, produced_by_step: dict[str, set[str]]) -> None:
+    if value is None:
+        return
+    if not isinstance(value, list):
+        raise OcmoError(f"{field} must be a list")
+    for index, reference in enumerate(value, start=1):
+        if not isinstance(reference, str) or not reference.strip():
+            raise OcmoError(f"{field}[{index}] must be a non-empty string")
+        parts = reference.split(".", 1)
+        if len(parts) != 2 or not all(ARTIFACT_NAME_RE.fullmatch(part) for part in parts):
+            raise OcmoError(f"{field}[{index}] must use <step-id>.<artifact-id>")
+        if parts[0] not in produced_by_step:
+            raise OcmoError(f"{field}[{index}] must reference an earlier step")
+        if parts[1] not in produced_by_step[parts[0]]:
+            raise OcmoError(f"{field}[{index}] references an unknown artifact")
+
+
+def validate_artifact_path_template(value: Any, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise OcmoError(f"{field} must be a non-empty string")
+    path = Path(value)
+    if path.is_absolute() or path.drive or ".." in path.parts or path == Path(".") or not path.parts or path.parts[0] != ARTIFACT_ROOT:
+        raise OcmoError(f"{field} must be relative and stay under {ARTIFACT_ROOT}/")
+
+
+def produced_artifacts(run: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    produces = run.get("produces")
+    if not isinstance(produces, dict):
+        return {}
+    artifacts: dict[str, dict[str, Any]] = {}
+    for artifact_id, config in produces.items():
+        artifacts[str(artifact_id)] = dict(config or {})
+    return artifacts
+
+
+def artifact_reference_map(manifest_path: Path, item: dict[str, Any], runs: list[dict[str, Any]]) -> dict[str, Path]:
+    artifacts: dict[str, Path] = {}
+    for run in runs:
+        run_id = str(run["id"])
+        for artifact_id, config in produced_artifacts(run).items():
+            artifacts[f"{run_id}.{artifact_id}"] = artifact_path(manifest_path, item, run_id, artifact_id, config.get("path"))
+    return artifacts
+
+
+def artifact_instructions(manifest_path: Path, item: dict[str, Any], run: dict[str, Any]) -> str:
+    artifacts = produced_artifacts(run)
+    if not artifacts:
+        return ""
+    lines = ["## Required Artifacts", "", "Before finishing this run, write these handoff artifact files exactly as specified:"]
+    for artifact_id, config in artifacts.items():
+        path = artifact_path(manifest_path, item, str(run["id"]), artifact_id, config.get("path"))
+        required = config.get("required", True)
+        lines.append(f"- {artifact_id}: {path}")
+        lines.append(f"  Manifest-relative path: {relative_to_manifest(path, manifest_path)}")
+        if config.get("description"):
+            lines.append(f"  Description: {config['description']}")
+        lines.append(f"  Required: {'yes' if required else 'no'}")
+    lines.append("")
+    lines.append("Create parent directories if needed. Required artifacts must be non-empty.")
+    return "\n".join(lines)
+
+
+def consumed_artifacts(manifest_path: Path, item: dict[str, Any], run: dict[str, Any], runs: list[dict[str, Any]]) -> str:
+    consumes = run.get("consumes") or []
+    if not consumes:
+        return ""
+    references = artifact_reference_map(manifest_path, item, runs)
+    sections = ["## Chained Inputs", ""]
+    for index, reference in enumerate(consumes, start=1):
+        step_id, artifact_id = parse_artifact_reference(reference, f"run.consumes[{index}]")
+        key = f"{step_id}.{artifact_id}"
+        path = references[key]
+        sections.append(f"### {key}")
+        sections.append(f"Source: {relative_to_manifest(path, manifest_path)}")
+        sections.append("")
+        if path.exists():
+            sections.append(path.read_text(encoding="utf-8", errors="replace"))
+        else:
+            sections.append("[artifact will be generated by an earlier sequential run]")
+        sections.append("")
+    return "\n".join(sections).rstrip()
 
 
 def validate_item_run_paths(item: dict[str, Any], manifest_path: Path, item_index: int) -> None:
@@ -271,7 +425,7 @@ def item_runs(manifest: dict[str, Any], item: dict[str, Any]) -> list[dict[str, 
 def effective_runner(manifest: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
     runner = dict(manifest.get("runner", {}))
     for key, value in run.items():
-        if key not in {"id", "index", "mode", "prompt"}:
+        if key not in {"id", "index", "mode", "prompt", "produces", "consumes"}:
             runner[key] = value
     return runner
 
@@ -374,6 +528,30 @@ def resolve_manifest_path(manifest_path: Path, value: str) -> Path:
     return (manifest_path.parent / path).resolve()
 
 
+def artifact_path(manifest_path: Path, item: dict[str, Any], run_id: str, artifact_id: str, configured_path: str | None = None) -> Path:
+    validate_artifact_name(artifact_id, "artifact")
+    value = configured_path or f"{ARTIFACT_ROOT}/{slugify(str(item.get('id', 'item')))}/{slugify(run_id)}/{slugify(artifact_id)}.md"
+    if configured_path is not None:
+        substitutions = {
+            "item_id": slugify(str(item.get("id", ""))),
+            "run_id": slugify(run_id),
+            "artifact_id": slugify(artifact_id),
+        }
+        value = Template(configured_path).safe_substitute(substitutions)
+    validate_artifact_path_template(value, "artifact.path")
+    path = resolve_manifest_path(manifest_path, value)
+    root = (manifest_path.parent / ARTIFACT_ROOT).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:  # pragma: no cover - validate_artifact_path_template rejects normal escape attempts.
+        raise OcmoError(f"artifact.path must stay under {ARTIFACT_ROOT}/") from exc
+    return path
+
+
+def artifact_relative_path(manifest_path: Path, item: dict[str, Any], run_id: str, artifact_id: str, configured_path: str | None = None) -> str:
+    return relative_to_manifest(artifact_path(manifest_path, item, run_id, artifact_id, configured_path), manifest_path)
+
+
 def select_items(manifest: dict[str, Any], selector: str | None) -> list[dict[str, Any]]:
     items = manifest["items"]
     selector = selector or manifest.get("selection", {}).get("default") or "uncompleted"
@@ -432,7 +610,6 @@ def render_prompt(
         "item_json": json.dumps(item, indent=2, ensure_ascii=False),
         "payload_json": json.dumps(item.get("payload", {}), indent=2, ensure_ascii=False),
         "operation_id": str(operation.get("id", "")),
-        "operation_kind": str(operation.get("kind", "generic")),
         "workspace": str(operation.get("workspace", "")),
         "item_id": str(item.get("id", "")),
         "item_title": str(item.get("title", "")),
@@ -452,6 +629,15 @@ def render_prompt(
         "skill_names": ", ".join(skills),
     }
     rendered = render_brace_placeholders(template.safe_substitute(context), context, manifest, item, operation, execution, run)
+    sections = []
+    chained_inputs = consumed_artifacts(manifest_path, item, run, runs)
+    if chained_inputs:
+        sections.append(chained_inputs)
+    sections.append(rendered)
+    required_artifacts = artifact_instructions(manifest_path, item, run)
+    if required_artifacts:
+        sections.append(required_artifacts)
+    rendered = "\n\n".join(sections)
     if rendered_skill_instructions:
         return f"{rendered_skill_instructions}\n\n{rendered}"
     return rendered
@@ -509,10 +695,28 @@ def format_placeholder_value(value: Any) -> str:
     return str(value)
 
 
+def compact_prompt_previews(previews: list[PromptPreview], show_all: bool) -> list[PromptPreview | int]:
+    if show_all or len(previews) <= 3:
+        return previews
+    omitted = len(previews) - 3
+    return [previews[0], previews[1], omitted, previews[-1]]
+
+
+def print_prompt_previews(previews: list[PromptPreview], show_all: bool) -> None:
+    for preview in compact_prompt_previews(previews, show_all):
+        if isinstance(preview, int):
+            print(f"# ... {preview} prompt(s) omitted ...")
+            print("\n" + "=" * 80 + "\n")
+            continue
+        print(f"# item {preview.item_id} / run {preview.run_id}")
+        print(preview.text)
+        print("\n" + "=" * 80 + "\n")
+
+
 def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str, run_dir: Path | None = None, runner: dict[str, Any] | None = None) -> list[str]:
     operation = manifest["operation"]
     runner = runner or manifest["runner"]
-    command = [runner.get("command", "opencode"), runner.get("mode", "run")]
+    command = [runner.get("command", "opencode"), "run"]
     if runner.get("agent"):
         command += ["--agent", str(runner["agent"])]
     if runner.get("model"):
@@ -759,6 +963,19 @@ def relative_to_manifest(path: Path, manifest_path: Path) -> str:
     return path.relative_to(manifest_path.parent).as_posix()
 
 
+def verify_required_artifacts(manifest_path: Path, item: dict[str, Any], run: dict[str, Any]) -> dict[str, str]:
+    produced = produced_artifacts(run)
+    verified: dict[str, str] = {}
+    for artifact_id, config in produced.items():
+        path = artifact_path(manifest_path, item, str(run["id"]), artifact_id, config.get("path"))
+        relative = relative_to_manifest(path, manifest_path)
+        if config.get("required", True) and (not path.exists() or not path.read_text(encoding="utf-8", errors="replace").strip()):
+            raise OcmoError(f"required artifact was not written or is empty: {relative}")
+        if path.exists():
+            verified[artifact_id] = relative
+    return verified
+
+
 def run_opencode_command(
     command: list[str],
     run_dir: Path,
@@ -829,6 +1046,7 @@ def run_manifest(options: RunOptions) -> int:
         return 0
 
     if options.dry_run:
+        previews = []
         for item in selected:
             execution = worktree_execution(manifest, options.manifest_path, item) if auto_worktrees["enabled"] else {}
             run_dir = Path(execution["worktreePath"]) if execution else None
@@ -838,16 +1056,18 @@ def run_manifest(options: RunOptions) -> int:
                 run_timeout = timeout_seconds if timeout_seconds is not None else runner.get("timeoutSeconds")
                 prompt_text = render_prompt(manifest, item, options.manifest_path, execution, run, runs)
                 command = build_command(manifest, options.manifest_path, prompt_text, run_dir, runner)
-                print(f"# item {item['id']} / run {run['id']}")
+                header = [format_command(command)]
                 if execution:
-                    print(f"# worktree: {execution['worktreePath']}")
-                    print(f"# branch: {execution['branchName']}")
-                print(format_command(command))
+                    header.append(f"# worktree: {execution['worktreePath']}")
+                    header.append(f"# branch: {execution['branchName']}")
                 if run_timeout:
-                    print(f"# timeout: {run_timeout} seconds")
-                print("\n--- prompt ---\n")
-                print(prompt_text)
-                print("\n" + "=" * 80 + "\n")
+                    header.append(f"# timeout: {run_timeout} seconds")
+                for artifact_id, config in produced_artifacts(run).items():
+                    header.append(f"# produces: {artifact_id} -> {artifact_relative_path(options.manifest_path, item, str(run['id']), artifact_id, config.get('path'))}")
+                for reference in run.get("consumes") or []:
+                    header.append(f"# consumes: {reference}")
+                previews.append(PromptPreview(str(item["id"]), str(run["id"]), "\n".join(header) + "\n\n--- prompt ---\n\n" + prompt_text))
+        print_prompt_previews(previews, options.preview_all)
         return 0
 
     if not options.yes:
@@ -932,6 +1152,10 @@ def run_item(
                 "command": command_without_prompt(command),
                 "timeoutSeconds": run_timeout,
                 "outputPath": relative_to_manifest(output_path, manifest_path),
+                "artifacts": {
+                    artifact_id: artifact_relative_path(manifest_path, item, run_id, artifact_id, config.get("path"))
+                    for artifact_id, config in produced_artifacts(run).items()
+                },
             },
         )
         reporter.run(item_id, run_id, "running", "starting")
@@ -951,7 +1175,15 @@ def run_item(
             return cleanup_code or 1
         reporter.subprocess_output(item_id, run_id, completed)
         if completed.returncode == 0:
-            state.mark_run(item_id, run_id, "completed", {"completedAt": utc_now(), "exitCode": 0})
+            try:
+                artifacts = verify_required_artifacts(manifest_path, item, run)
+            except OcmoError as exc:
+                state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
+                state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
+                reporter.run(item_id, run_id, "failed", str(exc))
+                cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
+                return cleanup_code or 1
+            state.mark_run(item_id, run_id, "completed", {"completedAt": utc_now(), "exitCode": 0, "artifacts": artifacts})
             reporter.run(item_id, run_id, "running", "completed")
         else:
             state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": completed.returncode})
@@ -1276,7 +1508,7 @@ class PlainPlanReporter:
         self.out_path = out_path
 
     def __enter__(self) -> "PlainPlanReporter":
-        print(f"ocmo: planning with agent={self.args.agent} model={self.args.model or '<opencode-default>'}", file=sys.stderr)
+        print(f"ocmo: planning with agent={PLAN_AGENT} model={self.args.model or '<opencode-default>'}", file=sys.stderr)
         print(f"ocmo: planning workspace={self.workspace}", file=sys.stderr)
         print(f"ocmo: planning output={self.out_path}", file=sys.stderr)
         return self
@@ -1330,7 +1562,7 @@ class RichPlanReporter(PlainPlanReporter):  # pragma: no cover
     def status_text(self, phase: str) -> str:
         elapsed = format_duration(time.monotonic() - self.started)
         model = self.args.model or "<opencode-default>"
-        return f"ocmo plan {phase} | agent={self.args.agent} model={model} elapsed={elapsed} output={self.out_path}"
+        return f"ocmo plan {phase} | agent={PLAN_AGENT} model={model} elapsed={elapsed} output={self.out_path}"
 
 
 def make_plan_reporter(args: argparse.Namespace, workspace: Path, out_path: Path, interactive: bool) -> PlainPlanReporter:
@@ -1364,7 +1596,7 @@ def plan_artifact_dir(args: argparse.Namespace, workspace: Path, out_path: Path)
 
 
 def build_plan_command(args: argparse.Namespace, prompt: str, workspace: Path, interactive: bool = False) -> list[str]:
-    command = ["opencode", "run", "--agent", args.agent]
+    command = ["opencode", "run", "--agent", PLAN_AGENT]
     if args.model:
         command += ["--model", args.model]
     if interactive:
@@ -1509,16 +1741,17 @@ Rules:
 - The top-level schema field must be exactly: schema: ocmo/v1.
 - Do not use apiVersion.
 - operation.workspace must be exactly: {workspace}
-- Keep operation.kind generic unless the user explicitly named a stable kind.
 - Use a common ocmo/v1 envelope: operation, runner, queue, policy, prompt, state, items.
 - Do not invent unsupported top-level sections or custom policy/runner/state fields.
 - runner.command must usually be opencode.
-- runner.mode must usually be run.
 - Use queue.concurrency: 1 when the request uses one git worktree or branch-changing workflow.
 - Use queue.autoWorktrees.enabled: true only when the user wants ocmo to create one git worktree per item.
 - Put task-specific fields under each item's payload.
-- If one item needs multiple agents or prompt phases, use items[].runs.mode: sequential and put runs under items[].runs.steps.
-- Use per-run prompt.template values when different agents need different instructions.
+- If one item needs multiple prompt phases, use items[].runs.mode: sequential and put runs under items[].runs.steps.
+- Use agent: build for every explicit top-level or per-run agent value.
+- Use per-run prompt.template values when different phases need different instructions.
+- Use produces and consumes when one sequential phase should hand a deliberate file artifact to a later phase.
+- Produced artifacts default to artifacts/<item-id>/<step-id>/<artifact-id>.md and custom artifact paths must stay under artifacts/.
 - Use the top-level prompt.template only when every run can share the same template.
 - prompt.template and per-run prompt.template must be file paths, not inline YAML block text.
 - Put generated prompt templates under: {prompt_dir}
@@ -1541,12 +1774,10 @@ Canonical shape:
 schema: ocmo/v1
 operation:
   id: example-operation
-  kind: generic
   description: Example operation description.
   workspace: {workspace}
 runner:
   command: opencode
-  mode: run
   agent: build
   model: null
   attach: null

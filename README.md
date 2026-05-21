@@ -29,7 +29,7 @@ Use `ocmo` when one large request naturally splits into many similar units of wo
 - [Concurrency](#concurrency)
 - [Auto Worktrees](#auto-worktrees)
 - [Timeouts](#timeouts)
-- [Examples](#examples)
+- [Getting Started](#getting-started)
 - [State](#state)
 
 ## Why This Exists
@@ -89,13 +89,11 @@ schema: ocmo/v1
 
 operation:
   id: example-operation
-  kind: generic
   description: Process a set of example work items.
   workspace: C:\path\to\target-repo
 
 runner:
   command: opencode
-  mode: run
   agent: build
   model: openai/gpt-5.5
   attach: null
@@ -148,7 +146,7 @@ items:
           prompt:
             template: .ocmo/prompts/example-implement.md
         - id: review
-          agent: review
+          agent: build
           prompt:
             template: .ocmo/prompts/example-review.md
 ```
@@ -160,15 +158,13 @@ items:
 `operation` describes the overall workflow:
 
 - `id`: stable operation identifier, used for state/log naming.
-- `kind`: informational. Keep it `generic` unless your team defines a stable taxonomy.
 - `description`: human-readable operation summary.
 - `workspace`: target repository or working directory for `opencode run`.
 
 `runner` describes how `opencode` is invoked:
 
 - `command`: normally `opencode`.
-- `mode`: normally `run`.
-- `agent`: `opencode` agent name, for example `build` or `plan`.
+- `agent`: optional `opencode` agent name. If present, it must be `build`.
 - `model`: model identifier passed to `opencode`.
 - `attach`: optional `opencode serve` URL.
 - `timeoutSeconds`: optional maximum runtime for each `opencode run` process.
@@ -189,7 +185,7 @@ items:
 
 `state.path` points to the durable state JSON file.
 
-`items` contains operation items. Every item must have a unique `id`. The `payload` object is task-specific and can contain anything your prompt template needs. Optional `runs` let one item execute multiple ordered `opencode run` processes with different agents and prompt templates.
+`items` contains operation items. Every item must have a unique `id`. The `payload` object is task-specific and can contain anything your prompt template needs. Optional `runs` let one item execute multiple ordered `opencode run` processes with different prompt templates. All explicit run agents must be `build`.
 
 ## Path Resolution
 
@@ -239,7 +235,6 @@ Available variables:
 - `$payload_json`: JSON representation of the current item payload.
 - `$run_json`: JSON representation of the current run step.
 - `$operation_id`: operation ID.
-- `$operation_kind`: operation kind.
 - `$workspace`: workspace value from the manifest.
 - `$item_id`: current item ID.
 - `$item_title`: current item title, if present.
@@ -290,7 +285,7 @@ items:
       mode: sequential
       steps:
         - id: review
-          agent: review
+          agent: build
           prompt:
             skills:
               - code-review
@@ -300,7 +295,7 @@ If a run-specific `prompt.skills` is present, it replaces the top-level `prompt.
 
 ## Multi-Run Items
 
-By default, one selected item starts one isolated `opencode run` process using top-level `runner` and `prompt` settings. To run multiple agents or phases for the same item, add `runs.mode: sequential` and ordered `runs.steps` to that item.
+By default, one selected item starts one isolated `opencode run` process using top-level `runner` and `prompt` settings. To run multiple phases for the same item, add `runs.mode: sequential` and ordered `runs.steps` to that item.
 
 ```yaml
 items:
@@ -317,7 +312,7 @@ items:
           prompt:
             template: prompts/multi-agent-implement.md
         - id: review
-          agent: review
+          agent: build
           prompt:
             template: prompts/multi-agent-review.md
         - id: fix
@@ -326,7 +321,7 @@ items:
             template: prompts/multi-agent-fix.md
 ```
 
-Each step inherits top-level `runner` fields and can override `agent`, `model`, `attach`, `title`, `timeoutSeconds`, `dangerouslySkipPermissions`, or other runner fields used by `ocmo`. Each step can also set `prompt.template` or `prompt.skills`; if `prompt.template` is omitted, it uses the top-level `prompt.template`.
+Each step inherits top-level `runner` fields and can override `model`, `attach`, `title`, `timeoutSeconds`, `dangerouslySkipPermissions`, or other runner fields used by `ocmo`. If a step sets `agent`, it must be `build`. Each step can also set `prompt.template` or `prompt.skills`; if `prompt.template` is omitted, it uses the top-level `prompt.template`.
 
 Sequential run behavior:
 
@@ -338,6 +333,36 @@ Sequential run behavior:
 - Teardown and cleanup run once after all steps succeed or after the first failed step.
 - The item is marked `completed` only after every step succeeds.
 - If one step fails or times out, later steps for that item are skipped and the item is marked failed or timed out.
+
+### Chained Artifacts
+
+Sequential steps can pass explicit handoff files through native manifest fields. A step declares files with `produces`; later steps read them with `consumes`:
+
+```yaml
+items:
+  - id: ITEM-001
+    runs:
+      mode: sequential
+      steps:
+        - id: plan
+          agent: build
+          prompt:
+            template: prompts/plan.md
+          produces:
+            plan:
+              required: true
+              description: Implementation plan for this item.
+        - id: implement
+          agent: build
+          prompt:
+            template: prompts/implement.md
+          consumes:
+            - plan.plan
+```
+
+By default, `produces.plan` writes to `artifacts/<item-id>/<step-id>/plan.md` beside `manifest.yaml`. Custom artifact paths are allowed only under `artifacts/` and may use `$item_id`, `$run_id`, and `$artifact_id`.
+
+`ocmo` injects deterministic instructions into the producing step prompt telling the agent exactly which artifact file to write. After a successful `opencode run`, required artifacts must exist and be non-empty or the step fails. For consuming steps, `ocmo` reads the referenced artifact and injects it into the rendered prompt under `## Chained Inputs`.
 
 `runs.mode` currently supports only `sequential`. The field is present so a future manifest version can add parallel per-item runs without changing the manifest shape.
 
@@ -370,7 +395,7 @@ ocmo validate examples/report-rewrite.yaml
 ### `ocmo render`
 
 ```powershell
-ocmo render <manifest> [--select <selector>]
+ocmo render <manifest> [--select <selector>] [--all]
 ```
 
 Example:
@@ -379,7 +404,7 @@ Example:
 ocmo render examples/report-rewrite.yaml --select WORK-001
 ```
 
-`render` is a prompt-only preview. It validates the manifest, applies selection rules, renders the effective prompt template once for each selected item/run pair, and prints the resulting prompt text to stdout.
+`render` is a prompt-only preview. It validates the manifest, applies selection rules, renders the effective prompt template once for each selected item/run pair, and prints the resulting prompt text to stdout. When more than three prompts are selected, it prints a compact preview by default: the first two prompts and the last prompt. Use `--all` to print every prompt.
 
 `render` is intentionally read-only. It does not start `opencode`, build or print the final `opencode run` command, create worktrees, run setup or teardown commands, write state, edit files, apply concurrency, apply timeouts, or mark items.
 
@@ -390,7 +415,7 @@ For `ocmo render`, `$worktree_path` and `$branch_name` are empty. `$source_works
 ### `ocmo run`
 
 ```powershell
-ocmo run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--allow-shared-worktree-concurrency] [--dry-run] [--yes]
+ocmo run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--allow-shared-worktree-concurrency] [--dry-run] [--all] [--yes]
 ```
 
 Examples:
@@ -428,6 +453,7 @@ Options:
 - `--ui auto|live|plain`: controls non-dry-run terminal output; defaults to `auto`.
 - `--allow-shared-worktree-concurrency`: allows `concurrency > 1` with `policy.worktree: single` for this `run` invocation.
 - `--dry-run`: previews execution without starting work or writing state.
+- `--all`: with `--dry-run`, prints every rendered prompt instead of a compact preview.
 - `--yes`, `-y`: skips the confirmation prompt for non-dry runs.
 
 `--concurrency` and `--timeout-seconds` must be positive integers. If `policy.worktree: single`, concurrency must be `1` unless `--allow-shared-worktree-concurrency` is passed. `policy.worktree: single` cannot be combined with `queue.autoWorktrees.enabled: true`.
@@ -435,7 +461,7 @@ Options:
 ### `ocmo run --dry-run`
 
 ```powershell
-ocmo run [manifest-or-directory] --select <selector> --dry-run
+ocmo run [manifest-or-directory] --select <selector> --dry-run [--all]
 ```
 
 Example:
@@ -444,7 +470,7 @@ Example:
 ocmo run examples/report-rewrite.yaml --select WORK-001 --dry-run
 ```
 
-`--dry-run` validates the manifest, applies selection rules, renders the prompt for each selected item/run pair, and prints each `opencode run` command that would be launched.
+`--dry-run` validates the manifest, applies selection rules, renders the prompt for each selected item/run pair, and prints each `opencode run` command that would be launched. When more than three prompts are selected, it uses the same compact preview as `ocmo render`; use `--all` to print every prompt.
 
 When auto worktrees are enabled, `--dry-run` also prints the planned worktree path and branch name. When a timeout is configured, it prints the effective timeout.
 
@@ -453,7 +479,7 @@ When auto worktrees are enabled, `--dry-run` also prints the planned worktree pa
 ### `ocmo plan`
 
 ```powershell
-ocmo plan --from <prompt-file> [--out <manifest>] [--workspace <path>] [--read <source-file>] [--model <model>] [--agent <agent>] [--interactive] [--dry-run]
+ocmo plan --from <prompt-file> [--out <manifest>] [--workspace <path>] [--read <source-file>] [--model <model>] [--interactive] [--dry-run]
 ```
 
 Example:
@@ -465,7 +491,7 @@ ocmo plan `
   --read "C:\path\to\source-data.csv"
 ```
 
-`plan` asks `opencode` to convert a natural-language mass-operation request into an `ocmo/v1` manifest. It can attach read-only source files such as CSV exports, text files, or other planning inputs. If the request needs multiple agents or phases per item, the planning prompt tells `opencode` to use `items[].runs.mode: sequential` and per-run `prompt.template` values.
+`plan` asks `opencode` to convert a natural-language mass-operation request into an `ocmo/v1` manifest. It can attach read-only source files such as CSV exports, text files, or other planning inputs. If the request needs multiple phases per item, the planning prompt tells `opencode` to use `items[].runs.mode: sequential`, `agent: build`, and per-run `prompt.template` values.
 
 `--workspace` sets the target repository for planning and is passed to `opencode run --dir`. If omitted, it defaults to the current working directory. The planner is instructed to use the resolved workspace path as `operation.workspace`.
 
@@ -511,7 +537,7 @@ Prompt template contents for $item_id
 OCMO_FILE_END
 ```
 
-`--agent` defaults to `build`.
+The planner always uses the `build` agent.
 
 `--interactive` allows the planning agent to ask terminal questions before returning the final manifest. In interactive mode, `ocmo` expects the final YAML between `OCMO_MANIFEST_START` and `OCMO_MANIFEST_END` markers, extracts only that YAML, writes any generated file blocks, validates the result, and writes the manifest to the resolved output path.
 
@@ -632,7 +658,6 @@ Use `runner.timeoutSeconds` to prevent stale or runaway `opencode run` processes
 ```yaml
 runner:
   command: opencode
-  mode: run
   timeoutSeconds: 14400
 ```
 
@@ -660,47 +685,71 @@ ocmo run examples/report-rewrite.yaml --timeout-seconds 7200 --yes
 
 `--dry-run` prints the effective timeout but does not start any process or write timeout state.
 
-## Examples
+## Getting Started
 
-See:
+1. Write the mass-operation request.
+
+```powershell
+notepad business-taxonomy-prompt.txt
+```
+
+Describe the work, the item boundaries, the desired prompt shape, and any constraints the agents must follow. Keep task-specific meaning in this request and the generated manifest payloads; `ocmo` only schedules and renders.
+
+2. Generate an operation folder.
+
+```powershell
+ocmo plan --from business-taxonomy-prompt.txt
+```
+
+By default, this writes:
+
+```text
+.ocmo/
+  business-taxonomy-prompt/
+    manifest.yaml
+    state.json
+    prompts/
+      <generated-template>.md
+```
+
+3. Review the generated files.
+
+Check `manifest.yaml` for item IDs, selection defaults, concurrency, worktree policy, timeouts, prompt template paths, and `state.path`. Check generated files under `prompts/` before running agents.
+
+4. Preview rendered prompts.
+
+```powershell
+ocmo render .ocmo/business-taxonomy-prompt/manifest.yaml --select uncompleted
+```
+
+When many prompts are selected, preview output is compact by default: first two prompts and the last prompt are shown. Add `--all` to print every rendered prompt.
+
+5. Preview execution.
+
+```powershell
+ocmo run .ocmo/business-taxonomy-prompt --select uncompleted --dry-run
+```
+
+Dry-run output includes the `opencode run` command, timeout, planned worktree details when configured, and compact prompt previews. Add `--all` to print every prompt.
+
+6. Run the queue.
+
+```powershell
+ocmo run .ocmo/business-taxonomy-prompt --select uncompleted --yes
+```
+
+Use `--ui live` to require the live terminal dashboard, or `--ui plain` for stable line-oriented logs.
+
+7. Inspect results.
+
+Review `state.json` beside the manifest for durable execution status. Review per-run agent output under `outputs/`, for example `outputs/TAXONOMY-041-048__default.txt`.
+
+Reference examples are available in:
 
 - `examples/report-rewrite.yaml`
 - `examples/report-rewrite-auto-worktrees.yaml`
 - `examples/report-rewrite-multi-agent.yaml`
 - `examples/prompts/report-rewrite.md`
-
-The example models a generic workflow where each report-like artifact is processed independently:
-
-```text
-Rewrite selected work items from a tracker export.
-Use one branch and review request per item.
-Use a single git worktree.
-Run an `opencode` review pass after each rewrite.
-If review finds issues, run a fix pass and review again.
-```
-
-All identifiers in the example are synthetic. They show the manifest shape without embedding real tracker IDs, employee names, reviewer handles, report names, or local filesystem paths.
-
-Because the example uses a single git worktree, it sets `queue.concurrency: 1`.
-
-To run the same workflow shape with isolated per-item worktrees, set `policy.worktree: per-item`, set `queue.autoWorktrees.enabled: true`, and increase `queue.concurrency` to the number of parallel items you want.
-
-### Example Item
-
-```yaml
-items:
-  - id: WORK-001
-    title: ExampleReportOne
-    status: pending
-    payload:
-      workItemKey: WORK-001
-      targetName: ExampleReportOne
-      branch: feature/WORK-001_example-report-one
-      reviewer: reviewer-user
-      assignee: assignee-user
-```
-
-`ocmo` does not know what `targetName`, `reviewer`, or `assignee` mean. It renders them into the prompt, and the `opencode` agent follows the prompt.
 
 ## State
 

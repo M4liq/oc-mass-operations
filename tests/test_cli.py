@@ -33,11 +33,9 @@ class OcmoTestCase(unittest.TestCase):
             f"""schema: ocmo/v1
 operation:
   id: test-op
-  kind: generic
   workspace: {self.workspace.as_posix()}
 runner:
   command: opencode
-  mode: run
   agent: build
   model: test-model
   timeoutSeconds: 30
@@ -74,11 +72,9 @@ items:
         return f"""schema: ocmo/v1
 operation:
   id: planned-op
-  kind: generic
   workspace: {self.workspace.as_posix()}
 runner:
   command: opencode
-  mode: run
 queue:
   concurrency: 1
 policy:
@@ -124,7 +120,7 @@ class ValidationTests(OcmoTestCase):
             "mode": "sequential",
             "steps": [
                 {"id": "implement", "agent": "build", "prompt": {"template": str(self.prompt)}},
-                {"id": "review", "agent": "review", "timeoutSeconds": 5, "prompt": {"template": str(review_prompt), "skills": ["/review-skill"]}},
+                {"id": "review", "agent": "build", "timeoutSeconds": 5, "prompt": {"template": str(review_prompt), "skills": ["/review-skill"]}},
             ],
         }
 
@@ -185,6 +181,13 @@ class ValidationTests(OcmoTestCase):
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "prompt": {"skills": "review"}}]}}, "prompt.skills must be a list"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "prompt": {"skills": [""]}}]}}, r"prompt.skills\[1\] must be a non-empty string"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "prompt": {"skills": ["bad skill"]}}]}}, r"prompt.skills\[1\] must be a skill name"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "agent": "review"}]}}, r"agent must be build"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": []}]}}, r"produces must be a mapping"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"bad name": {}}}]}}, r"simple artifact name"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"path": "../plan.md"}}}]}}, r"under artifacts/"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "consumes": "plan.plan"}]}}, r"consumes must be a list"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "consumes": ["plan.plan"]}]}}, r"earlier step"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "plan", "produces": {"notes": {}}}, {"id": "build", "consumes": ["plan.plan"]}]}}, r"unknown artifact"),
         ]
         for patch, message in cases:
             manifest = self.load()
@@ -192,6 +195,13 @@ class ValidationTests(OcmoTestCase):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(cli.OcmoError, message):
                     cli.validate_manifest(manifest, self.manifest_path)
+
+    def test_validation_rejects_non_build_top_level_agent(self) -> None:
+        manifest = self.load()
+        manifest["runner"]["agent"] = "review"
+
+        with self.assertRaisesRegex(cli.OcmoError, "runner.agent must be build"):
+            cli.validate_manifest(manifest, self.manifest_path)
 
     def test_auto_worktree_config_validation_errors(self) -> None:
         cases = [
@@ -267,7 +277,7 @@ class SelectionAndRenderingTests(OcmoTestCase):
     def test_render_prompt_includes_run_and_execution_context(self) -> None:
         manifest = self.load()
         item = manifest["items"][0]
-        run = {"id": "review", "index": 2, "mode": "sequential", "agent": "review", "model": "review-model"}
+        run = {"id": "review", "index": 2, "mode": "sequential", "agent": "build", "model": "review-model"}
 
         rendered = cli.render_prompt(
             manifest,
@@ -279,7 +289,7 @@ class SelectionAndRenderingTests(OcmoTestCase):
         )
 
         self.assertIn("Item 1 First run review/2", rendered)
-        self.assertIn("agent review model review-model", rendered)
+        self.assertIn("agent build model review-model", rendered)
         self.assertIn("C:/worktree", rendered)
         self.assertIn('"name": "Alpha"', rendered)
 
@@ -313,6 +323,15 @@ class SelectionAndRenderingTests(OcmoTestCase):
     def test_format_placeholder_value_handles_none(self) -> None:
         self.assertEqual(cli.format_placeholder_value(None), "")
 
+    def test_compact_prompt_previews_keeps_first_two_and_last(self) -> None:
+        previews = [cli.PromptPreview(str(index), "default", f"prompt {index}") for index in range(1, 6)]
+
+        compact = cli.compact_prompt_previews(previews, False)
+
+        self.assertEqual(compact, [previews[0], previews[1], 2, previews[-1]])
+        self.assertEqual(cli.compact_prompt_previews(previews[:3], False), previews[:3])
+        self.assertEqual(cli.compact_prompt_previews(previews, True), previews)
+
     def test_render_prompt_prepends_deterministic_skill_instructions(self) -> None:
         self.prompt.write_text("Skills: $skill_names\nCommands:\n$skill_commands\n$item_id", encoding="utf-8")
         manifest = self.load()
@@ -333,6 +352,106 @@ class SelectionAndRenderingTests(OcmoTestCase):
 
         self.assertIn("- /review", rendered)
         self.assertNotIn("- /implement", rendered)
+
+    def test_render_prompt_injects_chained_artifacts(self) -> None:
+        manifest = self.load()
+        item = manifest["items"][0]
+        plan_path = self.root / "artifacts" / "1" / "plan" / "plan.md"
+        plan_path.parent.mkdir(parents=True)
+        plan_path.write_text("Plan content", encoding="utf-8")
+        plan_run = {"id": "plan", "index": 1, "mode": "sequential", "agent": "build", "produces": {"plan": {}}}
+        implement_run = {"id": "implement", "index": 2, "mode": "sequential", "agent": "build", "consumes": ["plan.plan"], "produces": {"notes": {"required": False, "description": "Optional notes"}}}
+
+        rendered = cli.render_prompt(manifest, item, self.manifest_path, run=implement_run, runs=[plan_run, implement_run])
+
+        self.assertIn("## Chained Inputs", rendered)
+        self.assertIn("### plan.plan", rendered)
+        self.assertIn("Plan content", rendered)
+        self.assertIn("## Required Artifacts", rendered)
+        self.assertIn("Optional notes", rendered)
+        self.assertIn("artifacts/1/implement/notes.md", rendered)
+
+    def test_artifact_helpers_validate_more_edge_cases(self) -> None:
+        with self.assertRaisesRegex(cli.OcmoError, "field must be build"):
+            cli.validate_build_agent("", "field")
+        with self.assertRaisesRegex(cli.OcmoError, "artifact names"):
+            cli.validate_artifact_name("bad name", "field")
+        with self.assertRaisesRegex(cli.OcmoError, "step.artifact syntax"):
+            cli.parse_artifact_reference([], "field")
+        with self.assertRaisesRegex(cli.OcmoError, "must be a non-empty string"):
+            cli.validate_consumes([""], "field", {"plan": {"plan"}})
+        with self.assertRaisesRegex(cli.OcmoError, "must use <step-id>.<artifact-id>"):
+            cli.validate_consumes(["bad"], "field", {"plan": {"plan"}})
+        with self.assertRaisesRegex(cli.OcmoError, "artifact names"):
+            cli.parse_artifact_reference("bad name.plan", "field")
+        with self.assertRaisesRegex(cli.OcmoError, "must be a mapping"):
+            cli.validate_produces({"plan": "bad"}, "field")
+        with self.assertRaisesRegex(cli.OcmoError, "required must be a boolean"):
+            cli.validate_produces({"plan": {"required": "yes"}}, "field")
+        with self.assertRaisesRegex(cli.OcmoError, "description must be a string"):
+            cli.validate_produces({"plan": {"description": 1}}, "field")
+        with self.assertRaisesRegex(cli.OcmoError, "must be a non-empty string"):
+            cli.validate_artifact_path_template("", "field")
+        with self.assertRaisesRegex(cli.OcmoError, "relative and stay under artifacts"):
+            cli.artifact_path(self.manifest_path, {"id": "1"}, "run", "plan", "artifacts/../plan.md")
+        self.assertEqual(cli.validate_produces({"plan": None}, "field"), {"plan"})
+        self.assertEqual(cli.produced_artifacts({}), {})
+        self.assertEqual(cli.verify_required_artifacts(self.manifest_path, {"id": "1"}, {"id": "run", "produces": {"note": {"required": False}}}), {})
+        rendered = cli.consumed_artifacts(
+            self.manifest_path,
+            {"id": "1"},
+            {"id": "implement", "consumes": ["plan.plan"]},
+            [{"id": "plan", "produces": {"plan": {}}}, {"id": "implement"}],
+        )
+        self.assertIn("will be generated", rendered)
+
+    def test_artifact_helpers_cover_defaults_and_errors(self) -> None:
+        manifest = self.load()
+        item = manifest["items"][0]
+        self.assertEqual(cli.produced_artifacts({}), {})
+        self.assertEqual(cli.validate_produces(None, "field"), set())
+        self.assertEqual(cli.validate_produces({"plan": None}, "field"), {"plan"})
+        self.assertEqual(cli.artifact_relative_path(self.manifest_path, item, "run", "note", "artifacts/$item_id/$run_id/$artifact_id.md"), "artifacts/1/run/note.md")
+        self.assertIn("will be generated", cli.consumed_artifacts(self.manifest_path, item, {"id": "implement", "consumes": ["plan.plan"]}, [{"id": "plan", "produces": {"plan": {}}}]))
+        with self.assertRaisesRegex(cli.OcmoError, "artifact names"):
+            cli.validate_artifact_name("bad name", "field")
+        with self.assertRaisesRegex(cli.OcmoError, "must use step.artifact"):
+            cli.parse_artifact_reference([], "field")
+        with self.assertRaisesRegex(cli.OcmoError, "must be build"):
+            cli.validate_build_agent("", "agent")
+        with self.assertRaisesRegex(cli.OcmoError, "must be a mapping"):
+            cli.validate_produces({"plan": []}, "field")
+        with self.assertRaisesRegex(cli.OcmoError, "required must be a boolean"):
+            cli.validate_produces({"plan": {"required": "yes"}}, "field")
+        with self.assertRaisesRegex(cli.OcmoError, "description must be a string"):
+            cli.validate_produces({"plan": {"description": 1}}, "field")
+        with self.assertRaisesRegex(cli.OcmoError, "non-empty string"):
+            cli.validate_artifact_path_template("", "path")
+        with self.assertRaisesRegex(cli.OcmoError, "relative and stay under artifacts"):
+            cli.artifact_path(self.manifest_path, item, "run", "note", "artifacts-link/note.md")
+
+    def test_artifact_helpers_validate_edge_cases(self) -> None:
+        with self.assertRaisesRegex(cli.OcmoError, "field must be build"):
+            cli.validate_build_agent("", "field")
+        with self.assertRaisesRegex(cli.OcmoError, "artifact names"):
+            cli.validate_artifact_name("bad name", "field")
+        with self.assertRaisesRegex(cli.OcmoError, "step.artifact syntax"):
+            cli.parse_artifact_reference([], "field")
+        with self.assertRaisesRegex(cli.OcmoError, "artifact names"):
+            cli.parse_artifact_reference("bad name.plan", "field")
+        with self.assertRaisesRegex(cli.OcmoError, "must be a mapping"):
+            cli.validate_produces({"plan": "bad"}, "field")
+        with self.assertRaisesRegex(cli.OcmoError, "required must be a boolean"):
+            cli.validate_produces({"plan": {"required": "yes"}}, "field")
+        with self.assertRaisesRegex(cli.OcmoError, "description must be a string"):
+            cli.validate_produces({"plan": {"description": 1}}, "field")
+        with self.assertRaisesRegex(cli.OcmoError, "must be a non-empty string"):
+            cli.validate_artifact_path_template("", "field")
+        with self.assertRaisesRegex(cli.OcmoError, "relative and stay under artifacts"):
+            cli.artifact_path(self.manifest_path, {"id": "1"}, "run", "plan", "artifacts/../plan.md")
+        self.assertEqual(cli.validate_produces({"plan": None}, "field"), {"plan"})
+        self.assertEqual(cli.produced_artifacts({}), {})
+        self.assertIn("will be generated", cli.consumed_artifacts(self.manifest_path, {"id": "1"}, {"id": "implement", "consumes": ["plan.plan"]}, [{"id": "plan", "produces": {"plan": {}}}, {"id": "implement"}]))
 
     def test_build_command_and_format_command_hide_prompt(self) -> None:
         manifest = self.load()
@@ -369,8 +488,8 @@ class RunManifestTests(OcmoTestCase):
         manifest["items"][0]["runs"] = {
             "mode": "sequential",
             "steps": [
-                {"id": "implement", "agent": "build", "prompt": {"template": str(impl_prompt)}},
-                {"id": "review", "agent": "review", "prompt": {"template": str(review_prompt)}},
+                {"id": "implement", "agent": "build", "prompt": {"template": str(impl_prompt)}, "produces": {"plan": {}}},
+                {"id": "review", "agent": "build", "prompt": {"template": str(review_prompt)}, "consumes": ["implement.plan"]},
             ],
         }
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
@@ -383,6 +502,8 @@ class RunManifestTests(OcmoTestCase):
         output = stdout.getvalue()
         self.assertIn("# item 1 / run implement", output)
         self.assertIn("# item 1 / run review", output)
+        self.assertIn("# produces: plan -> artifacts/1/implement/plan.md", output)
+        self.assertIn("# consumes: implement.plan", output)
         self.assertIn("Implement implement 1", output)
         self.assertIn("Review review 2", output)
         run.assert_not_called()
@@ -391,7 +512,7 @@ class RunManifestTests(OcmoTestCase):
     def test_run_manifest_executes_runs_in_order_and_writes_nested_state(self) -> None:
         manifest = self.load()
         manifest["items"] = [manifest["items"][0]]
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "one"}, {"id": "two", "agent": "review"}]}
+        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "one"}, {"id": "two", "agent": "build"}]}
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
         calls: list[list[str]] = []
 
@@ -414,6 +535,49 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(state["items"]["1"]["runs"]["two"]["outputPath"], "outputs/1__two.txt")
         self.assertIn("agent output for", (self.root / "outputs" / "1__one.txt").read_text(encoding="utf-8"))
         self.assertIn("[ocmo] exit code: 0", (self.root / "outputs" / "1__two.txt").read_text(encoding="utf-8"))
+
+    def test_run_manifest_chains_required_artifacts(self) -> None:
+        manifest = self.load()
+        manifest["items"] = [manifest["items"][0]]
+        manifest["items"][0]["runs"] = {
+            "mode": "sequential",
+            "steps": [
+                {"id": "plan", "agent": "build", "produces": {"plan": {}}},
+                {"id": "implement", "agent": "build", "consumes": ["plan.plan"]},
+            ],
+        }
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        plan_artifact = self.root / "artifacts" / "1" / "plan" / "plan.md"
+        prompts: list[str] = []
+
+        def fake_run(command: list[str], **kwargs):
+            prompts.append(command[-1])
+            if "Required Artifacts" in command[-1]:
+                plan_artifact.parent.mkdir(parents=True)
+                plan_artifact.write_text("artifact plan", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, stdout="ok")
+
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 0)
+        self.assertIn("artifact plan", prompts[1])
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["items"]["1"]["runs"]["plan"]["artifacts"], {"plan": "artifacts/1/plan/plan.md"})
+
+    def test_run_manifest_fails_when_required_artifact_missing(self) -> None:
+        manifest = self.load()
+        manifest["items"] = [manifest["items"][0]]
+        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "plan", "agent": "build", "produces": {"plan": {}}}]}
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+
+        with mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["opencode"], 0, stdout="ok")), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 1)
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["items"]["1"]["runs"]["plan"]["status"], "failed")
+        self.assertIn("required artifact", state["items"]["1"]["runs"]["plan"]["error"])
 
     def test_run_manifest_writes_clean_utf8_output_files(self) -> None:
         manifest = self.load()
@@ -661,6 +825,33 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertIn("valid:", output)
         self.assertIn("# item 1 / run default", output)
 
+    def test_main_render_compacts_many_prompts_unless_all_is_set(self) -> None:
+        manifest = self.load()
+        manifest["items"] = [
+            {"id": f"ITEM-{index}", "status": "pending", "payload": {"name": f"Item {index}"}}
+            for index in range(1, 6)
+        ]
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = cli.main(["render", str(self.manifest_path), "--select", "all"])
+
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertIn("# item ITEM-1 / run default", output)
+        self.assertIn("# item ITEM-2 / run default", output)
+        self.assertIn("# item ITEM-5 / run default", output)
+        self.assertIn("# ... 2 prompt(s) omitted ...", output)
+        self.assertNotIn("# item ITEM-3 / run default", output)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = cli.main(["render", str(self.manifest_path), "--select", "all", "--all"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("# item ITEM-3 / run default", stdout.getvalue())
+
     def test_main_run_defaults_manifest_and_accepts_directory(self) -> None:
         manifest_dir = self.root / "operation"
         manifest_dir.mkdir()
@@ -679,6 +870,11 @@ class CliEntrypointTests(OcmoTestCase):
             code = cli.main(["run", "--allow-shared-worktree-concurrency", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertTrue(run.call_args.args[0].allow_shared_worktree_concurrency)
+
+        with mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
+            code = cli.main(["run", "--dry-run", "--all"])
+        self.assertEqual(code, 0)
+        self.assertTrue(run.call_args.args[0].preview_all)
 
         self.assertEqual(cli.run_manifest_path(self.manifest_path), self.manifest_path)
 
@@ -731,6 +927,11 @@ class EdgeCaseCoverageTests(OcmoTestCase):
             cli.validate_manifest(manifest, self.manifest_path)
 
         manifest = self.load()
+        manifest["operation"]["kind"] = "generic"
+        with self.assertRaisesRegex(cli.OcmoError, "operation.kind is no longer supported"):
+            cli.validate_manifest(manifest, self.manifest_path)
+
+        manifest = self.load()
         manifest["runner"] = []
         with self.assertRaisesRegex(cli.OcmoError, "runner must be a mapping"):
             cli.validate_manifest(manifest, self.manifest_path)
@@ -738,6 +939,11 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         manifest = self.load()
         manifest["runner"]["command"] = ""
         with self.assertRaisesRegex(cli.OcmoError, "command must be a non-empty string"):
+            cli.validate_manifest(manifest, self.manifest_path)
+
+        manifest = self.load()
+        manifest["runner"]["mode"] = "run"
+        with self.assertRaisesRegex(cli.OcmoError, "runner.mode is no longer supported"):
             cli.validate_manifest(manifest, self.manifest_path)
 
     def test_validation_rejects_invalid_timeout_concurrency_prompt_and_items(self) -> None:
@@ -1277,6 +1483,8 @@ Generated template for $item_id
         self.assertIn("must be file paths, not inline YAML block text", prompt)
         self.assertIn(f"operation.workspace must be exactly: {self.workspace}", prompt)
         self.assertIn(cli.MANIFEST_START, prompt)
+        self.assertNotIn("kind: generic", prompt)
+        self.assertNotIn("mode: run", prompt)
 
     def test_schema_validation_rejects_inline_template_text(self) -> None:
         manifest = self.load()
@@ -1329,7 +1537,7 @@ Generated template for $item_id
 
     def test_final_branch_coverage_for_dry_run_commands_and_planning(self) -> None:
         manifest = self.load()
-        manifest["runner"] = {"command": "opencode", "mode": "run"}
+        manifest["runner"] = {"command": "opencode"}
         manifest["queue"]["autoWorktrees"] = {"enabled": True, "baseBranch": "main"}
         manifest["policy"] = {}
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")

@@ -2,13 +2,11 @@ schema: ocmo/v1
 
 operation:
   id: report-rewrite-multi-agent-example
-  kind: generic
-  description: Rewrite and review selected report-like work items with multiple agents per item.
+  description: Rewrite and review selected report-like work items with multiple sequential phases per item.
   workspace: ..
 
 runner:
   command: opencode
-  mode: run
   model: openai/gpt-5.5
   attach: null
   timeoutSeconds: 14400
@@ -57,14 +55,22 @@ items:
           agent: build
           prompt:
             template: prompts/report-implement.md
+          produces:
+            implementation-notes:
+              required: false
+              description: Notes for the review and fix phases.
         - id: review
-          agent: review
+          agent: build
           prompt:
             template: prompts/report-review.md
+          consumes:
+            - implement.implementation-notes
         - id: fix
           agent: build
           prompt:
             template: prompts/report-fix.md
+          consumes:
+            - implement.implementation-notes
   - id: WORK-002
     title: ExampleReportTwo
     status: pending
@@ -81,7 +87,13 @@ items:
           agent: build
           prompt:
             template: prompts/report-implement.md
+          produces:
+            implementation-notes:
+              required: false
+              description: Notes for the review phase.
         - id: review
-          agent: review
+          agent: build
           prompt:
             template: prompts/report-review.md
+          consumes:
+            - implement.implementation-notes
