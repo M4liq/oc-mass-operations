@@ -179,7 +179,7 @@ items:
 - `stopOnFailure`: reserved for stricter failure handling.
 - `autoWorktrees`: optional per-item git worktree creation and setup.
 
-`policy` is interpreted only for worktree safety rules. If `policy.worktree` is `single`, `ocmo` rejects `concurrency > 1` and rejects `queue.autoWorktrees.enabled: true`.
+`policy` is interpreted only for worktree safety rules. If `policy.worktree` is `single`, `ocmo` rejects `concurrency > 1` unless `ocmo run` is called with `--allow-shared-worktree-concurrency`, and rejects `queue.autoWorktrees.enabled: true`.
 
 `prompt.template` points to the per-item prompt template. Optional `prompt.skills` is a list of opencode skill names that `ocmo` turns into deterministic slash-command instructions at the top of each rendered prompt.
 
@@ -493,6 +493,8 @@ ocmo plan `
 
 `plan` asks `opencode` to convert a natural-language mass-operation request into an `ocmo/v1` manifest. It can attach read-only source files such as CSV exports, text files, or other planning inputs. If the request needs multiple phases per item, the planning prompt tells `opencode` to use `items[].runs.mode: sequential`, `agent: build`, and per-run `prompt.template` values.
 
+The planner is allowed to produce `policy.worktree: single` with `queue.concurrency > 1` only when the request explicitly says item scopes are non-overlapping and safe to run in one shared workspace. Run those manifests with `ocmo run --allow-shared-worktree-concurrency`; plain `ocmo validate` still rejects that combination as a safety default.
+
 `--workspace` sets the target repository for planning and is passed to `opencode run --dir`. If omitted, it defaults to the current working directory. The planner is instructed to use the resolved workspace path as `operation.workspace`.
 
 If `--out` is omitted, the manifest is written under the resolved workspace using the input prompt file name. The default manifest name is always `manifest.yaml`:
@@ -598,7 +600,7 @@ queue:
   concurrency: 1
 ```
 
-If you pass `--concurrency 2` with `policy.worktree: single`, `ocmo` fails before starting work unless you also pass `--allow-shared-worktree-concurrency`. That override is run-only and does not make `ocmo validate` accept a manifest whose `queue.concurrency` is above `1` with `policy.worktree: single`.
+If you pass `--concurrency 2` with `policy.worktree: single`, `ocmo` fails before starting work unless you also pass `--allow-shared-worktree-concurrency`. The same flag is required when the manifest itself has `queue.concurrency` above `1` with `policy.worktree: single`. That override is run-only and does not make `ocmo validate` accept a manifest whose `queue.concurrency` is above `1` with `policy.worktree: single`.
 
 Use `--allow-shared-worktree-concurrency` only when concurrent agents are safe to run in the same workspace. Agents can otherwise conflict through shared files, branch state, the git index, generated artifacts, or dependency caches.
 

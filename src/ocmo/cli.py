@@ -1487,7 +1487,7 @@ def plan_manifest(args: argparse.Namespace) -> int:
             try:
                 manifest_text, generated_files = parse_plan_output(output, interactive)
                 manifest = load_manifest_text(manifest_text)
-                validate_manifest_schema(manifest, out_path)
+                validate_manifest_schema(manifest, out_path, allow_shared_worktree_concurrency=True)
                 validate_generated_plan_files(manifest, out_path, generated_files)
             except (OcmoError, yaml.YAMLError) as exc:
                 feedback = str(exc)
@@ -1745,6 +1745,7 @@ Rules:
 - Do not invent unsupported top-level sections or custom policy/runner/state fields.
 - runner.command must usually be opencode.
 - Use queue.concurrency: 1 when the request uses one git worktree or branch-changing workflow.
+- You may use policy.worktree: single with queue.concurrency > 1 only when the request explicitly says item scopes are non-overlapping and safe to run in one shared workspace; the operator must run it with ocmo run --allow-shared-worktree-concurrency.
 - Use queue.autoWorktrees.enabled: true only when the user wants ocmo to create one git worktree per item.
 - Put task-specific fields under each item's payload.
 - If one item needs multiple prompt phases, use items[].runs.mode: sequential and put runs under items[].runs.steps.

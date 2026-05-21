@@ -1339,6 +1339,21 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         self.assertIn("build", captured["command"])
         self.assertIn("prompts/example.md", captured["command"][-1])
         self.assertIn("state.json", captured["command"][-1])
+        self.assertIn("ocmo run --allow-shared-worktree-concurrency", captured["command"][-1])
+
+    def test_plan_accepts_shared_single_worktree_concurrency(self) -> None:
+        prompt = self.root / "request.txt"
+        prompt.write_text("Rate docs in non-overlapping folders with concurrency 3", encoding="utf-8")
+        out = self.root / "planned.yaml"
+        manifest_text = self.planned_manifest_text().replace("concurrency: 1", "concurrency: 3")
+
+        with mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["opencode"], 0, stdout=manifest_text, stderr="")), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[], out=out, model=None, dry_run=False, max_attempts=1, workspace=self.workspace, interactive=False))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(out.read_text(encoding="utf-8"), manifest_text)
+        with self.assertRaisesRegex(cli.OcmoError, "policy.worktree=single requires queue.concurrency=1"):
+            cli.validate_manifest_schema(cli.load_manifest(out), out)
 
     def test_plan_manifest_writes_generated_prompt_template_files(self) -> None:
         prompt = self.root / "request.txt"
