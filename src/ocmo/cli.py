@@ -65,6 +65,18 @@ class RunOptions:
 
 
 @dataclass(frozen=True)
+class WorkflowOptions:
+    workflow_path: Path
+    select: str | None
+    dry_run: bool
+    yes: bool
+    ui: str = "auto"
+    detach: bool = False
+    resume: bool = False
+    rerun: bool = False
+
+
+@dataclass(frozen=True)
 class PromptPreview:
     item_id: str
     run_id: str
@@ -75,7 +87,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ocmo", description="OC Mass Operations")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    run_parser = subparsers.add_parser("run", help="Run operation items from a manifest")
+    operation_parser = subparsers.add_parser("operation", help="Plan, inspect, run, and control one operation")
+    operation_subparsers = operation_parser.add_subparsers(dest="operation_command", required=True)
+
+    run_parser = operation_subparsers.add_parser("run", help="Run operation items from a manifest")
     run_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory; defaults to manifest.yaml or a single .ocmo/*/manifest.yaml")
     run_parser.add_argument("--select", help="Selection: all, pending, uncompleted, IDs, or ranges")
     run_parser.add_argument("--concurrency", type=int, help="Override queue.concurrency")
@@ -91,15 +106,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Allow concurrency > 1 with policy.worktree=single",
     )
 
-    validate_parser = subparsers.add_parser("validate", help="Validate a manifest")
+    validate_parser = operation_subparsers.add_parser("validate", help="Validate an operation manifest")
     validate_parser.add_argument("manifest", type=Path)
 
-    render_parser = subparsers.add_parser("render", help="Render prompts for selected items")
+    render_parser = operation_subparsers.add_parser("render", help="Render prompts for selected operation items")
     render_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory; defaults to manifest.yaml or a single .ocmo/*/manifest.yaml")
     render_parser.add_argument("--select", help="Selection: all, pending, uncompleted, IDs, or ranges")
     render_parser.add_argument("--all", action="store_true", help="Print every rendered prompt instead of a compact preview")
 
-    plan_parser = subparsers.add_parser("plan", help="Ask opencode to convert a prompt into an ocmo manifest")
+    plan_parser = operation_subparsers.add_parser("plan", help="Ask opencode to convert a prompt into an ocmo manifest")
     plan_parser.add_argument("--from", dest="from_file", required=True, type=Path, help="Natural-language operation prompt")
     plan_parser.add_argument("--read", dest="read_files", action="append", default=[], type=Path, help="Read-only source file to attach/inspect")
     plan_parser.add_argument("--out", type=Path, help="Manifest output path; defaults to <workspace>/.ocmo/<prompt-stem>/manifest.yaml")
@@ -109,27 +124,27 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--interactive", action="store_true", help="Allow the planner to ask terminal questions before returning marked YAML")
     plan_parser.add_argument("--dry-run", action="store_true", help="Print the planning prompt only")
 
-    status_parser = subparsers.add_parser("status", help="Show operation item and run status")
+    status_parser = operation_subparsers.add_parser("status", help="Show operation item and run status")
     status_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     status_parser.add_argument("--run-id", help="Show one detached run session")
     status_parser.add_argument("--all", action="store_true", help="Include inactive detached run sessions")
 
-    list_parser = subparsers.add_parser("list", help="List detached run sessions")
+    list_parser = operation_subparsers.add_parser("list", help="List detached operation run sessions")
     list_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     list_parser.add_argument("--run-id", help="Show one detached run session")
     list_parser.add_argument("--all", action="store_true", help="Include inactive detached run sessions")
 
-    pause_parser = subparsers.add_parser("pause", help="Stop active processes and mark the operation paused")
+    pause_parser = operation_subparsers.add_parser("pause", help="Stop active processes and mark the operation paused")
     pause_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     pause_parser.add_argument("--run-id", help="Pause by detached run id")
 
-    resume_parser = subparsers.add_parser("resume", help="Resume paused operation runs by opencode session id")
+    resume_parser = operation_subparsers.add_parser("resume", help="Resume paused operation runs by opencode session id")
     resume_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     resume_parser.add_argument("--detach", action="store_true", help="Resume in the background and return immediately")
     resume_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for foreground resume")
     resume_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for foreground resume")
 
-    rerun_parser = subparsers.add_parser("rerun", help="Fresh-start failed, timed-out, killed, or unresumable operation items")
+    rerun_parser = operation_subparsers.add_parser("rerun", help="Fresh-start failed, timed-out, killed, or unresumable operation items")
     rerun_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     rerun_parser.add_argument("--select", default="retryable", help="Rerun selector: retryable, unresumable, timed-out, failed, killed, all, IDs, or ranges")
     rerun_parser.add_argument("--concurrency", type=int, help="Override queue.concurrency")
@@ -143,15 +158,62 @@ def main(argv: list[str] | None = None) -> int:
         help="Allow concurrency > 1 with policy.worktree=single",
     )
 
-    kill_parser = subparsers.add_parser("kill", help="Terminate active processes and mark the operation killed")
+    kill_parser = operation_subparsers.add_parser("kill", help="Terminate active processes and mark the operation killed")
     kill_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     kill_parser.add_argument("--run-id", help="Kill by detached run id")
     kill_parser.add_argument("--force", action="store_true", help="Skip confirmation")
 
-    erase_parser = subparsers.add_parser("erase", help="Terminate and delete a generated operation directory")
+    erase_parser = operation_subparsers.add_parser("erase", help="Terminate and delete a generated operation directory")
     erase_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     erase_parser.add_argument("--run-id", help="Erase by detached run id")
     erase_parser.add_argument("--force", action="store_true", help="Required for non-interactive erase")
+
+    workflow_parser = subparsers.add_parser("workflow", help="Run operation manifests sequentially")
+    workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_command", required=True)
+
+    workflow_validate_parser = workflow_subparsers.add_parser("validate", help="Validate a workflow")
+    workflow_validate_parser.add_argument("workflow", type=Path, help="Workflow path or directory")
+
+    workflow_run_parser = workflow_subparsers.add_parser("run", help="Run workflow steps sequentially")
+    workflow_run_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory; defaults to workflow.yaml")
+    workflow_run_parser.add_argument("--select", help="Workflow step selection: all, pending, uncompleted, IDs, or ranges")
+    workflow_run_parser.add_argument("--dry-run", action="store_true", help="Preview workflow execution without running operations")
+    workflow_run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for foreground runs")
+    workflow_run_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for foreground operation steps")
+    workflow_run_parser.add_argument("--detach", action="store_true", help="Start workflow in the background and return immediately")
+
+    workflow_status_parser = workflow_subparsers.add_parser("status", help="Show workflow status")
+    workflow_status_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory")
+    workflow_status_parser.add_argument("--run-id", help="Show one detached workflow run session")
+    workflow_status_parser.add_argument("--all", action="store_true", help="Include inactive detached workflow sessions")
+
+    workflow_list_parser = workflow_subparsers.add_parser("list", help="List detached workflow run sessions")
+    workflow_list_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory")
+    workflow_list_parser.add_argument("--run-id", help="Show one detached workflow run session")
+    workflow_list_parser.add_argument("--all", action="store_true", help="Include inactive workflow sessions")
+
+    workflow_pause_parser = workflow_subparsers.add_parser("pause", help="Pause the active workflow step")
+    workflow_pause_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory")
+    workflow_pause_parser.add_argument("--run-id", help="Pause by detached run id")
+
+    workflow_resume_parser = workflow_subparsers.add_parser("resume", help="Resume a paused workflow")
+    workflow_resume_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory")
+    workflow_resume_parser.add_argument("--select", help="Workflow step selection")
+    workflow_resume_parser.add_argument("--detach", action="store_true", help="Resume in the background and return immediately")
+    workflow_resume_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for foreground resume")
+    workflow_resume_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for foreground operation steps")
+
+    workflow_rerun_parser = workflow_subparsers.add_parser("rerun", help="Fresh-start retryable workflow steps")
+    workflow_rerun_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory")
+    workflow_rerun_parser.add_argument("--select", default="retryable", help="Workflow step selection: retryable, failed, killed, all, IDs, or ranges")
+    workflow_rerun_parser.add_argument("--detach", action="store_true", help="Rerun in the background and return immediately")
+    workflow_rerun_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for foreground rerun")
+    workflow_rerun_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for foreground operation steps")
+
+    workflow_kill_parser = workflow_subparsers.add_parser("kill", help="Terminate active workflow processes")
+    workflow_kill_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory")
+    workflow_kill_parser.add_argument("--run-id", help="Kill by detached run id")
+    workflow_kill_parser.add_argument("--force", action="store_true", help="Skip confirmation")
 
     skill_parser = subparsers.add_parser("skill", help="Manage the bundled OCMO opencode skill")
     skill_subparsers = skill_parser.add_subparsers(dest="skill_command", required=True)
@@ -161,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     try:
-        if args.command == "run":
+        if args.command == "operation" and args.operation_command == "run":
             manifest_path = infer_manifest_path(args.manifest)
             return run_manifest(
                 RunOptions(
@@ -177,13 +239,13 @@ def main(argv: list[str] | None = None) -> int:
                     args.detach,
                 )
             )
-        if args.command == "validate":
+        if args.command == "operation" and args.operation_command == "validate":
             manifest = load_manifest(args.manifest)
             validate_manifest(manifest, args.manifest)
             warn_shared_worktree_concurrency(manifest)
             print(f"valid: {args.manifest}")
             return 0
-        if args.command == "render":
+        if args.command == "operation" and args.operation_command == "render":
             manifest_path = infer_manifest_path(args.manifest)
             manifest = load_manifest(manifest_path)
             validate_manifest(manifest, manifest_path)
@@ -195,22 +257,24 @@ def main(argv: list[str] | None = None) -> int:
                     previews.append(PromptPreview(str(item["id"]), str(run["id"]), render_prompt(manifest, item, manifest_path, run=run, runs=runs)))
             print_prompt_previews(previews, args.all)
             return 0
-        if args.command == "plan":
+        if args.command == "operation" and args.operation_command == "plan":
             return plan_manifest(args)
-        if args.command == "status":
+        if args.command == "operation" and args.operation_command == "status":
             return status_operation(args)
-        if args.command == "list":
+        if args.command == "operation" and args.operation_command == "list":
             return list_runs(args)
-        if args.command == "pause":
+        if args.command == "operation" and args.operation_command == "pause":
             return pause_operation(args)
-        if args.command == "resume":
+        if args.command == "operation" and args.operation_command == "resume":
             return resume_operation(args)
-        if args.command == "rerun":
+        if args.command == "operation" and args.operation_command == "rerun":
             return rerun_operation(args)
-        if args.command == "kill":
+        if args.command == "operation" and args.operation_command == "kill":
             return kill_operation(args)
-        if args.command == "erase":
+        if args.command == "operation" and args.operation_command == "erase":
             return erase_operation(args)
+        if args.command == "workflow":
+            return workflow_command(args)
         if args.command == "skill":
             return skill_command(args)
     except OcmoError as exc:
@@ -797,6 +861,165 @@ def select_rerun_items(manifest: dict[str, Any], state: dict[str, Any], selector
         if item_state_matches_statuses(item_state, statuses):
             selected.append(item)
     return selected
+
+
+def load_workflow(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise OcmoError(f"workflow not found: {path}")
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise OcmoError(f"invalid workflow yaml: {exc}") from exc
+    if not isinstance(data, dict):
+        raise OcmoError("workflow must be a mapping")
+    return data
+
+
+def validate_workflow(workflow: dict[str, Any], workflow_path: Path) -> None:
+    if workflow.get("schema") != "ocmo-workflow/v1":
+        raise OcmoError("workflow schema must be ocmo-workflow/v1")
+    metadata = require_mapping(workflow, "workflow")
+    require_string(metadata, "id")
+    state = workflow.get("state", {})
+    if state is not None and not isinstance(state, dict):
+        raise OcmoError("state must be a mapping")
+    defaults = workflow.get("defaults", {})
+    if defaults is not None and not isinstance(defaults, dict):
+        raise OcmoError("defaults must be a mapping")
+    validate_workflow_options(defaults or {}, "defaults")
+    steps = workflow.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise OcmoError("steps must be a non-empty list")
+    seen: set[str] = set()
+    for index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            raise OcmoError(f"steps[{index}] must be a mapping")
+        step_id = require_string(step, "id")
+        if step_id in seen:
+            raise OcmoError(f"duplicate workflow step id: {step_id}")
+        seen.add(step_id)
+        require_string(step, "manifest")
+        validate_workflow_options(step, f"steps[{index}]")
+        manifest_path = workflow_step_manifest_path(workflow_path, step)
+        manifest = load_manifest(manifest_path)
+        validate_manifest(manifest, manifest_path, workflow_step_bool(workflow, step, "allowSharedWorktreeConcurrency"))
+
+
+def validate_workflow_options(options: dict[str, Any], field: str) -> None:
+    for key in ("operationSelect",):
+        value = options.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise OcmoError(f"{field}.{key} must be a non-empty string")
+    for key in ("concurrency", "timeoutSeconds"):
+        value = options.get(key)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+            raise OcmoError(f"{field}.{key} must be a positive integer")
+    for key in ("allowSharedWorktreeConcurrency", "stopOnFailure"):
+        value = options.get(key)
+        if value is not None and not isinstance(value, bool):
+            raise OcmoError(f"{field}.{key} must be a boolean")
+
+
+def workflow_step_manifest_path(workflow_path: Path, step: dict[str, Any]) -> Path:
+    value = str(step["manifest"])
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (workflow_path.parent / path).resolve()
+
+
+def workflow_step_value(workflow: dict[str, Any], step: dict[str, Any], key: str, default: Any = None) -> Any:
+    if key in step:
+        return step.get(key)
+    defaults = workflow.get("defaults") if isinstance(workflow.get("defaults"), dict) else {}
+    return defaults.get(key, default)
+
+
+def workflow_step_operation_select(workflow: dict[str, Any], step: dict[str, Any], rerun: bool = False) -> str:
+    if rerun:
+        value = step.get("operationSelect")
+        return value.strip() if isinstance(value, str) and value.strip() else "retryable"
+    value = workflow_step_value(workflow, step, "operationSelect")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return "retryable" if rerun else "uncompleted"
+
+
+def workflow_step_bool(workflow: dict[str, Any], step: dict[str, Any], key: str) -> bool:
+    return bool(workflow_step_value(workflow, step, key, False))
+
+
+def workflow_step_int(workflow: dict[str, Any], step: dict[str, Any], key: str) -> int | None:
+    value = workflow_step_value(workflow, step, key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def workflow_step_stop_on_failure(workflow: dict[str, Any], step: dict[str, Any]) -> bool:
+    return bool(workflow_step_value(workflow, step, "stopOnFailure", True))
+
+
+def select_workflow_steps(workflow: dict[str, Any], state: dict[str, Any], selector: str | None) -> list[dict[str, Any]]:
+    steps = workflow["steps"]
+    selector = (selector or "uncompleted").strip()
+    states = state.get("steps") if isinstance(state.get("steps"), dict) else {}
+    if selector == "all":
+        return steps
+    status_sets = {
+        "pending": {"pending"},
+        "uncompleted": None,
+        "failed": {"failed", "timed_out"},
+        "paused": PAUSED_STATUSES,
+        "killed": {"killed"},
+        "retryable": {"failed", "timed_out", "killed", "paused_unresumable"},
+    }
+    if selector in status_sets:
+        statuses = status_sets[selector]
+        selected = []
+        for step in steps:
+            status = workflow_step_status(step, states)
+            if statuses is None:
+                if status not in DONE_STATUSES:
+                    selected.append(step)
+            elif status in statuses:
+                selected.append(step)
+        return selected
+    requested = expand_workflow_selector(selector, steps)
+    selected = [step for step in steps if str(step.get("id")) in requested]
+    missing = requested - {str(step.get("id")) for step in selected}
+    if missing:
+        raise OcmoError(f"selection did not match workflow step ids: {', '.join(sorted(missing))}")
+    return selected
+
+
+def workflow_step_status(step: dict[str, Any], states: dict[str, Any]) -> str:
+    step_state = states.get(str(step["id"])) if isinstance(states.get(str(step["id"])), dict) else {}
+    return str(step_state.get("status") or step.get("status") or "pending")
+
+
+def expand_workflow_selector(selector: str, steps: list[dict[str, Any]]) -> set[str]:
+    by_index = {str(index): str(step["id"]) for index, step in enumerate(steps, start=1)}
+    result: set[str] = set()
+    for token in [part.strip() for part in selector.split(",") if part.strip()]:
+        match = re.fullmatch(r"(\d+)-(\d+)", token)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2))
+            if end < start:
+                raise OcmoError(f"invalid descending range: {token}")
+            for value in range(start, end + 1):
+                result.add(by_index.get(str(value), str(value)))
+        else:
+            result.add(by_index.get(token, token))
+    return result
+
+
+def print_workflow_dry_run(workflow: dict[str, Any], workflow_path: Path, selected: list[dict[str, Any]], rerun: bool, resume: bool) -> None:
+    action = "resume" if resume else "rerun" if rerun else "run"
+    print(f"workflow: {workflow['workflow']['id']}")
+    print(f"steps: {len(selected)}")
+    for step in selected:
+        manifest_path = workflow_step_manifest_path(workflow_path, step)
+        print(f"- {step['id']}: ocmo operation {action} {quote_arg(str(manifest_path))} --select {quote_arg(workflow_step_operation_select(workflow, step, rerun))}")
 
 
 def item_state_matches_statuses(item_state: dict[str, Any], statuses: set[str]) -> bool:
@@ -1543,6 +1766,7 @@ def run_manifest(options: RunOptions) -> int:
             print("ocmo: interrupted; pausing active runs", file=sys.stderr)
             interrupted_state = state.data()
             mark_active_runs(state.path, "paused")
+            state.finish("paused")
             stop_operation_processes(options.manifest_path, interrupted_state)
             for future in futures:
                 future.cancel()
@@ -1552,7 +1776,9 @@ def run_manifest(options: RunOptions) -> int:
             executor.shutdown(wait=True)
 
     if any(code != 0 for code in results):
+        state.finish("failed")
         return 1
+    state.finish("completed")
     return 0
 
 
@@ -1572,6 +1798,7 @@ def start_detached_run(options: RunOptions, manifest: dict[str, Any], concurrenc
     state = state_path(manifest, options.manifest_path)
     metadata = {
         "schema": "ocmo-detached-run/v1",
+        "kind": "operation",
         "runId": run_id,
         "pid": process.pid,
         "startedAt": utc_now(),
@@ -1595,7 +1822,7 @@ def start_detached_run(options: RunOptions, manifest: dict[str, Any], concurrenc
 
 def detached_child_command(options: RunOptions) -> list[str]:
     subcommand = "resume" if options.resume else "rerun" if options.rerun else "run"
-    command = [sys.executable, "-m", "ocmo", subcommand, str(options.manifest_path.resolve())]
+    command = [sys.executable, "-m", "ocmo", "operation", subcommand, str(options.manifest_path.resolve())]
     if options.select:
         command += ["--select", options.select]
     if options.concurrency is not None:
@@ -1686,7 +1913,7 @@ def list_runs(args: argparse.Namespace) -> int:
     if args.manifest:
         print_manifest_detached_runs(infer_manifest_path(args.manifest), include_inactive=args.all)
         return 0
-    records = detached_records(include_inactive=args.all)
+    records = detached_records(include_inactive=args.all, kind="operation")
     if not records:
         qualifier = "" if args.all else " active"
         print(f"No{qualifier} detached ocmo runs.")
@@ -1786,6 +2013,316 @@ def rerun_operation(args: argparse.Namespace) -> int:
             True,
         )
     )
+
+
+def workflow_command(args: argparse.Namespace) -> int:
+    command = args.workflow_command
+    if command == "validate":
+        workflow_path = infer_workflow_path(args.workflow)
+        workflow = load_workflow(workflow_path)
+        validate_workflow(workflow, workflow_path)
+        print(f"valid: {workflow_path}")
+        return 0
+    if command == "run":
+        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, args.dry_run, args.yes, args.ui, args.detach))
+    if command == "status":
+        return status_workflow(args)
+    if command == "list":
+        return list_workflow_runs(args)
+    if command == "pause":
+        return pause_workflow(args)
+    if command == "resume":
+        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, False, args.yes, args.ui, args.detach, True))
+    if command == "rerun":
+        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, False, args.yes, args.ui, args.detach, False, True))
+    if command == "kill":
+        return kill_workflow(args)
+    return 1  # pragma: no cover
+
+
+def run_workflow(options: WorkflowOptions) -> int:
+    workflow = load_workflow(options.workflow_path)
+    validate_workflow(workflow, options.workflow_path)
+    state_path_value = workflow_state_path(workflow, options.workflow_path)
+    existing_state = read_json_file(state_path_value) if state_path_value.exists() else {}
+    selected = select_workflow_steps(workflow, existing_state, options.select or ("retryable" if options.rerun else "uncompleted"))
+    if not selected:
+        print("No workflow steps selected.")
+        return 0
+    if options.detach:
+        if options.dry_run:
+            raise OcmoError("--detach cannot be used with --dry-run")
+        return start_detached_workflow(options, workflow)
+    if options.dry_run:
+        print_workflow_dry_run(workflow, options.workflow_path, selected, options.rerun, options.resume)
+        return 0
+    if not options.yes:
+        print(f"About to run {len(selected)} workflow step(s) sequentially.")
+        answer = input("Continue? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Cancelled.")
+            return 1
+    state = WorkflowStateStore(state_path_value)
+    state.ensure_workflow(workflow)
+    for step in selected:
+        state.prepare_step(workflow, options.workflow_path, step, options.rerun)
+    results: list[int] = []
+    try:
+        for step in selected:
+            code = run_workflow_step(workflow, options.workflow_path, step, state, options)
+            results.append(code)
+            if code != 0 and workflow_step_stop_on_failure(workflow, step):
+                state.finish("failed")
+                return 1
+    except KeyboardInterrupt:
+        print("ocmo: interrupted; pausing active workflow step", file=sys.stderr)
+        pause_workflow_path(options.workflow_path)
+        return 130
+    state.finish("completed" if all(code == 0 for code in results) else "failed")
+    return 0 if all(code == 0 for code in results) else 1
+
+
+def run_workflow_step(workflow: dict[str, Any], workflow_path: Path, step: dict[str, Any], state: "WorkflowStateStore", options: WorkflowOptions) -> int:
+    step_id = str(step["id"])
+    manifest_path = workflow_step_manifest_path(workflow_path, step)
+    manifest = load_manifest(manifest_path)
+    operation_state_path = state_path(manifest, manifest_path)
+    operation_id = str(manifest["operation"]["id"])
+    operation_select = workflow_step_operation_select(workflow, step, options.rerun)
+    state.mark_step(
+        step_id,
+        "running",
+        {
+            "manifestPath": str(manifest_path.resolve()),
+            "statePath": str(operation_state_path),
+            "operationId": operation_id,
+            "operationSelect": operation_select,
+            "startedAt": utc_now(),
+        },
+    )
+    resume_step = options.resume and operation_has_paused_work(manifest, manifest_path)
+    run_options = RunOptions(
+        manifest_path,
+        operation_select,
+        workflow_step_int(workflow, step, "concurrency"),
+        workflow_step_int(workflow, step, "timeoutSeconds"),
+        False,
+        True,
+        options.ui,
+        workflow_step_bool(workflow, step, "allowSharedWorktreeConcurrency"),
+        False,
+        False,
+        resume_step,
+        options.rerun,
+    )
+    code = run_manifest(run_options)
+    status = "completed" if code == 0 else workflow_failed_step_status(operation_state_path)
+    patch: dict[str, Any] = {"completedAt": utc_now(), "exitCode": code}
+    if code != 0:
+        patch["error"] = f"operation exited with code {code}"
+    state.mark_step(step_id, status, patch)
+    return code
+
+
+def workflow_failed_step_status(operation_state_path: Path) -> str:
+    if operation_state_path.exists():
+        state = read_json_file(operation_state_path)
+        items = state.get("items") if isinstance(state.get("items"), dict) else {}
+        statuses = [item.get("status") for item in items.values() if isinstance(item, dict)]
+        if any(status in PAUSED_STATUSES for status in statuses):
+            return "paused" if any(status == "paused" for status in statuses) else "paused_unresumable"
+        if any(status == "killed" for status in statuses):
+            return "killed"
+        if any(status == "timed_out" for status in statuses):
+            return "timed_out"
+    return "failed"
+
+
+def operation_has_paused_work(manifest: dict[str, Any], manifest_path: Path) -> bool:
+    path = state_path(manifest, manifest_path)
+    if not path.exists():
+        return False
+    state = read_json_file(path)
+    return bool(select_paused_items(manifest, state))
+
+
+def start_detached_workflow(options: WorkflowOptions, workflow: dict[str, Any]) -> int:
+    run_id = detached_workflow_run_id()
+    local_dir = workflow_detached_runs_dir(options.workflow_path)
+    local_dir.mkdir(parents=True, exist_ok=True)
+    log_path = local_dir / f"{run_id}.log"
+    command = detached_workflow_child_command(options)
+    log = log_path.open("w", encoding="utf-8")
+    try:
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, close_fds=True)
+    except OSError as exc:
+        log.close()
+        raise OcmoError(f"could not start detached workflow: {exc}") from exc
+    log.close()
+    metadata = {
+        "schema": "ocmo-detached-run/v1",
+        "kind": "workflow",
+        "runId": run_id,
+        "pid": process.pid,
+        "startedAt": utc_now(),
+        "workflowPath": str(options.workflow_path.resolve()),
+        "statePath": str(workflow_state_path(workflow, options.workflow_path)),
+        "logPath": str(log_path.resolve()),
+        "command": command,
+        "select": options.select,
+    }
+    write_detached_metadata(local_dir / f"{run_id}.json", metadata)
+    write_detached_metadata(global_detached_run_path(run_id), metadata)
+    print(f"detached: {run_id}")
+    print(f"pid: {process.pid}")
+    print(f"log: {relative_to_workflow(log_path, options.workflow_path)}")
+    print(f"status: ocmo workflow status --run-id {run_id}")
+    return 0
+
+
+def detached_workflow_child_command(options: WorkflowOptions) -> list[str]:
+    subcommand = "resume" if options.resume else "rerun" if options.rerun else "run"
+    command = [sys.executable, "-m", "ocmo", "workflow", subcommand, str(options.workflow_path.resolve())]
+    if options.select:
+        command += ["--select", options.select]
+    command += ["--ui", "plain", "--yes"]
+    return command
+
+
+def detached_workflow_run_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"ocmo-workflow-{stamp}-{uuid.uuid4().hex[:6]}"
+
+
+def status_workflow(args: argparse.Namespace) -> int:
+    record = None
+    if args.run_id:
+        path = find_detached_record(args.run_id)
+        if path is None:
+            raise OcmoError(f"detached run not found: {args.run_id}")
+        record = read_json_file(path)
+        if record.get("kind") != "workflow":
+            raise OcmoError(f"detached run is not a workflow: {args.run_id}")
+        workflow_value = record.get("workflowPath")
+        if not isinstance(workflow_value, str):
+            print_detached_record(record, details=True)
+            return 0
+        workflow_path = Path(workflow_value)
+    else:
+        workflow_path = infer_workflow_path(args.workflow)
+    print_workflow_status(workflow_path, args.all, record)
+    return 0
+
+
+def list_workflow_runs(args: argparse.Namespace) -> int:
+    if args.run_id:
+        path = find_detached_record(args.run_id)
+        if path is None:
+            raise OcmoError(f"detached run not found: {args.run_id}")
+        record = read_json_file(path)
+        if record.get("kind") != "workflow":
+            raise OcmoError(f"detached run is not a workflow: {args.run_id}")
+        print_detached_record(record, details=True)
+        return 0
+    if args.workflow:
+        print_workflow_detached_runs(infer_workflow_path(args.workflow), include_inactive=args.all)
+        return 0
+    records = detached_records(include_inactive=args.all, kind="workflow")
+    if not records:
+        qualifier = "" if args.all else " active"
+        print(f"No{qualifier} detached ocmo workflow runs.")
+        return 0
+    for record in records:
+        print_detached_record(record, details=False)
+    return 0
+
+
+def pause_workflow(args: argparse.Namespace) -> int:
+    workflow_path, record = control_workflow_and_record(args)
+    changed = pause_workflow_path(workflow_path, record)
+    workflow = load_workflow(workflow_path)
+    print(f"paused: {workflow['workflow']['id']} ({changed} step(s))")
+    return 0
+
+
+def kill_workflow(args: argparse.Namespace) -> int:
+    workflow_path, record = control_workflow_and_record(args)
+    workflow = load_workflow(workflow_path)
+    if not args.force and sys.stdin.isatty():
+        answer = input(f"Kill workflow {workflow['workflow']['id']}? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Cancelled.")
+            return 1
+    changed = mark_active_workflow_steps(workflow_path, "killed")
+    stop_workflow_processes(workflow_path, record, "killed")
+    print(f"killed: {workflow['workflow']['id']} ({changed} step(s))")
+    return 0
+
+
+def pause_workflow_path(workflow_path: Path, record: dict[str, Any] | None = None) -> int:
+    changed = mark_active_workflow_steps(workflow_path, "paused")
+    stop_workflow_processes(workflow_path, record, "paused")
+    return changed
+
+
+def control_workflow_and_record(args: argparse.Namespace) -> tuple[Path, dict[str, Any] | None]:
+    if getattr(args, "run_id", None):
+        path = find_detached_record(args.run_id)
+        if path is None:
+            raise OcmoError(f"detached run not found: {args.run_id}")
+        record = read_json_file(path)
+        if record.get("kind") != "workflow":
+            raise OcmoError(f"detached run is not a workflow: {args.run_id}")
+        workflow_value = record.get("workflowPath")
+        if not isinstance(workflow_value, str):
+            raise OcmoError(f"detached workflow is missing workflowPath: {args.run_id}")
+        return Path(workflow_value), record
+    return infer_workflow_path(args.workflow), None
+
+
+def stop_workflow_processes(workflow_path: Path, selected_record: dict[str, Any] | None = None, operation_status: str = "paused") -> None:
+    if selected_record and isinstance(selected_record.get("pid"), int):
+        terminate_process_tree(selected_record["pid"], force=True)
+    for record in related_workflow_detached_records(workflow_path, include_inactive=True):
+        pid = record.get("pid")
+        if isinstance(pid, int):
+            terminate_process_tree(pid, force=True)
+    workflow = load_workflow(workflow_path)
+    state_file = workflow_state_path(workflow, workflow_path)
+    state = read_json_file(state_file) if state_file.exists() else {}
+    steps = state.get("steps") if isinstance(state.get("steps"), dict) else {}
+    for step_state in steps.values():
+        if not isinstance(step_state, dict) or step_state.get("status") not in {"running", "paused", "killed"}:
+            continue
+        manifest_value = step_state.get("manifestPath")
+        if isinstance(manifest_value, str):
+            manifest_path = Path(manifest_value)
+            manifest = load_manifest(manifest_path)
+            operation_state = read_json_file(state_path(manifest, manifest_path)) if state_path(manifest, manifest_path).exists() else {}
+            mark_active_runs(state_path(manifest, manifest_path), operation_status)
+            stop_operation_processes(manifest_path, operation_state)
+
+
+def mark_active_workflow_steps(workflow_path: Path, status: str) -> int:
+    workflow = load_workflow(workflow_path)
+    path = workflow_state_path(workflow, workflow_path)
+    if not path.exists():
+        return 0
+    data = read_json_file(path)
+    steps = data.get("steps") if isinstance(data.get("steps"), dict) else {}
+    changed = 0
+    now = utc_now()
+    for step in steps.values():
+        if isinstance(step, dict) and step.get("status") == "running":
+            step["status"] = status
+            step[f"{status}At"] = now
+            changed += 1
+    data.setdefault("control", {}).update({"status": status, "updatedAt": now})
+    data["status"] = status
+    data.pop("completedAt", None)
+    data["updatedAt"] = now
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return changed
 
 
 def control_manifest_and_record(args: argparse.Namespace) -> tuple[Path, dict[str, Any] | None]:
@@ -1934,12 +2471,15 @@ def find_detached_record(run_id: str) -> Path | None:
     return None
 
 
-def detached_records(include_inactive: bool) -> list[dict[str, Any]]:
+def detached_records(include_inactive: bool, kind: str | None = None) -> list[dict[str, Any]]:
     records = []
     for path in sorted(global_detached_runs_dir().glob("*.json")):
         try:
             record = read_json_file(path)
         except (OSError, json.JSONDecodeError):
+            continue
+        record_kind = record.get("kind", "operation")
+        if kind is not None and record_kind != kind:
             continue
         if include_inactive or process_is_alive(record.get("pid")):
             records.append(record)
@@ -1990,6 +2530,114 @@ def print_operation_status(manifest_path: Path, include_inactive: bool, selected
     if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
         print("warning: detached run is inactive but state contains running items; run may be stale")
     print_status_table(rows)
+
+
+def print_workflow_status(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> None:
+    workflow = load_workflow(workflow_path)
+    validate_workflow(workflow, workflow_path)
+    path = workflow_state_path(workflow, workflow_path)
+    state = read_json_file(path) if path.exists() else {}
+    related = [selected_record] if selected_record else related_workflow_detached_records(workflow_path, include_inactive)
+    workflow_id = workflow["workflow"]["id"]
+    print(f"OCMO Workflow: {workflow_id}")
+    print(f"workflow: {workflow_path}")
+    print(f"state: {path}")
+    for record in related:
+        if record:
+            print_detached_record(record, details=False, prefix="detached: ")
+    rows = workflow_status_rows(workflow, workflow_path, state)
+    counts = operation_status_counts(rows)
+    updated = state.get("updatedAt") or "-"
+    print(
+        f"steps={len(rows)} running={counts['running']} completed={counts['completed']} "
+        f"failed={counts['failed']} pending={counts['pending']} paused={counts['paused']} "
+        f"killed={counts['killed']} {format_usage_summary(workflow_usage(workflow, workflow_path))} updated={updated}"
+    )
+    if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
+        print("warning: detached workflow is inactive but state contains running steps; run may be stale")
+    print_workflow_status_table(rows)
+
+
+def workflow_status_rows(workflow: dict[str, Any], workflow_path: Path, state: dict[str, Any]) -> list[dict[str, str]]:
+    step_states = state.get("steps") if isinstance(state.get("steps"), dict) else {}
+    rows = []
+    for step in workflow.get("steps", []):
+        step_id = str(step["id"])
+        step_state = step_states.get(step_id) if isinstance(step_states.get(step_id), dict) else {}
+        manifest_path = workflow_step_manifest_path(workflow_path, step)
+        operation = "-"
+        item_progress = "-"
+        tokens = "-"
+        detail = str(step.get("description") or "-")
+        if manifest_path.exists():
+            manifest = load_manifest(manifest_path)
+            operation = str(manifest["operation"]["id"])
+            op_state_path = state_path(manifest, manifest_path)
+            op_state = read_json_file(op_state_path) if op_state_path.exists() else {}
+            op_rows = operation_status_rows(manifest, op_state)
+            if op_rows:
+                completed = operation_status_counts(op_rows)["completed"]
+                item_progress = f"{completed}/{len(op_rows)}"
+            tokens = format_usage_cell(state_usage(op_state))
+        status = str(step_state.get("status") or step.get("status") or "pending")
+        if step_state.get("error"):
+            detail = str(step_state["error"])
+        rows.append({"item": step_id, "status": status, "step": operation, "progress": item_progress, "runtime": persisted_item_runtime(step_state, datetime.now(timezone.utc)), "tokens": tokens, "detail": detail})
+    return rows
+
+
+def print_workflow_status_table(rows: list[dict[str, str]]) -> None:
+    headers = ["Step", "Status", "Operation", "Items", "Runtime", "Tokens", "Detail"]
+    keys = ["item", "status", "step", "progress", "runtime", "tokens", "detail"]
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, key in enumerate(keys):
+            widths[index] = max(widths[index], len(row[key]))
+    print("  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print("  ".join(row[key].ljust(widths[index]) for index, key in enumerate(keys)))
+
+
+def workflow_usage(workflow: dict[str, Any], workflow_path: Path) -> dict[str, Any]:
+    total: dict[str, Any] = {}
+    for step in workflow.get("steps", []):
+        manifest_path = workflow_step_manifest_path(workflow_path, step)
+        if not manifest_path.exists():
+            continue
+        manifest = load_manifest(manifest_path)
+        path = state_path(manifest, manifest_path)
+        if path.exists():
+            total = add_usage(total, state_usage(read_json_file(path)))
+    return total
+
+
+def print_workflow_detached_runs(workflow_path: Path, include_inactive: bool) -> None:
+    workflow = load_workflow(workflow_path)
+    path = workflow_state_path(workflow, workflow_path)
+    state = read_json_file(path) if path.exists() else {}
+    print(f"workflow: {workflow_path}")
+    print(f"state: {path}")
+    print_workflow_state_summary(state)
+    related = related_workflow_detached_records(workflow_path, include_inactive)
+    if related:
+        print("detached runs:")
+        for record in related:
+            print_detached_record(record, details=False, prefix="  ")
+
+
+def related_workflow_detached_records(workflow_path: Path, include_inactive: bool) -> list[dict[str, Any]]:
+    related = []
+    for record_path in sorted(workflow_detached_runs_dir(workflow_path).glob("*.json")):
+        try:
+            record = read_json_file(record_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if record.get("kind") != "workflow":
+            continue
+        if include_inactive or process_is_alive(record.get("pid")):
+            related.append(record)
+    return related
 
 
 def related_detached_records(manifest_path: Path, include_inactive: bool) -> list[dict[str, Any]]:
@@ -2122,15 +2770,22 @@ def print_status_table(rows: list[dict[str, str]]) -> None:
 def print_detached_record(record: dict[str, Any], details: bool, prefix: str = "") -> None:
     pid = record.get("pid")
     status = "active" if process_is_alive(pid) else "inactive"
-    print(f"{prefix}{record.get('runId', '<unknown>')} {status} pid={pid} started={record.get('startedAt', '-')}")
+    kind = record.get("kind", "operation")
+    print(f"{prefix}{record.get('runId', '<unknown>')} {status} kind={kind} pid={pid} started={record.get('startedAt', '-')}")
     if not details:
         return
-    print(f"manifest: {record.get('manifestPath', '-')}")
+    if kind == "workflow":
+        print(f"workflow: {record.get('workflowPath', '-')}")
+    else:
+        print(f"manifest: {record.get('manifestPath', '-')}")
     print(f"state: {record.get('statePath', '-')}")
     print(f"log: {record.get('logPath', '-')}")
     path = record.get("statePath")
     if isinstance(path, str) and Path(path).exists():
-        print_state_summary(read_json_file(Path(path)))
+        if kind == "workflow":
+            print_workflow_state_summary(read_json_file(Path(path)))
+        else:
+            print_state_summary(read_json_file(Path(path)))
 
 
 def print_state_summary(state: dict[str, Any]) -> None:
@@ -2147,6 +2802,21 @@ def print_state_summary(state: dict[str, Any]) -> None:
     if updated:
         print(f"updated: {updated}")
     print(format_usage_summary(state_usage(state)))
+
+
+def print_workflow_state_summary(state: dict[str, Any]) -> None:
+    steps = state.get("steps") if isinstance(state.get("steps"), dict) else {}
+    if not steps:
+        print("steps: none")
+        return
+    counts: dict[str, int] = {}
+    for step in steps.values():
+        status = str(step.get("status", "unknown")) if isinstance(step, dict) else "unknown"
+        counts[status] = counts.get(status, 0) + 1
+    print("steps: " + ", ".join(f"{status}={counts[status]}" for status in sorted(counts)))
+    updated = state.get("updatedAt")
+    if updated:
+        print(f"updated: {updated}")
 
 
 def run_item(
@@ -2484,6 +3154,44 @@ def state_path(manifest: dict[str, Any], manifest_path: Path) -> Path:
     return (manifest_path.parent / ".ocmo" / "state" / f"{operation_id}.json").resolve()
 
 
+def infer_workflow_path(value: Path | None) -> Path:
+    if value is None:
+        default_path = Path.cwd() / "workflow.yaml"
+        if default_path.exists():
+            return default_path
+        generated = sorted((Path.cwd() / ".ocmo").glob("*/workflow.yaml"))
+        if len(generated) == 1:
+            return generated[0]
+        if len(generated) > 1:
+            raise OcmoError("multiple workflows found under .ocmo/*/workflow.yaml; pass one explicitly")
+        raise OcmoError("workflow not found: workflow.yaml, and no generated workflows found under .ocmo/*/workflow.yaml")
+    if value.is_dir():
+        return value / "workflow.yaml"
+    return value
+
+
+def workflow_state_path(workflow: dict[str, Any], workflow_path: Path) -> Path:
+    configured = workflow.get("state", {}).get("path") if isinstance(workflow.get("state"), dict) else None
+    if configured:
+        path = Path(str(configured))
+        if path.is_absolute():
+            return path
+        return (workflow_path.parent / path).resolve()
+    workflow_id = workflow["workflow"]["id"]
+    return (workflow_path.parent / ".ocmo" / "state" / f"{workflow_id}.json").resolve()
+
+
+def workflow_detached_runs_dir(workflow_path: Path) -> Path:
+    return workflow_path.parent / ".ocmo" / "runs"
+
+
+def relative_to_workflow(path: Path, workflow_path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(workflow_path.parent.resolve()))
+    except ValueError:
+        return str(path)
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -2561,6 +3269,16 @@ class StateStore:
             data["updatedAt"] = utc_now()
             self._write(data)
 
+    def finish(self, status: str) -> None:
+        with self.lock:
+            data = self._read()
+            now = utc_now()
+            if status == "completed":
+                data["completedAt"] = now
+            data.setdefault("control", {}).update({"status": status, "updatedAt": now})
+            data["updatedAt"] = now
+            self._write(data)
+
     def data(self) -> dict[str, Any]:
         with self.lock:
             return self._read()
@@ -2582,6 +3300,97 @@ class StateStore:
     def _write(self, data: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+class WorkflowStateStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+
+    def ensure_workflow(self, workflow: dict[str, Any]) -> None:
+        with self.lock:
+            data = self._read()
+            now = utc_now()
+            data.setdefault("schema", "ocmo-workflow-state/v1")
+            data.setdefault("workflowId", workflow["workflow"]["id"])
+            data.setdefault("startedAt", now)
+            data.setdefault("steps", {})
+            data["status"] = "running"
+            data.pop("completedAt", None)
+            data["control"] = {"status": "running", "updatedAt": now}
+            data["updatedAt"] = now
+            self._write(data)
+
+    def mark_step(self, step_id: str, status: str, patch: dict[str, Any]) -> None:
+        with self.lock:
+            data = self._read()
+            data.setdefault("steps", {})
+            step_state = data["steps"].setdefault(step_id, {})
+            if status in {"pending", "running", "completed"}:
+                for key in ("completedAt", "exitCode", "error", "pausedAt", "killedAt"):
+                    step_state.pop(key, None)
+            if status == "pending":
+                step_state.pop("startedAt", None)
+            step_state.update(patch)
+            step_state["status"] = status
+            data["updatedAt"] = utc_now()
+            self._write(data)
+
+    def prepare_step(self, workflow: dict[str, Any], workflow_path: Path, step: dict[str, Any], rerun: bool) -> None:
+        manifest_path = workflow_step_manifest_path(workflow_path, step)
+        manifest = load_manifest(manifest_path)
+        self.mark_step(
+            str(step["id"]),
+            "pending",
+            {
+                "manifestPath": str(manifest_path.resolve()),
+                "statePath": str(state_path(manifest, manifest_path)),
+                "operationId": str(manifest["operation"]["id"]),
+                "operationSelect": workflow_step_operation_select(workflow, step, rerun),
+            },
+        )
+
+    def finish(self, status: str) -> None:
+        with self.lock:
+            data = self._read()
+            now = utc_now()
+            if status == "completed":
+                status = workflow_overall_status(data)
+            data["status"] = status
+            if status in TERMINAL_STATUSES or status in DONE_STATUSES or status == "completed":
+                data["completedAt"] = now
+            else:
+                data.pop("completedAt", None)
+            data.setdefault("control", {}).update({"status": status, "updatedAt": now})
+            data["updatedAt"] = now
+            self._write(data)
+
+    def _read(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {}
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def _write(self, data: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def workflow_overall_status(state: dict[str, Any]) -> str:
+    steps = state.get("steps") if isinstance(state.get("steps"), dict) else {}
+    statuses = [step.get("status") for step in steps.values() if isinstance(step, dict)]
+    if not statuses:
+        return "pending"
+    if any(status == "running" for status in statuses):
+        return "running"
+    if any(status in PAUSED_STATUSES for status in statuses):
+        return "paused"
+    if any(status == "killed" for status in statuses):
+        return "killed"
+    if any(status in {"failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"} for status in statuses):
+        return "failed"
+    if any(status in {None, "pending"} for status in statuses):
+        return "pending"
+    return "completed"
 
 
 def command_without_prompt(command: list[str]) -> list[str]:

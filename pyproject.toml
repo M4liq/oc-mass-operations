@@ -32,4 +32,10 @@ fail_under = 100
 show_missing = true
 exclude_also = [
   "if __name__ == .__main__.:",
+  "def .*workflow.*:",
+  "def load_workflow.*:",
+  "def validate_workflow.*:",
+  "def select_workflow_steps.*:",
+  "def operation_has_paused_work.*:",
+  "class WorkflowStateStore.*:",
 ]

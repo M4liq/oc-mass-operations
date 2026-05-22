@@ -556,6 +556,8 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("one", calls[0][-1])
         self.assertIn("two", calls[1][-1])
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["control"]["status"], "completed")
+        self.assertIn("completedAt", state)
         self.assertEqual(state["items"]["1"]["status"], "completed")
         self.assertEqual(state["items"]["1"]["runs"]["one"]["status"], "completed")
         self.assertEqual(state["items"]["1"]["runs"]["two"]["status"], "completed")
@@ -695,6 +697,7 @@ class RunManifestTests(OcmoTestCase):
 
         self.assertEqual(code, 1)
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["control"]["status"], "failed")
         self.assertEqual(state["items"]["1"]["status"], "failed")
         self.assertEqual(state["items"]["1"]["runs"]["one"]["status"], "failed")
         self.assertNotIn("two", state["items"]["1"].get("runs", {}))
@@ -730,6 +733,7 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("pausing active runs", stderr.getvalue())
         terminate.assert_called_once_with(222, force=True)
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["control"]["status"], "paused")
         self.assertEqual(state["items"]["1"]["status"], "paused")
         self.assertEqual(state["items"]["1"]["runs"]["default"]["status"], "paused")
 
@@ -835,9 +839,9 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=True), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["list"]), 0)
-            self.assertEqual(cli.main(["status", "--run-id", "ocmo-active"]), 0)
-            self.assertEqual(cli.main(["status", str(self.manifest_path)]), 0)
+            self.assertEqual(cli.main(["operation", "list"]), 0)
+            self.assertEqual(cli.main(["operation", "status", "--run-id", "ocmo-active"]), 0)
+            self.assertEqual(cli.main(["operation", "status", str(self.manifest_path)]), 0)
 
         output = stdout.getvalue()
         self.assertIn("ocmo-active active", output)
@@ -872,8 +876,8 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=True), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["status", str(self.manifest_path)]), 0)
-            self.assertEqual(cli.main(["list", "--run-id", "usage"]), 0)
+            self.assertEqual(cli.main(["operation", "status", str(self.manifest_path)]), 0)
+            self.assertEqual(cli.main(["operation", "list", "--run-id", "usage"]), 0)
 
         output = stdout.getvalue()
         self.assertIn("tokens=1.5k in=400 out=100 cache=1.0k", output)
@@ -886,19 +890,19 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["list"]), 0)
-            self.assertEqual(cli.main(["list", "--all"]), 0)
+            self.assertEqual(cli.main(["operation", "list"]), 0)
+            self.assertEqual(cli.main(["operation", "list", "--all"]), 0)
         self.assertIn("No active detached ocmo runs.", stdout.getvalue())
         self.assertIn("inactive inactive", stdout.getvalue())
 
         stderr = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stderr(stderr):
-            self.assertEqual(cli.main(["status", "--run-id", "missing"]), 2)
+            self.assertEqual(cli.main(["operation", "status", "--run-id", "missing"]), 2)
         self.assertIn("detached run not found", stderr.getvalue())
 
         stderr = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stderr(stderr):
-            self.assertEqual(cli.main(["list", "--run-id", "missing"]), 2)
+            self.assertEqual(cli.main(["operation", "list", "--run-id", "missing"]), 2)
         self.assertIn("detached run not found", stderr.getvalue())
 
     def test_detached_helper_edge_cases(self) -> None:
@@ -1008,7 +1012,7 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["status", str(self.manifest_path)]), 0)
+            self.assertEqual(cli.main(["operation", "status", str(self.manifest_path)]), 0)
 
         output = stdout.getvalue()
         self.assertIn("OC Mass Operations: test-op", output)
@@ -1092,8 +1096,8 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", side_effect=lambda pid: pid == 123), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["list", "--run-id", "details"]), 0)
-            self.assertEqual(cli.main(["list", str(self.manifest_path)]), 0)
+            self.assertEqual(cli.main(["operation", "list", "--run-id", "details"]), 0)
+            self.assertEqual(cli.main(["operation", "list", str(self.manifest_path)]), 0)
             cli.print_operation_status(self.manifest_path, include_inactive=False)
 
         output = stdout.getvalue()
@@ -1105,7 +1109,7 @@ class RunManifestTests(OcmoTestCase):
         fallback.write_text(json.dumps({"runId": "fallback", "pid": 0, "startedAt": "then"}), encoding="utf-8")
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["status", "--run-id", "fallback"]), 0)
+            self.assertEqual(cli.main(["operation", "status", "--run-id", "fallback"]), 0)
         self.assertIn("fallback inactive", stdout.getvalue())
 
         stdout = io.StringIO()
@@ -1155,7 +1159,7 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.terminate_process_tree", side_effect=lambda pid, force=True: stopped.append(pid)), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["pause", str(self.manifest_path)]), 0)
+            self.assertEqual(cli.main(["operation", "pause", str(self.manifest_path)]), 0)
 
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(data["items"]["1"]["status"], "paused")
@@ -1167,7 +1171,7 @@ class RunManifestTests(OcmoTestCase):
         data["items"]["1"]["runs"]["default"]["status"] = "running"
         (self.root / "state.json").write_text(json.dumps(data), encoding="utf-8")
         with mock.patch("ocmo.cli.terminate_process_tree"), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["kill", str(self.manifest_path), "--force"]), 0)
+            self.assertEqual(cli.main(["operation", "kill", str(self.manifest_path), "--force"]), 0)
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(data["items"]["1"]["status"], "killed")
 
@@ -1188,7 +1192,7 @@ class RunManifestTests(OcmoTestCase):
             return FakePopen(command, 0, '{"sessionID":"ses-123"}\n')
 
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 0)
+            self.assertEqual(cli.main(["operation", "resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 0)
         self.assertIn("--session", commands[0])
         self.assertIn("ses-123", commands[0])
         self.assertNotIn("--continue", commands[0])
@@ -1197,7 +1201,7 @@ class RunManifestTests(OcmoTestCase):
         state["items"]["1"]["runs"]["default"] = {"status": "paused_unresumable"}
         (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 1)
+            self.assertEqual(cli.main(["operation", "resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 1)
 
     def test_rerun_unresumable_starts_fresh_and_clears_stale_run_state(self) -> None:
         manifest = self.load()
@@ -1230,7 +1234,7 @@ class RunManifestTests(OcmoTestCase):
             return FakePopen(command, 0, "fresh output\n")
 
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["rerun", str(self.manifest_path), "--select", "unresumable", "--yes", "--ui", "plain"]), 0)
+            self.assertEqual(cli.main(["operation", "rerun", str(self.manifest_path), "--select", "unresumable", "--yes", "--ui", "plain"]), 0)
 
         self.assertEqual(len(commands), 1)
         self.assertNotIn("--session", commands[0])
@@ -1291,7 +1295,7 @@ class RunManifestTests(OcmoTestCase):
             return FakeProcess()
 
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.detached_run_id", return_value="ocmo-rerun"), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["rerun", str(self.manifest_path), "--select", "timed-out", "--detach", "--yes"]), 0)
+            self.assertEqual(cli.main(["operation", "rerun", str(self.manifest_path), "--select", "timed-out", "--detach", "--yes"]), 0)
 
         self.assertIn("rerun", captured["command"])
         self.assertNotIn("resume", captured["command"])
@@ -1302,7 +1306,7 @@ class RunManifestTests(OcmoTestCase):
         self.write_manifest()
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            self.assertEqual(cli.main(["erase", str(self.manifest_path), "--force"]), 2)
+            self.assertEqual(cli.main(["operation", "erase", str(self.manifest_path), "--force"]), 2)
         self.assertIn("generated .ocmo", stderr.getvalue())
 
         generated_dir = self.root / ".ocmo" / "generated"
@@ -1312,7 +1316,7 @@ class RunManifestTests(OcmoTestCase):
         (generated_dir / "extra.txt").write_text("x", encoding="utf-8")
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["erase", str(generated_manifest), "--force"]), 0)
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force"]), 0)
         self.assertFalse(generated_dir.exists())
         self.assertIn("erased:", stdout.getvalue())
 
@@ -1323,11 +1327,11 @@ class RunManifestTests(OcmoTestCase):
         (registry / "bad.json").write_text(json.dumps({"runId": "bad", "pid": 1}), encoding="utf-8")
         stderr = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stderr(stderr):
-            self.assertEqual(cli.main(["pause", "--run-id", "bad"]), 2)
+            self.assertEqual(cli.main(["operation", "pause", "--run-id", "bad"]), 2)
         self.assertIn("missing manifestPath", stderr.getvalue())
         stderr = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stderr(stderr):
-            self.assertEqual(cli.main(["pause", "--run-id", "missing"]), 2)
+            self.assertEqual(cli.main(["operation", "pause", "--run-id", "missing"]), 2)
         self.assertIn("detached run not found", stderr.getvalue())
 
         state_path = self.root / "state.json"
@@ -1355,16 +1359,16 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["kill", str(self.manifest_path)]), 1)
+            self.assertEqual(cli.main(["operation", "kill", str(self.manifest_path)]), 1)
         self.assertIn("Cancelled.", stdout.getvalue())
         with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="yes"), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["kill", str(self.manifest_path)]), 0)
+            self.assertEqual(cli.main(["operation", "kill", str(self.manifest_path)]), 0)
 
         record = {"runId": "good", "pid": 333, "manifestPath": str(self.manifest_path), "statePath": str(self.root / "state.json")}
         (registry / "good.json").write_text(json.dumps(record), encoding="utf-8")
         stopped: list[int] = []
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.terminate_process_tree", side_effect=lambda pid, force=True: stopped.append(pid)), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["pause", "--run-id", "good"]), 0)
+            self.assertEqual(cli.main(["operation", "pause", "--run-id", "good"]), 0)
         self.assertIn(333, stopped)
         local_related = cli.local_detached_record_path(self.manifest_path, "related")
         local_related.parent.mkdir(parents=True, exist_ok=True)
@@ -1381,11 +1385,11 @@ class RunManifestTests(OcmoTestCase):
         generated_manifest.write_text(self.manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
         stderr = io.StringIO()
         with mock.patch("sys.stdin.isatty", return_value=False), contextlib.redirect_stderr(stderr):
-            self.assertEqual(cli.main(["erase", str(generated_manifest)]), 2)
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 2)
         self.assertIn("requires --force", stderr.getvalue())
         stdout = io.StringIO()
         with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["erase", str(generated_manifest)]), 1)
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 1)
         self.assertTrue(generated_dir.exists())
         self.assertIn("Cancelled.", stdout.getvalue())
         local_run = cli.local_detached_record_path(generated_manifest, "good")
@@ -1398,7 +1402,7 @@ class RunManifestTests(OcmoTestCase):
         with mock.patch("ocmo.cli.related_detached_records", return_value=[{"runId": 123}]):
             cli.remove_detached_records(generated_manifest)
         with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="yes"), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["erase", str(generated_manifest)]), 0)
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 0)
         self.assertFalse(generated_dir.exists())
 
         self.assertEqual(cli.select_paused_items({"items": ["bad", {"id": "1"}, {"id": "2"}]}, {"items": {"1": "bad", "2": {"runs": {"default": {"status": "completed"}}}}}), [])
@@ -1458,7 +1462,7 @@ class RunManifestTests(OcmoTestCase):
             return FakePopen(command, 0, '{"sessionID":"ses-two"}\n')
 
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 0)
+            self.assertEqual(cli.main(["operation", "resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 0)
         self.assertEqual(len(commands), 2)
         self.assertIn("--session", commands[0])
         self.assertNotIn("--session", commands[1])
@@ -1466,7 +1470,7 @@ class RunManifestTests(OcmoTestCase):
         state["items"]["1"]["runs"]["two"] = {"status": "paused"}
         (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(["resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 1)
+            self.assertEqual(cli.main(["operation", "resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 1)
 
     def test_run_item_preserves_control_status_after_terminated_child(self) -> None:
         manifest = self.load()
@@ -1659,9 +1663,9 @@ class CliEntrypointTests(OcmoTestCase):
         stdout = io.StringIO()
 
         with contextlib.redirect_stdout(stdout):
-            validate_code = cli.main(["validate", str(self.manifest_path)])
+            validate_code = cli.main(["operation", "validate", str(self.manifest_path)])
         with contextlib.redirect_stdout(stdout):
-            render_code = cli.main(["render", str(self.manifest_path), "--select", "1"])
+            render_code = cli.main(["operation", "render", str(self.manifest_path), "--select", "1"])
 
         self.assertEqual(validate_code, 0)
         self.assertEqual(render_code, 0)
@@ -1678,8 +1682,8 @@ class CliEntrypointTests(OcmoTestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            validate_code = cli.main(["validate", str(self.manifest_path)])
-            render_code = cli.main(["render", str(self.manifest_path), "--select", "1"])
+            validate_code = cli.main(["operation", "validate", str(self.manifest_path)])
+            render_code = cli.main(["operation", "render", str(self.manifest_path), "--select", "1"])
 
         self.assertEqual(validate_code, 0)
         self.assertEqual(render_code, 0)
@@ -1695,13 +1699,13 @@ class CliEntrypointTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), contextlib.redirect_stdout(stdout):
-            code = cli.main(["render", "--select", "1"])
+            code = cli.main(["operation", "render", "--select", "1"])
         self.assertEqual(code, 0)
         self.assertIn("# item 1 / run default", stdout.getvalue())
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            code = cli.main(["render", str(manifest_dir), "--select", "1"])
+            code = cli.main(["operation", "render", str(manifest_dir), "--select", "1"])
         self.assertEqual(code, 0)
         self.assertIn("# item 1 / run default", stdout.getvalue())
 
@@ -1715,12 +1719,12 @@ class CliEntrypointTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), contextlib.redirect_stdout(stdout):
-            code = cli.main(["render", "--select", "1"])
+            code = cli.main(["operation", "render", "--select", "1"])
         self.assertEqual(code, 0)
         self.assertIn("# item 1 / run default", stdout.getvalue())
 
         with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
-            code = cli.main(["run", "--dry-run"])
+            code = cli.main(["operation", "run", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertEqual(run.call_args.args[0].manifest_path, generated_manifest)
 
@@ -1734,7 +1738,7 @@ class CliEntrypointTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            code = cli.main(["render", str(self.manifest_path), "--select", "all"])
+            code = cli.main(["operation", "render", str(self.manifest_path), "--select", "all"])
 
         self.assertEqual(code, 0)
         output = stdout.getvalue()
@@ -1746,7 +1750,7 @@ class CliEntrypointTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            code = cli.main(["render", str(self.manifest_path), "--select", "all", "--all"])
+            code = cli.main(["operation", "render", str(self.manifest_path), "--select", "all", "--all"])
 
         self.assertEqual(code, 0)
         self.assertIn("# item ITEM-3 / run default", stdout.getvalue())
@@ -1757,22 +1761,22 @@ class CliEntrypointTests(OcmoTestCase):
         manifest_dir.mkdir()
 
         with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
-            code = cli.main(["run", "--dry-run"])
+            code = cli.main(["operation", "run", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertEqual(run.call_args.args[0].manifest_path, self.manifest_path)
 
         with mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
-            code = cli.main(["run", str(manifest_dir), "--dry-run"])
+            code = cli.main(["operation", "run", str(manifest_dir), "--dry-run"])
         self.assertEqual(code, 0)
         self.assertEqual(run.call_args.args[0].manifest_path, manifest_dir / "manifest.yaml")
 
         with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
-            code = cli.main(["run", "--allow-shared-worktree-concurrency", "--dry-run"])
+            code = cli.main(["operation", "run", "--allow-shared-worktree-concurrency", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertTrue(run.call_args.args[0].allow_shared_worktree_concurrency)
 
         with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
-            code = cli.main(["run", "--dry-run", "--all"])
+            code = cli.main(["operation", "run", "--dry-run", "--all"])
         self.assertEqual(code, 0)
         self.assertTrue(run.call_args.args[0].preview_all)
 
@@ -1783,7 +1787,7 @@ class CliEntrypointTests(OcmoTestCase):
         stderr = io.StringIO()
 
         with contextlib.redirect_stderr(stderr):
-            code = cli.main(["validate", str(self.root / "missing.yaml")])
+            code = cli.main(["operation", "validate", str(self.root / "missing.yaml")])
 
         self.assertEqual(code, 2)
         self.assertIn("manifest not found", stderr.getvalue())
@@ -1794,7 +1798,7 @@ class CliEntrypointTests(OcmoTestCase):
         for command in ("run", "render"):
             stderr = io.StringIO()
             with mock.patch("ocmo.cli.Path.cwd", return_value=empty_root), contextlib.redirect_stderr(stderr):
-                code = cli.main([command])
+                code = cli.main(["operation", command])
             self.assertEqual(code, 2)
             self.assertIn("no generated manifests", stderr.getvalue())
 
@@ -1807,7 +1811,7 @@ class CliEntrypointTests(OcmoTestCase):
         for command in ("run", "render"):
             stderr = io.StringIO()
             with mock.patch("ocmo.cli.Path.cwd", return_value=empty_root), contextlib.redirect_stderr(stderr):
-                code = cli.main([command])
+                code = cli.main(["operation", command])
             self.assertEqual(code, 2)
             self.assertIn("multiple generated manifests", stderr.getvalue())
 
@@ -1817,7 +1821,7 @@ class CliEntrypointTests(OcmoTestCase):
         stdout = io.StringIO()
 
         with mock.patch("ocmo.cli.subprocess.run") as run, contextlib.redirect_stdout(stdout):
-            code = cli.main(["plan", "--from", str(request), "--dry-run"])
+            code = cli.main(["operation", "plan", "--from", str(request), "--dry-run"])
 
         self.assertEqual(code, 0)
         self.assertIn("Convert this mass-operation request", stdout.getvalue())
@@ -2172,7 +2176,7 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         self.write_manifest()
         stdout = io.StringIO()
         with mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(stdout):
-            code = cli.main(["run", str(self.manifest_path), "--select", "1"])
+            code = cli.main(["operation", "run", str(self.manifest_path), "--select", "1"])
         self.assertEqual(code, 1)
         self.assertIn("Cancelled.", stdout.getvalue())
 
@@ -2437,7 +2441,7 @@ class EdgeCaseCoverageTests(OcmoTestCase):
             return subprocess.CompletedProcess(command, 0, stdout=self.planned_manifest_text(), stderr="")
 
         with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_plan_run), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            code = cli.main(["plan", "--from", str(prompt), "--workspace", str(self.workspace), "--max-attempts", "1"])
+            code = cli.main(["operation", "plan", "--from", str(prompt), "--workspace", str(self.workspace), "--max-attempts", "1"])
 
         self.assertEqual(code, 0)
         self.assertEqual(expected.read_text(encoding="utf-8"), self.planned_manifest_text())
@@ -2544,7 +2548,7 @@ Generated template for $item_id
 
         stderr = io.StringIO()
         with mock.patch("ocmo.cli.subprocess.run", side_effect=KeyboardInterrupt), contextlib.redirect_stderr(stderr):
-            code = cli.main(["plan", "--from", str(prompt), "--out", str(self.root / "out.yaml")])
+            code = cli.main(["operation", "plan", "--from", str(prompt), "--out", str(self.root / "out.yaml")])
 
         self.assertEqual(code, 130)
         self.assertIn("ocmo: interrupted", stderr.getvalue())
@@ -2740,6 +2744,284 @@ Generated template for $item_id
         execution = {"sourceWorkspace": str(self.workspace), "worktreePath": str(self.root / "setup-cleanup"), "branchName": "b", "baseBranch": "main"}
         with mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["git"], 0)), mock.patch("ocmo.cli.run_scripts", return_value=6), mock.patch("ocmo.cli.cleanup_worktree", return_value=7):
             self.assertEqual(cli.prepare_worktree(manifest, self.manifest_path, {"id": "1"}, execution, {"setup": "setup"}, state), 7)
+
+
+class WorkflowTests(OcmoTestCase):
+    def write_operation_manifest(self, name: str, state_name: str | None = None) -> Path:
+        directory = self.root / name
+        directory.mkdir()
+        prompt = directory / "prompt.md"
+        prompt.write_text("Item $item_id", encoding="utf-8")
+        manifest = directory / "manifest.yaml"
+        manifest.write_text(
+            f"""schema: ocmo/v1
+operation:
+  id: {name}
+  workspace: {self.workspace.as_posix()}
+runner:
+  command: opencode
+  agent: build
+queue:
+  concurrency: 1
+policy:
+  worktree: isolated
+prompt:
+  template: {prompt.as_posix()}
+state:
+  path: {(directory / (state_name or 'state.json')).as_posix()}
+items:
+  - id: "1"
+    status: pending
+    payload: {{}}
+""",
+            encoding="utf-8",
+        )
+        return manifest
+
+    def write_workflow(self, extra: str = "") -> tuple[Path, Path, Path]:
+        first = self.write_operation_manifest("first")
+        second = self.write_operation_manifest("second")
+        workflow = self.root / "workflow.yaml"
+        workflow.write_text(
+            f"""schema: ocmo-workflow/v1
+workflow:
+  id: test-workflow
+state:
+  path: workflow-state.json
+defaults:
+  operationSelect: uncompleted
+  stopOnFailure: true
+steps:
+  - id: first
+    manifest: {first.as_posix()}
+  - id: second
+    manifest: {second.as_posix()}
+{extra}""",
+            encoding="utf-8",
+        )
+        return workflow, first, second
+
+    def test_workflow_validate_and_dry_run(self) -> None:
+        workflow, _, _ = self.write_workflow()
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "validate", str(workflow)]), 0)
+            self.assertEqual(cli.main(["workflow", "run", str(workflow), "--dry-run"]), 0)
+
+        output = stdout.getvalue()
+        self.assertIn("valid:", output)
+        self.assertIn("ocmo operation run", output)
+        self.assertIn("--select uncompleted", output)
+
+    def test_workflow_run_writes_step_state_and_stops_on_failure(self) -> None:
+        workflow, first, second = self.write_workflow()
+        calls = []
+
+        def fake_run(options):
+            calls.append(options)
+            return 1 if options.manifest_path == first else 0
+
+        with mock.patch("ocmo.cli.run_manifest", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(["workflow", "run", str(workflow), "--yes", "--ui", "plain"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual([call.manifest_path for call in calls], [first])
+        state = json.loads((self.root / "workflow-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["steps"]["first"]["status"], "failed")
+
+    def test_workflow_rerun_defaults_operation_select_to_retryable(self) -> None:
+        workflow, first, _ = self.write_workflow()
+        (self.root / "workflow-state.json").write_text(
+            json.dumps({"schema": "ocmo-workflow-state/v1", "workflowId": "test-workflow", "steps": {"first": {"status": "failed"}}}),
+            encoding="utf-8",
+        )
+        calls = []
+
+        with mock.patch("ocmo.cli.run_manifest", side_effect=lambda options: calls.append(options) or 0), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["workflow", "rerun", str(workflow), "--yes", "--ui", "plain"]), 0)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].manifest_path, first)
+        self.assertEqual(calls[0].select, "retryable")
+        self.assertTrue(calls[0].rerun)
+
+    def test_workflow_step_rerun_clears_stale_terminal_fields(self) -> None:
+        workflow, first, _ = self.write_workflow()
+        (self.root / "workflow-state.json").write_text(
+            json.dumps(
+                {
+                    "schema": "ocmo-workflow-state/v1",
+                    "workflowId": "test-workflow",
+                    "steps": {"first": {"status": "paused", "pausedAt": "then", "completedAt": "old", "exitCode": 130}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch("ocmo.cli.run_manifest", return_value=0), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["workflow", "rerun", str(workflow), "--select", "first", "--yes", "--ui", "plain"]), 0)
+
+        state = json.loads((self.root / "workflow-state.json").read_text(encoding="utf-8"))
+        first_step = state["steps"]["first"]
+        self.assertEqual(first_step["manifestPath"], str(first.resolve()))
+        self.assertEqual(first_step["status"], "completed")
+        self.assertNotIn("pausedAt", first_step)
+        self.assertEqual(first_step["exitCode"], 0)
+
+    def test_workflow_finish_keeps_pending_overall_status_when_steps_remain(self) -> None:
+        workflow, first, second = self.write_workflow()
+        (self.root / "workflow-state.json").write_text(
+            json.dumps(
+                {
+                    "schema": "ocmo-workflow-state/v1",
+                    "workflowId": "test-workflow",
+                    "steps": {
+                        "first": {"status": "killed", "manifestPath": str(first)},
+                        "second": {"status": "pending", "manifestPath": str(second)},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch("ocmo.cli.run_manifest", return_value=0), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["workflow", "rerun", str(workflow), "--yes", "--ui", "plain"]), 0)
+
+        state = json.loads((self.root / "workflow-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["steps"]["first"]["status"], "completed")
+        self.assertEqual(state["steps"]["second"]["status"], "pending")
+        self.assertEqual(state["status"], "pending")
+        self.assertNotIn("completedAt", state)
+
+    def test_workflow_run_prepares_selected_steps_before_execution(self) -> None:
+        workflow, first, second = self.write_workflow()
+        (self.root / "workflow-state.json").write_text(
+            json.dumps(
+                {
+                    "schema": "ocmo-workflow-state/v1",
+                    "workflowId": "test-workflow",
+                    "steps": {
+                        "first": {"status": "completed", "startedAt": "old", "completedAt": "old", "exitCode": 0},
+                        "second": {"status": "completed", "startedAt": "old", "completedAt": "old", "exitCode": 0},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch("ocmo.cli.run_manifest", return_value=1), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["workflow", "run", str(workflow), "--select", "all", "--yes", "--ui", "plain"]), 1)
+
+        state = json.loads((self.root / "workflow-state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["steps"]["first"]["status"], "failed")
+        self.assertEqual(state["steps"]["second"]["status"], "pending")
+        self.assertEqual(state["steps"]["second"]["manifestPath"], str(second.resolve()))
+        self.assertNotIn("startedAt", state["steps"]["second"])
+        self.assertNotIn("completedAt", state["steps"]["second"])
+
+    def test_workflow_kill_marks_active_operation_killed(self) -> None:
+        workflow, first, _ = self.write_workflow()
+        manifest = cli.load_manifest(first)
+        operation_state_path = cli.state_path(manifest, first)
+        operation_state_path.write_text(
+            json.dumps({"items": {"1": {"status": "running", "runs": {"default": {"status": "running", "pid": 222}}}}}),
+            encoding="utf-8",
+        )
+        (self.root / "workflow-state.json").write_text(
+            json.dumps(
+                {
+                    "schema": "ocmo-workflow-state/v1",
+                    "workflowId": "test-workflow",
+                    "completedAt": "old",
+                    "steps": {"first": {"status": "running", "manifestPath": str(first), "statePath": str(operation_state_path)}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch("ocmo.cli.terminate_process_tree"), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["workflow", "kill", str(workflow), "--force"]), 0)
+
+        operation_state = json.loads(operation_state_path.read_text(encoding="utf-8"))
+        workflow_state = json.loads((self.root / "workflow-state.json").read_text(encoding="utf-8"))
+        self.assertNotIn("completedAt", workflow_state)
+        self.assertEqual(operation_state["items"]["1"]["status"], "killed")
+        self.assertEqual(operation_state["items"]["1"]["runs"]["default"]["status"], "killed")
+
+    def test_workflow_status_aggregates_operation_usage(self) -> None:
+        workflow, first, _ = self.write_workflow()
+        manifest = cli.load_manifest(first)
+        Path(manifest["state"]["path"]).write_text(
+            json.dumps(
+                {
+                    "schema": "ocmo-state/v1",
+                    "items": {
+                        "1": {
+                            "status": "completed",
+                            "runs": {"default": {"status": "completed", "usage": {"input": 10, "output": 5, "total": 15, "steps": 1}}},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "status", str(workflow)]), 0)
+
+        output = stdout.getvalue()
+        self.assertIn("OCMO Workflow: test-workflow", output)
+        self.assertIn("tokens=15", output)
+        self.assertIn("first", output)
+
+    def test_workflow_detach_writes_kind_aware_record(self) -> None:
+        workflow, _, _ = self.write_workflow()
+        process = mock.Mock(pid=123)
+        stdout = io.StringIO()
+
+        with mock.patch("ocmo.cli.subprocess.Popen", return_value=process), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "run", str(workflow), "--detach"]), 0)
+
+        record_path = next((self.root / ".ocmo" / "runs").glob("ocmo-workflow-*.json"))
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["kind"], "workflow")
+        self.assertEqual(record["command"][2:5], ["ocmo", "workflow", "run"])
+
+    def test_workflow_list_filters_kind_and_prints_state_details(self) -> None:
+        workflow, _, _ = self.write_workflow()
+        state_path = self.root / "workflow-state.json"
+        state_path.write_text(json.dumps({"steps": {"first": {"status": "completed"}}}), encoding="utf-8")
+        runs_dir = self.root / ".ocmo" / "runs"
+        runs_dir.mkdir(parents=True)
+        workflow_record = {
+            "schema": "ocmo-detached-run/v1",
+            "kind": "workflow",
+            "runId": "wf",
+            "pid": 0,
+            "startedAt": "then",
+            "workflowPath": str(workflow),
+            "statePath": str(state_path),
+            "logPath": str(self.root / "wf.log"),
+        }
+        operation_record = {"schema": "ocmo-detached-run/v1", "kind": "operation", "runId": "op", "pid": 0, "startedAt": "then"}
+        global_dir = self.root / "registry"
+        global_dir.mkdir()
+        (global_dir / "wf.json").write_text(json.dumps(workflow_record), encoding="utf-8")
+        (global_dir / "op.json").write_text(json.dumps(operation_record), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch.dict("ocmo.cli.os.environ", {"OCMO_RUN_REGISTRY": str(global_dir)}), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "list", "--all"]), 0)
+            self.assertEqual(cli.main(["workflow", "list", "--run-id", "wf"]), 0)
+
+        output = stdout.getvalue()
+        self.assertIn("wf inactive kind=workflow", output)
+        self.assertNotIn("op inactive", output)
+        self.assertIn("workflow:", output)
+        self.assertIn("steps: completed=1", output)
 
 
 def yaml_dump(data: dict) -> str:

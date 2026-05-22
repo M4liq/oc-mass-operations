@@ -2,7 +2,7 @@
 
 This handbook is installed with the `/ocmo` opencode skill by `ocmo skill install`. It is version-matched to the OCMO CLI that installed it.
 
-Use it when working with OCMO commands, `ocmo/v1` manifests, generated `.ocmo` operation folders, state files, outputs, planning, execution, or operation control.
+Use it when working with OCMO commands, `ocmo/v1` operation manifests, `ocmo-workflow/v1` workflow files, generated `.ocmo` operation folders, state files, outputs, planning, execution, or operation/workflow control.
 
 ## Core Model
 
@@ -13,6 +13,7 @@ OC Mass Operations (`ocmo`) is a deterministic queue runner for repeatable `open
 - One operation item is one independently schedulable unit of work.
 - One selected item produces one rendered prompt per run step.
 - Each run step starts a separate `opencode run` process.
+- One workflow is backed by one `workflow.yaml` and runs operation manifests sequentially.
 - OCMO writes durable state for status, resume, retry, and audit.
 - Task-specific meaning belongs in manifest item payloads and prompt templates, not in OCMO itself.
 - Use OCMO when one large request naturally splits into many similar units of work.
@@ -25,23 +26,24 @@ Inspect before acting.
 - Read `.ocmo/*/state.json` to understand actual execution status.
 - Read `.ocmo/*/outputs/` when diagnosing `opencode` runs.
 - Read `.ocmo/*/artifacts/` when sequential run steps pass files to later steps.
-- Read `.ocmo/runs/*.json` or use `ocmo list --all` when detached runs are involved.
+- Read workflow `workflow.yaml` and workflow state when orchestrating multiple operations.
+- Read `.ocmo/runs/*.json` or use `ocmo operation list --all` / `ocmo workflow list --all` when detached runs are involved.
 
 Prefer this workflow for existing operations:
 
 1. Inspect manifest and state.
-2. Run `ocmo validate <manifest>`.
-3. Run `ocmo render [manifest-or-directory] --select <selector>` to inspect prompts.
-4. Run `ocmo run [manifest-or-directory] --select <selector> --dry-run` before real execution.
+2. Run `ocmo operation validate <manifest>`.
+3. Run `ocmo operation render [manifest-or-directory] --select <selector>` to inspect prompts.
+4. Run `ocmo operation run [manifest-or-directory] --select <selector> --dry-run` before real execution.
 5. Ask before starting long-running foreground or detached work unless explicitly requested.
-6. Use `ocmo status`, `ocmo list`, `state.json`, outputs, and artifacts to inspect progress and results.
+6. Use `ocmo operation status`, `ocmo operation list`, `state.json`, outputs, and artifacts to inspect progress and results.
 
 ## Command Reference
 
-### `ocmo plan`
+### `ocmo operation plan`
 
 ```powershell
-ocmo plan --from <prompt-file> [--out <manifest>] [--workspace <path>] [--read <source-file>] [--model <model>] [--max-attempts <count>] [--interactive] [--dry-run]
+ocmo operation plan --from <prompt-file> [--out <manifest>] [--workspace <path>] [--read <source-file>] [--model <model>] [--max-attempts <count>] [--interactive] [--dry-run]
 ```
 
 Converts a natural-language mass-operation request into an `ocmo/v1` manifest and any generated prompt templates. Planning does not execute operation items.
@@ -57,18 +59,18 @@ Converts a natural-language mass-operation request into an `ocmo/v1` manifest an
 
 Use `--read` for CSV exports, inventories, design notes, existing manifests, or other planning inputs.
 
-### `ocmo validate`
+### `ocmo operation validate`
 
 ```powershell
-ocmo validate <manifest>
+ocmo operation validate <manifest>
 ```
 
 Validates manifest schema, paths, prompt templates, worktree settings, item run paths, and workspace assumptions.
 
-### `ocmo render`
+### `ocmo operation render`
 
 ```powershell
-ocmo render [manifest-or-directory] [--select <selector>] [--all]
+ocmo operation render [manifest-or-directory] [--select <selector>] [--all]
 ```
 
 Renders prompts for selected items without running agents.
@@ -78,10 +80,10 @@ Renders prompts for selected items without running agents.
 
 Use `render` to inspect exact prompt text before launching agents.
 
-### `ocmo run`
+### `ocmo operation run`
 
 ```powershell
-ocmo run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--dry-run] [--all] [--yes] [--ui auto|live|plain] [--detach] [--allow-shared-worktree-concurrency]
+ocmo operation run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--dry-run] [--all] [--yes] [--ui auto|live|plain] [--detach] [--allow-shared-worktree-concurrency]
 ```
 
 Runs selected operation items.
@@ -93,15 +95,15 @@ Runs selected operation items.
 - `--all`: with `--dry-run`, prints every rendered prompt instead of compact preview.
 - `--yes`, `-y`: skips confirmation for foreground runs.
 - `--ui auto|live|plain`: controls foreground terminal output.
-- `--detach`: starts a background `ocmo run` with `--yes` and `--ui plain`, writes detached metadata/logs under `.ocmo/runs/`, writes a global registry entry, returns a run ID, and exits.
+- `--detach`: starts a background `ocmo operation run` with `--yes` and `--ui plain`, writes detached metadata/logs under `.ocmo/runs/`, writes a global registry entry, returns a run ID, and exits.
 - `--allow-shared-worktree-concurrency`: allows concurrency above `1` when `policy.worktree: single`. Use only when selected item scopes are explicitly non-overlapping.
 
-Pressing `Ctrl+C` during foreground `ocmo run` uses pause semantics: tracked child processes are terminated, active runs are marked `paused` or `paused_unresumable`, and the command exits `130`.
+Pressing `Ctrl+C` during foreground `ocmo operation run` uses pause semantics: tracked child processes are terminated, active runs are marked `paused` or `paused_unresumable`, and the command exits `130`.
 
-### `ocmo status`
+### `ocmo operation status`
 
 ```powershell
-ocmo status [manifest-or-directory] [--run-id <run-id>] [--all]
+ocmo operation status [manifest-or-directory] [--run-id <run-id>] [--all]
 ```
 
 Shows operation item/run status and detached run information.
@@ -113,18 +115,18 @@ Shows operation item/run status and detached run information.
 
 When `opencode run --format json` reports step usage, status shows operation token totals and a per-item `Tokens` column formatted as `input/output`.
 
-### `ocmo list`
+### `ocmo operation list`
 
 ```powershell
-ocmo list [manifest-or-directory] [--run-id <run-id>] [--all]
+ocmo operation list [manifest-or-directory] [--run-id <run-id>] [--all]
 ```
 
-Lists detached run sessions. Use `--all` to include inactive sessions. `ocmo list --run-id <run-id>` includes a state summary with token totals when usage is available.
+Lists detached operation run sessions. Use `--all` to include inactive sessions. `ocmo operation list --run-id <run-id>` includes a state summary with token totals when usage is available.
 
-### `ocmo pause`
+### `ocmo operation pause`
 
 ```powershell
-ocmo pause [manifest-or-directory] [--run-id <run-id>]
+ocmo operation pause [manifest-or-directory] [--run-id <run-id>]
 ```
 
 Stops active tracked processes and marks running items/runs as paused.
@@ -133,10 +135,10 @@ Stops active tracked processes and marks running items/runs as paused.
 - Runs with a known opencode `sessionId` are marked `paused`.
 - Runs without a known session id are marked `paused_unresumable`.
 
-### `ocmo resume`
+### `ocmo operation resume`
 
 ```powershell
-ocmo resume [manifest-or-directory] [--detach] [--yes] [--ui auto|live|plain]
+ocmo operation resume [manifest-or-directory] [--detach] [--yes] [--ui auto|live|plain]
 ```
 
 Strictly resumes paused runs by persisted opencode session id.
@@ -144,12 +146,12 @@ Strictly resumes paused runs by persisted opencode session id.
 - Uses `opencode run --session <sessionId>`.
 - Never falls back to `opencode --continue`.
 - Fails for `paused_unresumable` work.
-- Use `ocmo rerun` for fresh retry of unresumable work.
+- Use `ocmo operation rerun` for fresh retry of unresumable work.
 
-### `ocmo rerun`
+### `ocmo operation rerun`
 
 ```powershell
-ocmo rerun [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--detach] [--yes] [--ui auto|live|plain] [--allow-shared-worktree-concurrency]
+ocmo operation rerun [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--detach] [--yes] [--ui auto|live|plain] [--allow-shared-worktree-concurrency]
 ```
 
 Fresh-starts selected operation items. It never uses `--session`.
@@ -160,18 +162,18 @@ Fresh-starts selected operation items. It never uses `--session`.
 
 Use rerun for failed, timed-out, killed, or unresumable work. Use resume for clean paused work with session ids.
 
-### `ocmo kill`
+### `ocmo operation kill`
 
 ```powershell
-ocmo kill [manifest-or-directory] [--run-id <run-id>] [--force]
+ocmo operation kill [manifest-or-directory] [--run-id <run-id>] [--force]
 ```
 
 Terminates active tracked processes and marks active work `killed`, preserving operation files, state, outputs, logs, and artifacts for audit.
 
-### `ocmo erase`
+### `ocmo operation erase`
 
 ```powershell
-ocmo erase [manifest-or-directory] [--run-id <run-id>] --force
+ocmo operation erase [manifest-or-directory] [--run-id <run-id>] --force
 ```
 
 Terminates tracked processes and deletes a generated operation directory such as `.ocmo/<operation>/`.
@@ -201,6 +203,57 @@ Commands accepting `[manifest-or-directory]` resolve manifests as follows:
 - A directory argument uses `<directory>/manifest.yaml`.
 - If missing, exactly one `.ocmo/*/manifest.yaml` may be inferred.
 - If multiple generated manifests exist, pass one explicitly.
+
+## Workflow Reference
+
+The current workflow schema is `ocmo-workflow/v1`. Workflows are sequential only and orchestrate existing operation manifests.
+
+```yaml
+schema: ocmo-workflow/v1
+
+workflow:
+  id: example-workflow
+  description: Run operations in order.
+
+state:
+  path: state.json
+
+defaults:
+  operationSelect: uncompleted
+  stopOnFailure: true
+  concurrency: null
+  timeoutSeconds: null
+  allowSharedWorktreeConcurrency: false
+
+steps:
+  - id: plan-docs
+    manifest: ../plan-docs/manifest.yaml
+  - id: implement-docs
+    manifest: ../implement-docs/manifest.yaml
+    operationSelect: uncompleted
+```
+
+Workflow commands:
+
+```powershell
+ocmo workflow validate workflow.yaml
+ocmo workflow run workflow.yaml --dry-run
+ocmo workflow run workflow.yaml --detach
+ocmo workflow status workflow.yaml
+ocmo workflow list --all
+ocmo workflow pause workflow.yaml
+ocmo workflow resume workflow.yaml --detach
+ocmo workflow rerun workflow.yaml --detach
+ocmo workflow kill workflow.yaml --force
+```
+
+Workflow facts:
+
+- Workflow `--select` selects workflow steps, not operation items.
+- `operationSelect` selects items inside the referenced operation manifest.
+- Workflow state records orchestration status; operation state remains authoritative for items, runs, sessions, outputs, artifacts, and token usage.
+- `ocmo workflow rerun` defaults to retryable workflow steps and uses operation `retryable` selection unless a selected step explicitly defines `operationSelect`.
+- `ocmo workflow pause` and `ocmo workflow kill` delegate to the active operation step and preserve operation files.
 
 ## Selection Rules
 
@@ -417,14 +470,14 @@ Artifact rules:
 
 - Safe only when item scopes are explicitly non-overlapping.
 - `validate` and `render` warn for `queue.concurrency > 1`.
-- `ocmo run` rejects shared single-worktree concurrency above `1` unless passed `--allow-shared-worktree-concurrency`.
+- `ocmo operation run` rejects shared single-worktree concurrency above `1` unless passed `--allow-shared-worktree-concurrency`.
 - `policy.worktree: single` cannot be combined with `queue.autoWorktrees.enabled: true`.
 
 Use `queue.autoWorktrees.enabled: true` when items may edit overlapping files, when isolation matters, or when parallel item execution is desired without shared-workspace risk. Auto worktrees use native `git worktree`; they are per item, not per run step.
 
 ## State And Outputs
 
-`ocmo run` writes durable state to the manifest's configured state path. State records execution facts such as item status, run status, start/completion times, exit codes, output paths, worktree metadata, process IDs, opencode session IDs, and per-run token usage when `opencode` reports it.
+`ocmo operation run` writes durable state to the manifest's configured state path. State records execution facts such as item status, run status, start/completion times, exit codes, output paths, worktree metadata, process IDs, opencode session IDs, and per-run token usage when `opencode` reports it.
 
 Per-run `opencode` stdout/stderr is written under `outputs/` beside the manifest. This keeps concurrent agent output from corrupting the terminal UI and makes long-running work inspectable after the fact.
 
@@ -443,7 +496,7 @@ Failed items remain selectable through `uncompleted` unless you mark them comple
 
 ## Planning Checklist
 
-Before running `ocmo plan`, make sure the request identifies enough of:
+Before running `ocmo operation plan`, make sure the request identifies enough of:
 
 - Target workspace.
 - Operation goal and definition of done.
@@ -459,4 +512,4 @@ Before running `ocmo plan`, make sure the request identifies enough of:
 
 If the request is vague, ask focused questions. Do not turn this into a long grilling ritual by default; ask only what is necessary for safe planning or execution.
 
-Do not run `ocmo plan`, `ocmo run`, `ocmo resume`, `ocmo rerun`, `ocmo kill`, or `ocmo erase` unless the user asked for that action or approved the relevant operation.
+Do not run `ocmo operation plan`, `ocmo operation run`, `ocmo operation resume`, `ocmo operation rerun`, `ocmo operation kill`, `ocmo operation erase`, or workflow control commands unless the user asked for that action or approved the relevant operation/workflow.
