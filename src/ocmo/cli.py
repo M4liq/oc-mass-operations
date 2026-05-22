@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import os
+from importlib import resources
 import json
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -25,7 +28,10 @@ MANIFEST_START = "OCMO_MANIFEST_START"
 MANIFEST_END = "OCMO_MANIFEST_END"
 FILE_START = "OCMO_FILE_START"
 FILE_END = "OCMO_FILE_END"
-TERMINAL_STATUSES = {"completed", "failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"}
+TERMINAL_STATUSES = {"completed", "failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed", "paused", "paused_unresumable", "killed"}
+PAUSED_STATUSES = {"paused", "paused_unresumable"}
+FAILED_STATUSES = {"failed", "cleanup_failed", "worktree_failed", "setup_failed"}
+RERUN_RETRYABLE_STATUSES = {*FAILED_STATUSES, "paused_unresumable", "timed_out", "killed"}
 SHARED_WORKTREE_CONCURRENCY_WARNING = "warning: policy.worktree=single with queue.concurrency > 1 requires non-overlapping item scopes; ocmo run requires --allow-shared-worktree-concurrency"
 MISSING_PLACEHOLDER = object()
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
@@ -33,7 +39,9 @@ PLAN_AGENT = "build"
 RUN_AGENT = "build"
 ARTIFACT_ROOT = "artifacts"
 ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-OCMO_SKILL_NAME = "ocmo-plan-grill"
+OCMO_SKILL_NAME = "ocmo"
+OLD_OCMO_SKILL_NAMES = ("ocmo-plan-grill",)
+OCMO_SKILL_RESOURCE = "resources/skill"
 
 
 class OcmoError(Exception):
@@ -52,6 +60,8 @@ class RunOptions:
     allow_shared_worktree_concurrency: bool = False
     preview_all: bool = False
     detach: bool = False
+    resume: bool = False
+    rerun: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,10 +119,44 @@ def main(argv: list[str] | None = None) -> int:
     list_parser.add_argument("--run-id", help="Show one detached run session")
     list_parser.add_argument("--all", action="store_true", help="Include inactive detached run sessions")
 
+    pause_parser = subparsers.add_parser("pause", help="Stop active processes and mark the operation paused")
+    pause_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
+    pause_parser.add_argument("--run-id", help="Pause by detached run id")
+
+    resume_parser = subparsers.add_parser("resume", help="Resume paused operation runs by opencode session id")
+    resume_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
+    resume_parser.add_argument("--detach", action="store_true", help="Resume in the background and return immediately")
+    resume_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for foreground resume")
+    resume_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for foreground resume")
+
+    rerun_parser = subparsers.add_parser("rerun", help="Fresh-start failed, timed-out, killed, or unresumable operation items")
+    rerun_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
+    rerun_parser.add_argument("--select", default="retryable", help="Rerun selector: retryable, unresumable, timed-out, failed, killed, all, IDs, or ranges")
+    rerun_parser.add_argument("--concurrency", type=int, help="Override queue.concurrency")
+    rerun_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each item")
+    rerun_parser.add_argument("--detach", action="store_true", help="Rerun in the background and return immediately")
+    rerun_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for foreground rerun")
+    rerun_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for foreground rerun")
+    rerun_parser.add_argument(
+        "--allow-shared-worktree-concurrency",
+        action="store_true",
+        help="Allow concurrency > 1 with policy.worktree=single",
+    )
+
+    kill_parser = subparsers.add_parser("kill", help="Terminate active processes and mark the operation killed")
+    kill_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
+    kill_parser.add_argument("--run-id", help="Kill by detached run id")
+    kill_parser.add_argument("--force", action="store_true", help="Skip confirmation")
+
+    erase_parser = subparsers.add_parser("erase", help="Terminate and delete a generated operation directory")
+    erase_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
+    erase_parser.add_argument("--run-id", help="Erase by detached run id")
+    erase_parser.add_argument("--force", action="store_true", help="Required for non-interactive erase")
+
     skill_parser = subparsers.add_parser("skill", help="Manage the bundled OCMO opencode skill")
     skill_subparsers = skill_parser.add_subparsers(dest="skill_command", required=True)
     skill_install_parser = skill_subparsers.add_parser("install", help="Install the bundled opencode planning skill")
-    skill_install_parser.add_argument("--force", action="store_true", help="Overwrite an existing different skill file")
+    skill_install_parser.add_argument("--force", action="store_true", help="Accepted for compatibility; install updates the bundled skill by default")
     skill_subparsers.add_parser("path", help="Print the target opencode skill path")
 
     args = parser.parse_args(argv)
@@ -157,11 +201,24 @@ def main(argv: list[str] | None = None) -> int:
             return status_operation(args)
         if args.command == "list":
             return list_runs(args)
+        if args.command == "pause":
+            return pause_operation(args)
+        if args.command == "resume":
+            return resume_operation(args)
+        if args.command == "rerun":
+            return rerun_operation(args)
+        if args.command == "kill":
+            return kill_operation(args)
+        if args.command == "erase":
+            return erase_operation(args)
         if args.command == "skill":
             return skill_command(args)
     except OcmoError as exc:
         print(f"ocmo: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        print("ocmo: interrupted", file=sys.stderr)
+        return 130
     return 1  # pragma: no cover
 
 
@@ -180,21 +237,66 @@ def skill_command(args: argparse.Namespace) -> int:
 
 
 def install_skill(force: bool = False) -> Path:
-    source = bundled_skill_path()
+    source_dir = bundled_skill_dir()
     destination = opencode_skill_path()
-    source_text = source.read_text(encoding="utf-8")
+    destination_dir = destination.parent
+    source_files = bundled_skill_files(source_dir)
     if destination.exists():
-        destination_text = destination.read_text(encoding="utf-8")
-        if destination_text == source_text:
+        if installed_skill_matches(destination_dir, source_files):
             print(f"already installed: {destination}")
+            remove_old_skill_installs(destination_dir.parent)
             return destination
-        if not force:
-            raise OcmoError(f"skill already exists and differs: {destination}; pass --force to overwrite")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(source_text, encoding="utf-8")
-    print(f"installed: {destination}")
+        action = "updated"
+    else:
+        action = "installed"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    for relative_path, source_path in source_files.items():
+        target = destination_dir / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source_path.read_bytes())
+    print(f"{action}: {destination}")
+    remove_old_skill_installs(destination_dir.parent)
     print("restart opencode to load the skill")
     return destination
+
+
+def bundled_skill_files(source_dir: Any) -> dict[Path, Any]:
+    files: dict[Path, Any] = {}
+
+    def collect(path: Any, relative_to_source: Path) -> None:
+        for child in sorted(path.iterdir(), key=lambda item: item.name):
+            child_relative = relative_to_source / child.name
+            if child.is_file():
+                files[child_relative] = child
+            elif child.is_dir():  # pragma: no branch
+                collect(child, child_relative)
+
+    collect(source_dir, Path())
+    if Path("SKILL.md") not in files:
+        raise OcmoError("bundled skill file not found: SKILL.md")
+    return files
+
+
+def installed_skill_matches(destination_dir: Path, source_files: dict[Path, Any]) -> bool:
+    for relative_path, source_path in source_files.items():
+        target = destination_dir / relative_path
+        if not target.exists() or target.read_bytes() != source_path.read_bytes():
+            return False
+    return True
+
+
+def remove_old_skill_installs(skills_dir: Path) -> None:
+    for skill_name in OLD_OCMO_SKILL_NAMES:
+        old_dir = skills_dir / skill_name
+        old_skill = old_dir / "SKILL.md"
+        if not old_skill.exists():
+            continue
+        old_skill.unlink()
+        try:
+            old_dir.rmdir()
+        except OSError:
+            pass
+        print(f"removed old skill: {old_skill}")
 
 
 def opencode_skill_path() -> Path:
@@ -204,17 +306,26 @@ def opencode_skill_path() -> Path:
 
 
 def bundled_skill_path() -> Path:
+    return bundled_skill_dir() / "SKILL.md"
+
+
+def bundled_skill_dir() -> Path:
     configured = os.environ.get("OCMO_SKILL_SOURCE")
     if configured:
         path = Path(configured)
-        if path.exists():
+        if path.is_file():
+            return path.parent
+        if (path / "SKILL.md").exists():
             return path
         raise OcmoError(f"configured skill source not found: {path}")
+    resource_root = resources.files(__package__).joinpath(OCMO_SKILL_RESOURCE)
+    if resource_root.joinpath("SKILL.md").is_file():
+        return resource_root
     for parent in Path(__file__).resolve().parents:
-        candidate = parent / "skills" / OCMO_SKILL_NAME / "SKILL.md"
-        if candidate.exists():
+        candidate = parent / "skills" / OCMO_SKILL_NAME
+        if (candidate / "SKILL.md").exists():
             return candidate
-    raise OcmoError("bundled skill file not found; install from the cloned ocmo repository")
+    raise OcmoError("bundled skill directory not found; reinstall ocmo or install from the cloned repository")
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -662,6 +773,39 @@ def select_items(manifest: dict[str, Any], selector: str | None) -> list[dict[st
     return selected
 
 
+def select_rerun_items(manifest: dict[str, Any], state: dict[str, Any], selector: str | None) -> list[dict[str, Any]]:
+    selector = (selector or "retryable").strip()
+    if selector == "all":
+        return manifest["items"]
+    status_sets = {
+        "retryable": RERUN_RETRYABLE_STATUSES,
+        "unresumable": {"paused_unresumable"},
+        "paused_unresumable": {"paused_unresumable"},
+        "timed-out": {"timed_out"},
+        "timed_out": {"timed_out"},
+        "failed": FAILED_STATUSES,
+        "killed": {"killed"},
+    }
+    statuses = status_sets.get(selector)
+    if statuses is None:
+        return select_items(manifest, selector)
+    item_states = state.get("items") if isinstance(state.get("items"), dict) else {}
+    selected = []
+    for item in manifest["items"]:
+        item_id = str(item.get("id"))
+        item_state = item_states.get(item_id) if isinstance(item_states.get(item_id), dict) else {}
+        if item_state_matches_statuses(item_state, statuses):
+            selected.append(item)
+    return selected
+
+
+def item_state_matches_statuses(item_state: dict[str, Any], statuses: set[str]) -> bool:
+    if str(item_state.get("status", "")) in statuses:
+        return True
+    runs = item_state.get("runs") if isinstance(item_state.get("runs"), dict) else {}
+    return any(isinstance(run, dict) and str(run.get("status", "")) in statuses for run in runs.values())
+
+
 def expand_selector(selector: str) -> set[str]:
     result: set[str] = set()
     for token in [part.strip() for part in selector.split(",") if part.strip()]:
@@ -818,7 +962,14 @@ def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: st
         command += ["--title", str(runner["title"])]
     if runner.get("dangerouslySkipPermissions"):
         command.append("--dangerously-skip-permissions")
+    command += ["--format", "json"]
     command += ["--dir", str(run_dir or resolve_manifest_path(manifest_path, operation["workspace"])), prompt_text]
+    return command
+
+
+def build_resume_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str, session_id: str, run_dir: Path | None = None, runner: dict[str, Any] | None = None) -> list[str]:
+    command = build_command(manifest, manifest_path, prompt_text, run_dir, runner)
+    command[2:2] = ["--session", session_id]
     return command
 
 
@@ -1072,17 +1223,19 @@ def run_opencode_command(
     run_dir: Path,
     run_timeout: int | None,
     output_path: Path,
+    on_start: Any | None = None,
+    on_session: Any | None = None,
 ) -> subprocess.CompletedProcess:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     env = opencode_capture_env()
     with output_path.open("w", encoding="utf-8") as output:
         output.write(f"$ {format_command(command)}\n\n")
         output.flush()
+        process: subprocess.Popen[str] | None = None
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 cwd=str(run_dir),
-                timeout=run_timeout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1090,19 +1243,61 @@ def run_opencode_command(
                 errors="replace",
                 env=env,
             )
+            if on_start:
+                on_start(process.pid)
+            if on_session:
+                chunks = []
+                assert process.stdout is not None
+                for line in process.stdout:
+                    chunks.append(line)
+                    session_id = extract_session_id(line)
+                    if session_id:
+                        on_session(session_id)
+                process.wait(timeout=run_timeout)
+                stdout = "".join(chunks)
+            else:
+                stdout, _ = process.communicate(timeout=run_timeout)
         except subprocess.TimeoutExpired:
+            if process is not None:
+                terminate_process_tree(process.pid, force=True)
             output.write(f"\n[ocmo] timed out after {run_timeout} seconds\n")
+            output.flush()
+            raise
+        except KeyboardInterrupt:
+            if process is not None:
+                terminate_process_tree(process.pid, force=True)
+            output.write("\n[ocmo] interrupted\n")
             output.flush()
             raise
         except OSError as exc:
             output.write(f"\n[ocmo] failed to start: {exc}\n")
             output.flush()
             raise
-        cleaned_stdout = strip_ansi(completed.stdout or "")
+        cleaned_stdout = strip_ansi(stdout or "")
         output.write(cleaned_stdout)
-        output.write(f"\n[ocmo] exit code: {completed.returncode}\n")
+        output.write(f"\n[ocmo] exit code: {process.returncode}\n")
         output.flush()
-        return subprocess.CompletedProcess(completed.args, completed.returncode, stdout=cleaned_stdout, stderr=completed.stderr)
+        return subprocess.CompletedProcess(command, int(process.returncode or 0), stdout=cleaned_stdout, stderr=None)
+
+
+def extract_session_id(output: str) -> str | None:
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        direct = event.get("sessionId") or event.get("sessionID")
+        if isinstance(direct, str) and direct:
+            return direct
+        session = event.get("session")
+        if isinstance(session, dict):
+            value = session.get("id") or session.get("sessionId") or session.get("sessionID")
+            if isinstance(value, str) and value:
+                return value
+    return None
 
 
 def strip_ansi(text: str) -> str:
@@ -1120,7 +1315,13 @@ def opencode_capture_env() -> dict[str, str]:
 def run_manifest(options: RunOptions) -> int:
     manifest = load_manifest(options.manifest_path)
     validate_manifest(manifest, options.manifest_path, options.allow_shared_worktree_concurrency)
-    selected = select_items(manifest, options.select)
+    existing_state = read_json_file(state_path(manifest, options.manifest_path)) if state_path(manifest, options.manifest_path).exists() else {}
+    if options.resume:
+        selected = select_paused_items(manifest, existing_state)
+    elif options.rerun:
+        selected = select_rerun_items(manifest, existing_state, options.select)
+    else:
+        selected = select_items(manifest, options.select)
     concurrency = options.concurrency if options.concurrency is not None else manifest.get("queue", {}).get("concurrency", 1)
     timeout_seconds = options.timeout_seconds
     auto_worktrees = auto_worktrees_config(manifest)
@@ -1180,9 +1381,11 @@ def run_manifest(options: RunOptions) -> int:
     results: list[int] = []
     with make_run_reporter(options.ui) as reporter:
         reporter.start(manifest, selected, concurrency, auto_worktrees)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+        futures: dict[concurrent.futures.Future[int], str] = {}
+        try:
             futures = {
-                executor.submit(run_item, manifest, options.manifest_path, item, state, timeout_seconds, auto_worktrees, reporter): str(item["id"])
+                executor.submit(run_item, manifest, options.manifest_path, item, state, timeout_seconds, auto_worktrees, reporter, options.resume, options.rerun): str(item["id"])
                 for item in selected
             }
             for future in concurrent.futures.as_completed(futures):
@@ -1193,6 +1396,17 @@ def run_manifest(options: RunOptions) -> int:
                     state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": f"unexpected worker error: {exc}"})
                     reporter.worker_error(item_id, exc)
                     results.append(1)
+        except KeyboardInterrupt:
+            print("ocmo: interrupted; pausing active runs", file=sys.stderr)
+            interrupted_state = state.data()
+            mark_active_runs(state.path, "paused")
+            stop_operation_processes(options.manifest_path, interrupted_state)
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            return 130
+        else:
+            executor.shutdown(wait=True)
 
     if any(code != 0 for code in results):
         return 1
@@ -1237,7 +1451,8 @@ def start_detached_run(options: RunOptions, manifest: dict[str, Any], concurrenc
 
 
 def detached_child_command(options: RunOptions) -> list[str]:
-    command = [sys.executable, "-m", "ocmo", "run", str(options.manifest_path.resolve())]
+    subcommand = "resume" if options.resume else "rerun" if options.rerun else "run"
+    command = [sys.executable, "-m", "ocmo", subcommand, str(options.manifest_path.resolve())]
     if options.select:
         command += ["--select", options.select]
     if options.concurrency is not None:
@@ -1245,7 +1460,7 @@ def detached_child_command(options: RunOptions) -> list[str]:
     if options.timeout_seconds is not None:
         command += ["--timeout-seconds", str(options.timeout_seconds)]
     command += ["--ui", "plain", "--yes"]
-    if options.allow_shared_worktree_concurrency:
+    if options.allow_shared_worktree_concurrency and not options.resume:
         command.append("--allow-shared-worktree-concurrency")
     return command
 
@@ -1356,6 +1571,215 @@ def status_operation(args: argparse.Namespace) -> int:
     return 0
 
 
+def pause_operation(args: argparse.Namespace) -> int:
+    manifest_path, record = control_manifest_and_record(args)
+    manifest = load_manifest(manifest_path)
+    path = state_path(manifest, manifest_path)
+    state = read_json_file(path) if path.exists() else {}
+    changed = mark_active_runs(path, "paused")
+    stop_operation_processes(manifest_path, state, record)
+    print(f"paused: {manifest['operation']['id']} ({changed} run(s))")
+    return 0
+
+
+def kill_operation(args: argparse.Namespace) -> int:
+    manifest_path, record = control_manifest_and_record(args)
+    manifest = load_manifest(manifest_path)
+    path = state_path(manifest, manifest_path)
+    state = read_json_file(path) if path.exists() else {}
+    if not args.force and sys.stdin.isatty():
+        answer = input(f"Kill operation {manifest['operation']['id']}? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Cancelled.")
+            return 1
+    changed = mark_active_runs(path, "killed")
+    stop_operation_processes(manifest_path, state, record)
+    print(f"killed: {manifest['operation']['id']} ({changed} run(s))")
+    return 0
+
+
+def erase_operation(args: argparse.Namespace) -> int:
+    manifest_path, record = control_manifest_and_record(args)
+    if not is_generated_operation_manifest(manifest_path):
+        raise OcmoError("erase only removes generated .ocmo/<operation>/manifest.yaml operation directories")
+    manifest = load_manifest(manifest_path)
+    if not args.force and sys.stdin.isatty():
+        answer = input(f"Erase generated operation directory {manifest_path.parent}? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Cancelled.")
+            return 1
+    if not args.force and not sys.stdin.isatty():
+        raise OcmoError("erase requires --force when not interactive")
+    path = state_path(manifest, manifest_path)
+    state = read_json_file(path) if path.exists() else {}
+    stop_operation_processes(manifest_path, state, record)
+    remove_detached_records(manifest_path)
+    erased = manifest_path.parent
+    shutil.rmtree(erased)
+    print(f"erased: {erased}")
+    return 0
+
+
+def resume_operation(args: argparse.Namespace) -> int:
+    manifest_path = infer_manifest_path(args.manifest)
+    return run_manifest(RunOptions(manifest_path, None, None, None, False, args.yes, args.ui, False, False, args.detach, True))
+
+
+def rerun_operation(args: argparse.Namespace) -> int:
+    manifest_path = infer_manifest_path(args.manifest)
+    return run_manifest(
+        RunOptions(
+            manifest_path,
+            args.select,
+            args.concurrency,
+            args.timeout_seconds,
+            False,
+            args.yes,
+            args.ui,
+            args.allow_shared_worktree_concurrency,
+            False,
+            args.detach,
+            False,
+            True,
+        )
+    )
+
+
+def control_manifest_and_record(args: argparse.Namespace) -> tuple[Path, dict[str, Any] | None]:
+    if getattr(args, "run_id", None):
+        path = find_detached_record(args.run_id)
+        if path is None:
+            raise OcmoError(f"detached run not found: {args.run_id}")
+        record = read_json_file(path)
+        manifest_value = record.get("manifestPath")
+        if not isinstance(manifest_value, str):
+            raise OcmoError(f"detached run is missing manifestPath: {args.run_id}")
+        return Path(manifest_value), record
+    return infer_manifest_path(args.manifest), None
+
+
+def stop_operation_processes(manifest_path: Path, state: dict[str, Any], selected_record: dict[str, Any] | None = None) -> None:
+    pids: list[int] = []
+    if selected_record and isinstance(selected_record.get("pid"), int):
+        pids.append(selected_record["pid"])
+    for record in related_detached_records(manifest_path, include_inactive=True):
+        pid = record.get("pid")
+        if isinstance(pid, int):
+            pids.append(pid)
+    for pid in active_state_pids(state):
+        pids.append(pid)
+    for pid in sorted(set(pids), reverse=True):
+        terminate_process_tree(pid, force=True)
+
+
+def active_state_pids(state: dict[str, Any]) -> list[int]:
+    pids = []
+    items = state.get("items") if isinstance(state.get("items"), dict) else {}
+    for item in items.values():
+        if not isinstance(item, dict):
+            continue
+        runs = item.get("runs") if isinstance(item.get("runs"), dict) else {}
+        for run in runs.values():
+            if isinstance(run, dict) and run.get("status") == "running" and isinstance(run.get("pid"), int):
+                pids.append(run["pid"])
+    return pids
+
+
+def terminate_process_tree(pid: int, force: bool = True) -> None:
+    if pid < 1 or not process_is_alive(pid):
+        return
+    if os.name == "nt":
+        command = ["taskkill", "/PID", str(pid), "/T"]
+        if force:
+            command.append("/F")
+        try:
+            subprocess.run(command, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not process_is_alive(pid):
+            return
+        time.sleep(0.1)
+    if force:
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+
+
+def mark_active_runs(path: Path, status: str) -> int:
+    if not path.exists():
+        return 0
+    data = read_json_file(path)
+    items = data.get("items") if isinstance(data.get("items"), dict) else {}
+    changed = 0
+    now = utc_now()
+    for item in items.values():
+        if not isinstance(item, dict):
+            continue
+        runs = item.get("runs") if isinstance(item.get("runs"), dict) else {}
+        item_changed = False
+        for run in runs.values():
+            if not isinstance(run, dict) or run.get("status") != "running":
+                continue
+            next_status = status
+            if status == "paused" and not run.get("sessionId"):
+                next_status = "paused_unresumable"
+            run["status"] = next_status
+            run[f"{status}At"] = now
+            item_changed = True
+            changed += 1
+        if item.get("status") == "running" or item_changed:
+            item["status"] = status if status != "paused" or any(isinstance(run, dict) and run.get("status") == "paused" for run in runs.values()) else "paused_unresumable"
+            item[f"{status}At"] = now
+    data.setdefault("control", {})
+    data["control"].update({"status": status, "updatedAt": now})
+    data["updatedAt"] = now
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return changed
+
+
+def select_paused_items(manifest: dict[str, Any], state: dict[str, Any]) -> list[dict[str, Any]]:
+    item_states = state.get("items") if isinstance(state.get("items"), dict) else {}
+    selected = []
+    for item in manifest.get("items", []):
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        item_state = item_states.get(str(item["id"]), {})
+        if not isinstance(item_state, dict):
+            continue
+        runs = item_state.get("runs") if isinstance(item_state.get("runs"), dict) else {}
+        if item_state.get("status") in PAUSED_STATUSES or any(isinstance(run, dict) and run.get("status") in PAUSED_STATUSES for run in runs.values()):
+            selected.append(item)
+    return selected
+
+
+def resume_prompt(item_id: str, run_id: str) -> str:
+    return f"Continue the previous OCMO session for item {item_id}, run {run_id}. Preserve prior work, inspect current files and state, and finish the original assigned task."
+
+
+def is_generated_operation_manifest(manifest_path: Path) -> bool:
+    parts = manifest_path.resolve().parts
+    return manifest_path.name == "manifest.yaml" and len(parts) >= 3 and parts[-3] == ".ocmo"
+
+
+def remove_detached_records(manifest_path: Path) -> None:
+    for record in related_detached_records(manifest_path, include_inactive=True):
+        run_id = record.get("runId")
+        if isinstance(run_id, str):
+            for path in (global_detached_run_path(run_id), local_detached_record_path(manifest_path, run_id)):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
 def find_detached_record(run_id: str) -> Path | None:
     path = global_detached_run_path(run_id)
     if path.exists():
@@ -1417,7 +1841,8 @@ def print_operation_status(manifest_path: Path, include_inactive: bool, selected
     updated = state.get("updatedAt") or "-"
     print(
         f"selected={len(rows)} running={counts['running']} completed={counts['completed']} "
-        f"failed={counts['failed']} pending={counts['pending']} updated={updated}"
+        f"failed={counts['failed']} pending={counts['pending']} paused={counts['paused']} "
+        f"killed={counts['killed']} updated={updated}"
     )
     if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
         print("warning: detached run is inactive but state contains running items; run may be stale")
@@ -1519,11 +1944,15 @@ def status_detail(item: dict[str, Any], item_state: dict[str, Any], run_state: d
 
 
 def operation_status_counts(rows: list[dict[str, str]]) -> dict[str, int]:
-    counts = {"running": 0, "completed": 0, "failed": 0, "pending": 0}
+    counts = {"running": 0, "completed": 0, "failed": 0, "pending": 0, "paused": 0, "killed": 0}
     for row in rows:
         status = row["status"]
         if status in DONE_STATUSES:
             counts["completed"] += 1
+        elif status in PAUSED_STATUSES:
+            counts["paused"] += 1
+        elif status == "killed":
+            counts["killed"] += 1
         elif status in {"failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"}:
             counts["failed"] += 1
         elif status in {"queued", "pending"}:
@@ -1583,6 +2012,8 @@ def run_item(
     timeout_seconds: int | None,
     auto_worktrees: dict[str, Any],
     reporter: PlainRunReporter | None = None,
+    resume: bool = False,
+    rerun: bool = False,
 ) -> int:
     reporter = reporter or PlainRunReporter()
     item_id = str(item["id"])
@@ -1599,15 +2030,46 @@ def run_item(
         state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
         reporter.item(item_id, "failed", f"failed before start: {exc}")
         return 1
-    state.mark(item_id, "running", {"startedAt": utc_now(), "runCount": len(runs), **execution})
+    item_state = state.item(item_id)
+    if rerun:
+        state.clear_item_terminal_fields(item_id)
+    item_running_patch = {"startedAt": utc_now() if rerun else item_state.get("startedAt") or utc_now(), "runCount": len(runs), **execution}
+    if resume:
+        item_running_patch["resumedAt"] = utc_now()
+    elif not rerun and item_state.get("resumedAt"):
+        item_running_patch["resumedAt"] = item_state.get("resumedAt")
+    state.mark(item_id, "running", item_running_patch)
     reporter.item(item_id, "running", "running")
+    resumed_paused_run = False
     for run in runs:
         runner = effective_runner(manifest, run)
         run_id = str(run["id"])
+        previous_run_state = state.run(item_id, run_id)
+        use_session_resume = False
+        if resume:
+            previous_status = previous_run_state.get("status")
+            if previous_status == "completed":
+                continue
+            if previous_status == "paused_unresumable":
+                state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": f"paused run is not resumable: {run_id}", **execution})
+                reporter.run(item_id, run_id, "failed", "paused run is not resumable")
+                return 1
+            if previous_status == "paused":
+                use_session_resume = True
+                resumed_paused_run = True
+            elif not resumed_paused_run:
+                continue
         run_timeout = timeout_seconds if timeout_seconds is not None else runner.get("timeoutSeconds")
         try:
-            prompt_text = render_prompt(manifest, item, manifest_path, execution, run, runs)
-            command = build_command(manifest, manifest_path, prompt_text, run_dir, runner)
+            if use_session_resume:
+                session_id = previous_run_state.get("sessionId")
+                if not isinstance(session_id, str) or not session_id:
+                    raise OcmoError(f"paused run is missing opencode sessionId: {item_id}/{run_id}")
+                prompt_text = resume_prompt(item_id, run_id)
+                command = build_resume_command(manifest, manifest_path, prompt_text, session_id, run_dir, runner)
+            else:
+                prompt_text = render_prompt(manifest, item, manifest_path, execution, run, runs)
+                command = build_command(manifest, manifest_path, prompt_text, run_dir, runner)
         except (OSError, OcmoError) as exc:
             state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
             state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
@@ -1615,24 +2077,36 @@ def run_item(
             cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
             return cleanup_code or 1
         output_path = run_output_path(manifest_path, item_id, run_id)
-        state.mark_run(
-            item_id,
-            run_id,
-            "running",
-            {
-                "startedAt": utc_now(),
-                "command": command_without_prompt(command),
-                "timeoutSeconds": run_timeout,
-                "outputPath": relative_to_manifest(output_path, manifest_path),
-                "artifacts": {
-                    artifact_id: artifact_relative_path(manifest_path, item, run_id, artifact_id, config.get("path"))
-                    for artifact_id, config in produced_artifacts(run).items()
-                },
+        running_run_state = {
+            "startedAt": utc_now(),
+            "command": command_without_prompt(command),
+            "timeoutSeconds": run_timeout,
+            "outputPath": relative_to_manifest(output_path, manifest_path),
+            "artifacts": {
+                artifact_id: artifact_relative_path(manifest_path, item, run_id, artifact_id, config.get("path"))
+                for artifact_id, config in produced_artifacts(run).items()
             },
-        )
+        }
+        if resume:
+            running_run_state["sessionId"] = previous_run_state.get("sessionId")
+            running_run_state["resumedAt"] = utc_now()
+        elif not rerun:
+            running_run_state["sessionId"] = previous_run_state.get("sessionId")
+            running_run_state["resumedAt"] = previous_run_state.get("resumedAt")
+        if rerun:
+            state.replace_run(item_id, run_id, "running", running_run_state)
+        else:
+            state.mark_run(item_id, run_id, "running", running_run_state)
         reporter.run(item_id, run_id, "running", "starting")
         try:
-            completed = run_opencode_command(command, run_dir, run_timeout, output_path)
+            completed = run_opencode_command(
+                command,
+                run_dir,
+                run_timeout,
+                output_path,
+                on_start=lambda pid, item_id=item_id, run_id=run_id: state.mark_run(item_id, run_id, "running", {"pid": pid}),
+                on_session=lambda session_id, item_id=item_id, run_id=run_id: state.patch_run(item_id, run_id, {"sessionId": session_id}),
+            )
         except subprocess.TimeoutExpired:
             state.mark_run(item_id, run_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout})
             state.mark(item_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout, **execution})
@@ -1646,6 +2120,9 @@ def run_item(
             cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
             return cleanup_code or 1
         reporter.subprocess_output(item_id, run_id, completed)
+        session_id = extract_session_id(completed.stdout or "")
+        if session_id:
+            state.patch_run(item_id, run_id, {"sessionId": session_id})
         if completed.returncode == 0:
             try:
                 artifacts = verify_required_artifacts(manifest_path, item, run)
@@ -1658,6 +2135,10 @@ def run_item(
             state.mark_run(item_id, run_id, "completed", {"completedAt": utc_now(), "exitCode": 0, "artifacts": artifacts})
             reporter.run(item_id, run_id, "running", "completed")
         else:
+            latest_status = state.run(item_id, run_id).get("status")
+            if latest_status in PAUSED_STATUSES or latest_status == "killed":
+                reporter.run(item_id, run_id, str(latest_status), str(latest_status).replace("_", " "))
+                return 1
             state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": completed.returncode})
             state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": completed.returncode, **execution})
             reporter.run(item_id, run_id, "failed", f"failed: exit {completed.returncode}")
@@ -1856,6 +2337,7 @@ class StateStore:
             data.setdefault("schema", "ocmo-state/v1")
             data.setdefault("operationId", manifest["operation"]["id"])
             data.setdefault("items", {})
+            data["control"] = {"status": "running", "updatedAt": utc_now()}
             data["updatedAt"] = utc_now()
             self._write(data)
 
@@ -1881,6 +2363,37 @@ class StateStore:
             data["updatedAt"] = utc_now()
             self._write(data)
 
+    def replace_run(self, item_id: str, run_id: str, status: str, patch: dict[str, Any]) -> None:
+        with self.lock:
+            data = self._read()
+            data.setdefault("items", {})
+            item_state = data["items"].setdefault(item_id, {})
+            runs = item_state.setdefault("runs", {})
+            runs[run_id] = {**patch, "status": status}
+            data["updatedAt"] = utc_now()
+            self._write(data)
+
+    def clear_item_terminal_fields(self, item_id: str) -> None:
+        with self.lock:
+            data = self._read()
+            data.setdefault("items", {})
+            item_state = data["items"].setdefault(item_id, {})
+            for key in ("completedAt", "exitCode", "error", "pausedAt", "killedAt", "resumedAt"):
+                item_state.pop(key, None)
+            data["updatedAt"] = utc_now()
+            self._write(data)
+
+    def patch_run(self, item_id: str, run_id: str, patch: dict[str, Any]) -> None:
+        with self.lock:
+            data = self._read()
+            data.setdefault("items", {})
+            item_state = data["items"].setdefault(item_id, {})
+            runs = item_state.setdefault("runs", {})
+            run_state = runs.setdefault(run_id, {})
+            run_state.update(patch)
+            data["updatedAt"] = utc_now()
+            self._write(data)
+
     def patch(self, item_id: str, patch: dict[str, Any]) -> None:
         with self.lock:
             data = self._read()
@@ -1889,6 +2402,19 @@ class StateStore:
             item_state.update(patch)
             data["updatedAt"] = utc_now()
             self._write(data)
+
+    def data(self) -> dict[str, Any]:
+        with self.lock:
+            return self._read()
+
+    def item(self, item_id: str) -> dict[str, Any]:
+        item = self.data().get("items", {}).get(item_id, {})
+        return item if isinstance(item, dict) else {}
+
+    def run(self, item_id: str, run_id: str) -> dict[str, Any]:
+        runs = self.item(item_id).get("runs", {})
+        run = runs.get(run_id, {}) if isinstance(runs, dict) else {}
+        return run if isinstance(run, dict) else {}
 
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -2100,11 +2626,15 @@ def run_plan_command(command: list[str], interactive: bool) -> tuple[int, str, s
         return completed.returncode, completed.stdout, completed.stderr
     process = subprocess.Popen(command, stdin=None, stdout=subprocess.PIPE, stderr=None, text=True, encoding="utf-8", errors="replace")
     output_parts = []
-    assert process.stdout is not None
-    for line in process.stdout:
-        print(line, end="")
-        output_parts.append(line)
-    return process.wait(), "".join(output_parts), ""
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="")
+            output_parts.append(line)
+        return process.wait(), "".join(output_parts), ""
+    except KeyboardInterrupt:
+        terminate_process_tree(process.pid, force=True)
+        raise
 
 
 def parse_plan_output(text: str, require_manifest_markers: bool) -> tuple[str, dict[Path, str]]:

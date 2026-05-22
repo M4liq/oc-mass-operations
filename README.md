@@ -51,12 +51,13 @@ $env:PYTHONPATH='src'
 python -m ocmo --help
 ```
 
-## Planning Skill
+## OCMO Skill
 
-This repository ships an optional opencode skill for turning vague mass-operation ideas into approved `ocmo plan` prompts:
+This repository ships an optional opencode skill for working with OCMO commands, manifests, generated operation folders, state, and operation control:
 
 ```text
-skills/ocmo-plan-grill/SKILL.md
+src/ocmo/resources/skill/SKILL.md
+src/ocmo/resources/skill/README.md
 ```
 
 Install it globally with:
@@ -71,9 +72,9 @@ Print the target install path with:
 ocmo skill path
 ```
 
-Use `ocmo skill install --force` to overwrite an existing different copy. Restart opencode after installing the skill. Running sessions keep using the already-loaded skill set.
+`ocmo skill install` updates the installed skill directory when the bundled skill or its handbook changes. It installs both `SKILL.md` and a version-matched `README.md` handbook, and it removes the old managed `ocmo-plan-grill` skill path during migration. Restart opencode after installing the skill. Running sessions keep using the already-loaded skill set.
 
-Use the skill when you want an agent to grill a vague request, format the final planning prompt, get your approval, and then run `ocmo plan`.
+Use `/ocmo` when you want an agent to inspect OCMO manifests, validate or render operations, explain command usage, inspect state and outputs, plan mass operations, or control running work with pause/resume/rerun/kill/erase.
 
 ## How It Works
 
@@ -104,7 +105,7 @@ Core concepts:
 notepad business-taxonomy-prompt.txt
 ```
 
-Describe the work, item boundaries, constraints, and desired output. If the request is vague, use the `ocmo-plan-grill` skill first.
+Describe the work, item boundaries, constraints, and desired output. Use the `/ocmo` skill when you want an agent to help inspect, plan, validate, render, run, or control an OCMO operation.
 
 2. Generate an operation folder.
 
@@ -154,7 +155,13 @@ Review `state.json` beside the manifest for durable execution status. Review per
 | Preview execution | `ocmo run [manifest-or-directory] --select <selector> --dry-run` |
 | Execute foreground | `ocmo run [manifest-or-directory] --select <selector> --yes` |
 | Execute background | `ocmo run [manifest-or-directory] --select <selector> --detach` |
-| Show detached runs/status | `ocmo status` or `ocmo list` |
+| Show operation status | `ocmo status [manifest-or-directory]` |
+| List detached runs | `ocmo list [manifest-or-directory]` |
+| Pause a running operation | `ocmo pause [manifest-or-directory]` |
+| Resume a paused operation | `ocmo resume [manifest-or-directory] --yes` |
+| Fresh-rerun broken work | `ocmo rerun [manifest-or-directory] --select retryable --yes` |
+| Kill a running operation | `ocmo kill [manifest-or-directory] --force` |
+| Erase a generated operation | `ocmo erase .ocmo/<operation>/manifest.yaml --force` |
 
 ## Planning
 
@@ -223,6 +230,34 @@ ocmo status .ocmo/business-taxonomy-prompt
 ```
 
 Set `OCMO_RUN_REGISTRY` to override the global registry location.
+
+## Operation Control
+
+Long-running operations can be stopped, resumed, or removed:
+
+```powershell
+ocmo pause .ocmo/business-taxonomy-prompt
+ocmo resume .ocmo/business-taxonomy-prompt --yes
+ocmo rerun .ocmo/business-taxonomy-prompt --select retryable --yes
+ocmo kill .ocmo/business-taxonomy-prompt --force
+ocmo erase .ocmo/business-taxonomy-prompt --force
+```
+
+`pause` is stop-and-resume, not an operating-system suspend. It terminates the active detached supervisor and any tracked child `opencode run` processes, then marks running items/runs as `paused` when their opencode `sessionId` is known. If a process had not emitted a session id yet, the run is marked `paused_unresumable`.
+
+Pressing `Ctrl+C` during a foreground `ocmo run` uses the same pause semantics: tracked child processes are terminated, active runs are marked `paused` or `paused_unresumable`, and the command exits with code `130`.
+
+Pressing `Ctrl+C` during `ocmo plan` terminates the active planner process when ocmo owns it, prints `ocmo: interrupted`, and exits with code `130` without writing a manifest unless planning had already reached the final write step.
+
+`resume` is strict session continuation. It resumes only paused runs that have a persisted opencode session id and starts them with `opencode run --session <sessionId>`. It never falls back to `opencode --continue` because that can resume the wrong session during concurrent work.
+
+`rerun` is a fresh start and never uses `--session`. By default, `ocmo rerun` selects `retryable` items: `paused_unresumable`, `timed_out`, `failed`, `cleanup_failed`, `worktree_failed`, `setup_failed`, and `killed`. Use `--select unresumable`, `--select timed-out`, `--select failed`, `--select killed`, `--select all`, or explicit item IDs/ranges to narrow or expand the fresh rerun.
+
+If an `opencode run` exceeds `timeoutSeconds`, ocmo terminates the child process tree, marks the run and item `timed_out`, and treats that item as retryable for `ocmo rerun --select timed-out` or the default `--select retryable`.
+
+`kill` terminates tracked processes and marks active items/runs as `killed`, preserving the operation directory, state, outputs, logs, and artifacts for audit.
+
+`erase` runs the same termination step and then deletes the generated operation directory, such as `.ocmo/business-taxonomy-prompt/`. It requires `--force` when non-interactive and refuses manifests outside `.ocmo/<operation>/manifest.yaml`.
 
 ## Selection Rules
 

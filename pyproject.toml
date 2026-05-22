@@ -19,6 +19,9 @@ ocmo = "ocmo.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+ocmo = ["resources/skill/*"]
+
 [tool.coverage.run]
 branch = true
 source = ["ocmo"]

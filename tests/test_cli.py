@@ -90,6 +90,34 @@ items:
 """
 
 
+class FakePopen:
+    pid = 1234
+
+    def __init__(self, command: list[str], returncode: int = 0, stdout: str = "", timeout: bool = False) -> None:
+        self.args = command
+        self.returncode = returncode
+        self.stdout = io.StringIO(stdout)
+        self._stdout_text = stdout
+        self.timeout = timeout
+
+    def communicate(self, timeout: int | None = None):
+        if self.timeout:
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        return self._stdout_text, None
+
+    def wait(self, timeout: int | None = None):
+        if self.timeout:
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        return self.returncode
+
+
+def fake_popen_completed(returncode: int = 0, stdout: str = ""):
+    def fake(command: list[str], **kwargs):
+        return FakePopen(command, returncode, stdout)
+
+    return fake
+
+
 class ValidationTests(OcmoTestCase):
     def test_valid_manifest_passes(self) -> None:
         manifest = self.load()
@@ -516,11 +544,11 @@ class RunManifestTests(OcmoTestCase):
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
         calls: list[list[str]] = []
 
-        def fake_run(command: list[str], **kwargs):
+        def fake_popen(command: list[str], **kwargs):
             calls.append(command)
-            return subprocess.CompletedProcess(command, 0, stdout=f"agent output for {command[-1]}\n")
+            return FakePopen(command, 0, f"agent output for {command[-1]}\n")
 
-        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
 
         self.assertEqual(code, 0)
@@ -550,14 +578,14 @@ class RunManifestTests(OcmoTestCase):
         plan_artifact = self.root / "artifacts" / "1" / "plan" / "plan.md"
         prompts: list[str] = []
 
-        def fake_run(command: list[str], **kwargs):
+        def fake_popen(command: list[str], **kwargs):
             prompts.append(command[-1])
             if "Required Artifacts" in command[-1]:
                 plan_artifact.parent.mkdir(parents=True)
                 plan_artifact.write_text("artifact plan", encoding="utf-8")
-            return subprocess.CompletedProcess(command, 0, stdout="ok")
+            return FakePopen(command, 0, "ok")
 
-        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
 
         self.assertEqual(code, 0)
@@ -571,7 +599,7 @@ class RunManifestTests(OcmoTestCase):
         manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "plan", "agent": "build", "produces": {"plan": {}}}]}
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
 
-        with mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["opencode"], 0, stdout="ok")), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "ok")), contextlib.redirect_stdout(io.StringIO()):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
 
         self.assertEqual(code, 1)
@@ -583,7 +611,7 @@ class RunManifestTests(OcmoTestCase):
         manifest = self.load()
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
 
-        def fake_run(command: list[str], **kwargs):
+        def fake_popen(command: list[str], **kwargs):
             self.assertEqual(kwargs["stdout"], subprocess.PIPE)
             self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
             self.assertEqual(kwargs["encoding"], "utf-8")
@@ -591,9 +619,9 @@ class RunManifestTests(OcmoTestCase):
             self.assertEqual(kwargs["env"]["NO_COLOR"], "1")
             self.assertEqual(kwargs["env"]["FORCE_COLOR"], "0")
             self.assertEqual(kwargs["env"]["TERM"], "dumb")
-            return subprocess.CompletedProcess(command, 0, stdout="\x1b[0mhello\x1b[31m red\x1b[0m\n")
+            return FakePopen(command, 0, "\x1b[0mhello\x1b[31m red\x1b[0m\n")
 
-        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
 
         self.assertEqual(code, 0)
@@ -607,7 +635,7 @@ class RunManifestTests(OcmoTestCase):
         manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "one"}, {"id": "two"}]}
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
 
-        with mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["opencode"], 7)), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(7, "")), contextlib.redirect_stdout(io.StringIO()):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
 
         self.assertEqual(code, 1)
@@ -621,7 +649,7 @@ class RunManifestTests(OcmoTestCase):
         manifest["items"] = [manifest["items"][0]]
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
 
-        with mock.patch("ocmo.cli.subprocess.run", side_effect=subprocess.TimeoutExpired(["opencode"], 1)), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("ocmo.cli.subprocess.Popen", return_value=FakePopen(["opencode"], 0, "", timeout=True)), mock.patch("ocmo.cli.terminate_process_tree"), contextlib.redirect_stdout(io.StringIO()):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, 1, False, True))
 
         self.assertEqual(code, 1)
@@ -630,6 +658,45 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(state["items"]["1"]["runs"]["default"]["status"], "timed_out")
         self.assertEqual(state["items"]["1"]["runs"]["default"]["outputPath"], "outputs/1__default.txt")
         self.assertIn("[ocmo] timed out after 1 seconds", (self.root / "outputs" / "1__default.txt").read_text(encoding="utf-8"))
+
+    def test_run_manifest_ctrl_c_marks_active_runs_paused_and_stops_processes(self) -> None:
+        self.write_manifest()
+
+        def interrupted_worker(manifest, manifest_path, item, state, *args):
+            state.mark(str(item["id"]), "running", {"startedAt": cli.utc_now()})
+            state.mark_run(str(item["id"]), "default", "running", {"pid": 222, "sessionId": "ses-1"})
+            raise KeyboardInterrupt
+
+        stderr = io.StringIO()
+        with mock.patch("ocmo.cli.run_item", side_effect=interrupted_worker), mock.patch("ocmo.cli.terminate_process_tree") as terminate, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 130)
+        self.assertIn("pausing active runs", stderr.getvalue())
+        terminate.assert_called_once_with(222, force=True)
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["items"]["1"]["status"], "paused")
+        self.assertEqual(state["items"]["1"]["runs"]["default"]["status"], "paused")
+
+    def test_run_opencode_command_ctrl_c_terminates_child_and_logs_interrupt(self) -> None:
+        class InterruptingPopen(FakePopen):
+            def communicate(self, timeout: int | None = None):
+                raise KeyboardInterrupt
+
+        output = self.root / "outputs" / "interrupt.txt"
+        with mock.patch("ocmo.cli.subprocess.Popen", return_value=InterruptingPopen(["opencode"], 0, "")), mock.patch("ocmo.cli.terminate_process_tree") as terminate:
+            with self.assertRaises(KeyboardInterrupt):
+                cli.run_opencode_command(["opencode", "run", "prompt"], self.root, None, output)
+
+        terminate.assert_called_once_with(1234, force=True)
+        self.assertIn("[ocmo] interrupted", output.read_text(encoding="utf-8"))
+
+        before_start_output = self.root / "outputs" / "interrupt-before-start.txt"
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=KeyboardInterrupt), mock.patch("ocmo.cli.terminate_process_tree") as terminate_before_start:
+            with self.assertRaises(KeyboardInterrupt):
+                cli.run_opencode_command(["opencode", "run", "prompt"], self.root, None, before_start_output)
+        terminate_before_start.assert_not_called()
+        self.assertIn("[ocmo] interrupted", before_start_output.read_text(encoding="utf-8"))
 
     def test_no_selected_items_returns_zero(self) -> None:
         manifest = self.load()
@@ -720,7 +787,7 @@ class RunManifestTests(OcmoTestCase):
         output = stdout.getvalue()
         self.assertIn("ocmo-active active", output)
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=1 completed=1 failed=0 pending=0 updated=now", output)
+        self.assertIn("selected=2 running=1 completed=1 failed=0 pending=0 paused=0 killed=0 updated=now", output)
         self.assertIn("Item", output)
         self.assertIn("Progress", output)
         self.assertIn("1     running", output)
@@ -860,7 +927,7 @@ class RunManifestTests(OcmoTestCase):
 
         output = stdout.getvalue()
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=0 completed=1 failed=0 pending=1 updated=-", output)
+        self.assertIn("selected=2 running=0 completed=1 failed=0 pending=1 paused=0 killed=0 updated=-", output)
         self.assertIn("1     pending", output)
         self.assertIn("2     completed", output)
         self.assertIn("First", output)
@@ -972,6 +1039,8 @@ class RunManifestTests(OcmoTestCase):
                 "2": {"status": "queued", "startedAt": "2026-05-21T10:00:00"},
                 "state-only": {"status": "running", "worktreePath": "wt-path", "runs": {"default": "bad"}},
                 "blank": {"status": "running"},
+                "paused": {"status": "paused"},
+                "killed": {"status": "killed"},
             }
         }
 
@@ -980,11 +1049,367 @@ class RunManifestTests(OcmoTestCase):
 
         self.assertEqual(counts["failed"], 1)
         self.assertEqual(counts["pending"], 1)
+        self.assertEqual(counts["paused"], 1)
+        self.assertEqual(counts["killed"], 1)
         self.assertEqual(counts["running"], 2)
         self.assertIn("state-only", [row["item"] for row in rows])
         self.assertIn("wt-path", [row["detail"] for row in rows])
         self.assertIn("-", [row["detail"] for row in rows])
         self.assertEqual(cli.parse_state_datetime("not-a-date"), None)
+
+    def test_pause_and_kill_mark_active_runs_and_stop_processes(self) -> None:
+        self.write_manifest()
+        state = {
+            "items": {
+                "1": {"status": "running", "runs": {"default": {"status": "running", "pid": 111, "sessionId": "ses-one"}}},
+                "2": {"status": "running", "runs": {"default": {"status": "running", "pid": 222}}},
+            }
+        }
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        stopped: list[int] = []
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.terminate_process_tree", side_effect=lambda pid, force=True: stopped.append(pid)), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["pause", str(self.manifest_path)]), 0)
+
+        data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["items"]["1"]["status"], "paused")
+        self.assertEqual(data["items"]["2"]["status"], "paused_unresumable")
+        self.assertEqual(sorted(stopped), [111, 222])
+        self.assertIn("paused: test-op", stdout.getvalue())
+
+        data["items"]["1"]["status"] = "running"
+        data["items"]["1"]["runs"]["default"]["status"] = "running"
+        (self.root / "state.json").write_text(json.dumps(data), encoding="utf-8")
+        with mock.patch("ocmo.cli.terminate_process_tree"), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["kill", str(self.manifest_path), "--force"]), 0)
+        data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["items"]["1"]["status"], "killed")
+
+    def test_resume_uses_session_id_and_refuses_unresumable_runs(self) -> None:
+        manifest = self.load()
+        manifest["items"] = [manifest["items"][0]]
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        state = {
+            "items": {
+                "1": {"status": "paused", "runs": {"default": {"status": "paused", "sessionId": "ses-123"}}},
+            }
+        }
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        commands: list[list[str]] = []
+
+        def fake_popen(command: list[str], **kwargs):
+            commands.append(command)
+            return FakePopen(command, 0, '{"sessionID":"ses-123"}\n')
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 0)
+        self.assertIn("--session", commands[0])
+        self.assertIn("ses-123", commands[0])
+        self.assertNotIn("--continue", commands[0])
+
+        state["items"]["1"]["status"] = "paused_unresumable"
+        state["items"]["1"]["runs"]["default"] = {"status": "paused_unresumable"}
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 1)
+
+    def test_rerun_unresumable_starts_fresh_and_clears_stale_run_state(self) -> None:
+        manifest = self.load()
+        manifest["items"] = [manifest["items"][0]]
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        state = {
+            "items": {
+                "1": {
+                    "status": "paused_unresumable",
+                    "error": "old item error",
+                    "completedAt": "then",
+                    "runs": {
+                        "default": {
+                            "status": "paused_unresumable",
+                            "sessionId": "stale-session",
+                            "pid": 999,
+                            "error": "old run error",
+                            "completedAt": "then",
+                            "exitCode": 1,
+                        }
+                    },
+                }
+            }
+        }
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        commands: list[list[str]] = []
+
+        def fake_popen(command: list[str], **kwargs):
+            commands.append(command)
+            return FakePopen(command, 0, "fresh output\n")
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["rerun", str(self.manifest_path), "--select", "unresumable", "--yes", "--ui", "plain"]), 0)
+
+        self.assertEqual(len(commands), 1)
+        self.assertNotIn("--session", commands[0])
+        data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["items"]["1"]["status"], "completed")
+        self.assertNotIn("error", data["items"]["1"])
+        run_state = data["items"]["1"]["runs"]["default"]
+        self.assertEqual(run_state["status"], "completed")
+        self.assertNotIn("sessionId", run_state)
+        self.assertEqual(run_state["pid"], 1234)
+        self.assertNotIn("error", run_state)
+
+    def test_rerun_retryable_selects_timeout_failed_killed_but_not_paused(self) -> None:
+        manifest = self.load(
+            """  - id: "3"
+    title: Third
+    status: pending
+    payload: {}
+  - id: "4"
+    title: Fourth
+    status: pending
+    payload: {}
+  - id: "5"
+    title: Fifth
+    status: pending
+    payload: {}
+"""
+        )
+        state = {
+            "items": {
+                "1": {"status": "timed_out", "runs": {"default": {"status": "timed_out"}}},
+                "2": {"status": "paused", "runs": {"default": {"status": "paused", "sessionId": "ses-2"}}},
+                "3": {"status": "failed", "runs": {"default": {"status": "failed"}}},
+                "4": {"status": "killed", "runs": {"default": {"status": "killed"}}},
+                "5": {"status": "running", "runs": {"default": {"status": "paused_unresumable"}}},
+            }
+        }
+        selected = cli.select_rerun_items(manifest, state, "retryable")
+        self.assertEqual([str(item["id"]) for item in selected], ["1", "3", "4", "5"])
+        self.assertEqual([str(item["id"]) for item in cli.select_rerun_items(manifest, state, "timed-out")], ["1"])
+        self.assertEqual([str(item["id"]) for item in cli.select_rerun_items(manifest, state, "failed")], ["3"])
+        self.assertEqual([str(item["id"]) for item in cli.select_rerun_items(manifest, state, "killed")], ["4"])
+        self.assertEqual([str(item["id"]) for item in cli.select_rerun_items(manifest, state, "all")], ["1", "2", "3", "4", "5"])
+        self.assertEqual([str(item["id"]) for item in cli.select_rerun_items(manifest, state, "1")], ["1"])
+
+    def test_detached_rerun_starts_rerun_child_command(self) -> None:
+        self.write_manifest()
+        registry = self.root / "registry"
+        state = {"items": {"1": {"status": "timed_out", "runs": {"default": {"status": "timed_out"}}}}}
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        captured = {}
+
+        class FakeProcess:
+            pid = 2468
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            return FakeProcess()
+
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.detached_run_id", return_value="ocmo-rerun"), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["rerun", str(self.manifest_path), "--select", "timed-out", "--detach", "--yes"]), 0)
+
+        self.assertIn("rerun", captured["command"])
+        self.assertNotIn("resume", captured["command"])
+        self.assertIn("--select", captured["command"])
+        self.assertIn("timed-out", captured["command"])
+
+    def test_erase_requires_generated_operation_and_removes_directory(self) -> None:
+        self.write_manifest()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["erase", str(self.manifest_path), "--force"]), 2)
+        self.assertIn("generated .ocmo", stderr.getvalue())
+
+        generated_dir = self.root / ".ocmo" / "generated"
+        generated_dir.mkdir(parents=True)
+        generated_manifest = generated_dir / "manifest.yaml"
+        generated_manifest.write_text(self.manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+        (generated_dir / "extra.txt").write_text("x", encoding="utf-8")
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["erase", str(generated_manifest), "--force"]), 0)
+        self.assertFalse(generated_dir.exists())
+        self.assertIn("erased:", stdout.getvalue())
+
+    def test_control_edge_branches_and_helpers(self) -> None:
+        self.write_manifest()
+        registry = self.root / "registry"
+        registry.mkdir()
+        (registry / "bad.json").write_text(json.dumps({"runId": "bad", "pid": 1}), encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["pause", "--run-id", "bad"]), 2)
+        self.assertIn("missing manifestPath", stderr.getvalue())
+        stderr = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["pause", "--run-id", "missing"]), 2)
+        self.assertIn("detached run not found", stderr.getvalue())
+
+        state_path = self.root / "state.json"
+        state_path.write_text(json.dumps({"items": {"x": "bad", "1": {"status": "running", "runs": {"default": {"status": "completed"}}}}}), encoding="utf-8")
+        self.assertEqual(cli.mark_active_runs(state_path, "paused"), 0)
+        self.assertEqual(cli.mark_active_runs(self.root / "missing.json", "paused"), 0)
+        self.assertEqual(cli.active_state_pids({"items": {"x": "bad"}}), [])
+
+        self.assertEqual(cli.extract_session_id("not json\n{"), None)
+        self.assertEqual(cli.extract_session_id('{"session":{}}\n'), None)
+        self.assertEqual(cli.extract_session_id('{"session":"bad"}\n'), None)
+        self.assertEqual(cli.extract_session_id('{"session":{"id":"nested"}}\n'), "nested")
+        self.assertEqual(cli.extract_session_id('{"sessionId":"direct"}\n'), "direct")
+
+        started: list[int] = []
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "ok")):
+            completed = cli.run_opencode_command(["opencode", "run", "prompt"], self.workspace, None, self.root / "output.txt", on_start=started.append)
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(started, [1234])
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "ok")):
+            self.assertEqual(cli.run_opencode_command(["opencode", "run", "prompt"], self.workspace, None, self.root / "output2.txt").returncode, 0)
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=subprocess.TimeoutExpired(["opencode"], 1)), mock.patch("ocmo.cli.terminate_process_tree"):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                cli.run_opencode_command(["opencode", "run", "prompt"], self.workspace, 1, self.root / "timeout.txt")
+
+        stdout = io.StringIO()
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["kill", str(self.manifest_path)]), 1)
+        self.assertIn("Cancelled.", stdout.getvalue())
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="yes"), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["kill", str(self.manifest_path)]), 0)
+
+        record = {"runId": "good", "pid": 333, "manifestPath": str(self.manifest_path), "statePath": str(self.root / "state.json")}
+        (registry / "good.json").write_text(json.dumps(record), encoding="utf-8")
+        stopped: list[int] = []
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.terminate_process_tree", side_effect=lambda pid, force=True: stopped.append(pid)), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["pause", "--run-id", "good"]), 0)
+        self.assertIn(333, stopped)
+        local_related = cli.local_detached_record_path(self.manifest_path, "related")
+        local_related.parent.mkdir(parents=True, exist_ok=True)
+        local_related.write_text(json.dumps({"runId": "related", "pid": 444}), encoding="utf-8")
+        (local_related.parent / "bad-pid.json").write_text(json.dumps({"runId": "bad-pid", "pid": "bad"}), encoding="utf-8")
+        stopped = []
+        with mock.patch("ocmo.cli.terminate_process_tree", side_effect=lambda pid, force=True: stopped.append(pid)):
+            cli.stop_operation_processes(self.manifest_path, {}, None)
+        self.assertIn(444, stopped)
+
+        generated_dir = self.root / ".ocmo" / "cancel"
+        generated_dir.mkdir(parents=True)
+        generated_manifest = generated_dir / "manifest.yaml"
+        generated_manifest.write_text(self.manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch("sys.stdin.isatty", return_value=False), contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["erase", str(generated_manifest)]), 2)
+        self.assertIn("requires --force", stderr.getvalue())
+        stdout = io.StringIO()
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["erase", str(generated_manifest)]), 1)
+        self.assertTrue(generated_dir.exists())
+        self.assertIn("Cancelled.", stdout.getvalue())
+        local_run = cli.local_detached_record_path(generated_manifest, "good")
+        local_run.parent.mkdir(parents=True, exist_ok=True)
+        local_run.write_text(json.dumps({"runId": "good", "pid": 1}), encoding="utf-8")
+        global_run = registry / "good.json"
+        global_run.write_text(json.dumps({"runId": "good", "pid": 1}), encoding="utf-8")
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=True), mock.patch("pathlib.Path.unlink", side_effect=OSError):
+            cli.remove_detached_records(generated_manifest)
+        with mock.patch("ocmo.cli.related_detached_records", return_value=[{"runId": 123}]):
+            cli.remove_detached_records(generated_manifest)
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="yes"), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["erase", str(generated_manifest)]), 0)
+        self.assertFalse(generated_dir.exists())
+
+        self.assertEqual(cli.select_paused_items({"items": ["bad", {"id": "1"}, {"id": "2"}]}, {"items": {"1": "bad", "2": {"runs": {"default": {"status": "completed"}}}}}), [])
+
+    def test_process_termination_helpers(self) -> None:
+        cli.terminate_process_tree(0)
+        with mock.patch("ocmo.cli.process_is_alive", return_value=False):
+            cli.terminate_process_tree(123)
+
+        with mock.patch("ocmo.cli.os.name", "nt"), mock.patch("ocmo.cli.process_is_alive", return_value=True), mock.patch("ocmo.cli.subprocess.run") as run:
+            cli.terminate_process_tree(123, force=False)
+        self.assertNotIn("/F", run.call_args.args[0])
+
+        with mock.patch("ocmo.cli.os.name", "nt"), mock.patch("ocmo.cli.process_is_alive", return_value=True), mock.patch("ocmo.cli.subprocess.run", side_effect=OSError):
+            cli.terminate_process_tree(123)
+
+        with mock.patch("ocmo.cli.os.name", "posix"), mock.patch("ocmo.cli.process_is_alive", return_value=True), mock.patch("ocmo.cli.os.kill", side_effect=ProcessLookupError):
+            cli.terminate_process_tree(123)
+
+        with mock.patch("ocmo.cli.os.name", "posix"), mock.patch("ocmo.cli.process_is_alive", side_effect=[True, False]), mock.patch("ocmo.cli.os.kill") as kill:
+            cli.terminate_process_tree(123)
+        kill.assert_called_once_with(123, cli.signal.SIGTERM)
+
+        with mock.patch("ocmo.cli.os.name", "posix"), mock.patch("ocmo.cli.process_is_alive", side_effect=[True, True, False]), mock.patch("ocmo.cli.time.sleep") as sleep, mock.patch("ocmo.cli.os.kill"):
+            cli.terminate_process_tree(123)
+        sleep.assert_called_once()
+
+        with mock.patch("ocmo.cli.os.name", "posix"), mock.patch("ocmo.cli.process_is_alive", return_value=True), mock.patch("ocmo.cli.time.monotonic", side_effect=[0, 4]), mock.patch("ocmo.cli.os.kill") as kill:
+            cli.terminate_process_tree(123, force=False)
+        kill.assert_called_once_with(123, cli.signal.SIGTERM)
+
+        with mock.patch("ocmo.cli.os.name", "posix"), mock.patch("ocmo.cli.process_is_alive", return_value=True), mock.patch("ocmo.cli.time.monotonic", side_effect=[0, 4]), mock.patch("ocmo.cli.os.kill", side_effect=[None, OSError]):
+            cli.terminate_process_tree(123)
+
+    def test_resume_multistep_skip_and_missing_session_branches(self) -> None:
+        manifest = self.load()
+        manifest["items"] = [manifest["items"][0]]
+        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "done"}, {"id": "one"}, {"id": "two"}, {"id": "three"}]}
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        state = {
+            "items": {
+                "1": {
+                    "status": "paused",
+                    "runs": {
+                        "done": {"status": "completed"},
+                        "one": {"status": "queued"},
+                        "two": {"status": "paused", "sessionId": "ses-two"},
+                    },
+                }
+            }
+        }
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        commands: list[list[str]] = []
+
+        def fake_popen(command: list[str], **kwargs):
+            commands.append(command)
+            return FakePopen(command, 0, '{"sessionID":"ses-two"}\n')
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 0)
+        self.assertEqual(len(commands), 2)
+        self.assertIn("--session", commands[0])
+        self.assertNotIn("--session", commands[1])
+
+        state["items"]["1"]["runs"]["two"] = {"status": "paused"}
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 1)
+
+    def test_run_item_preserves_control_status_after_terminated_child(self) -> None:
+        manifest = self.load()
+        manifest["items"] = [manifest["items"][0]]
+        state = cli.StateStore(self.root / "state.json")
+        state.ensure_operation(manifest)
+
+        def fake_run(command, run_dir, run_timeout, output_path, on_start=None, on_session=None):
+            state.mark_run("1", "default", "paused", {"sessionId": "ses-paused"})
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr=None)
+
+        with mock.patch("ocmo.cli.run_opencode_command", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.run_item(manifest, self.manifest_path, manifest["items"][0], state, None, {"enabled": False}), 1)
+        data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["items"]["1"]["runs"]["default"]["status"], "paused")
+
+    def test_run_item_preserves_existing_resumed_at_on_normal_run(self) -> None:
+        manifest = self.load()
+        manifest["items"] = [manifest["items"][0]]
+        state = cli.StateStore(self.root / "state.json")
+        state.ensure_operation(manifest)
+        state.patch("1", {"resumedAt": "previous-resume"})
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "ok")), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.run_item(manifest, self.manifest_path, manifest["items"][0], state, None, {"enabled": False}), 0)
+
+        data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["items"]["1"]["resumedAt"], "previous-resume")
 
     def test_run_manifest_rejects_single_worktree_runtime_conflicts(self) -> None:
         manifest = self.load()
@@ -1062,7 +1487,7 @@ class RunManifestTests(OcmoTestCase):
         state = cli.StateStore(self.root / "state.json")
         state.ensure_operation(manifest)
 
-        with mock.patch("ocmo.cli.subprocess.run", side_effect=OSError("cannot start")), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=OSError("cannot start")), contextlib.redirect_stdout(io.StringIO()):
             code = cli.run_item(manifest, self.manifest_path, manifest["items"][0], state, None, {"enabled": False})
 
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
@@ -1083,7 +1508,7 @@ class RunManifestTests(OcmoTestCase):
                 return subprocess.CompletedProcess(command, 4)
             return subprocess.CompletedProcess(command, 0)
 
-        with mock.patch("ocmo.cli.ensure_git_repository"), mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("ocmo.cli.ensure_git_repository"), mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "")), contextlib.redirect_stdout(io.StringIO()):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
 
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
@@ -1322,13 +1747,16 @@ class CliEntrypointTests(OcmoTestCase):
             code = cli.main(["skill", "path"])
 
         self.assertEqual(code, 0)
-        self.assertEqual(stdout.getvalue().strip(), str(skills_dir / "ocmo-plan-grill" / "SKILL.md"))
+        self.assertEqual(stdout.getvalue().strip(), str(skills_dir / "ocmo" / "SKILL.md"))
 
     def test_skill_install_writes_source_and_is_idempotent(self) -> None:
-        source = self.root / "source-skill.md"
-        source.write_text("skill text\n", encoding="utf-8")
+        source = self.root / "source-skill"
+        source.mkdir()
+        (source / "SKILL.md").write_text("skill text\n", encoding="utf-8")
+        (source / "README.md").write_text("handbook text\n", encoding="utf-8")
         skills_dir = self.root / "skills-dir"
-        destination = skills_dir / "ocmo-plan-grill" / "SKILL.md"
+        destination = skills_dir / "ocmo" / "SKILL.md"
+        handbook = skills_dir / "ocmo" / "README.md"
         stdout = io.StringIO()
         env = {"OCMO_SKILL_SOURCE": str(source), "OCMO_OPENCODE_SKILLS_DIR": str(skills_dir)}
 
@@ -1339,50 +1767,159 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertEqual(first_code, 0)
         self.assertEqual(second_code, 0)
         self.assertEqual(destination.read_text(encoding="utf-8"), "skill text\n")
+        self.assertEqual(handbook.read_text(encoding="utf-8"), "handbook text\n")
         output = stdout.getvalue()
         self.assertIn("installed:", output)
         self.assertIn("already installed:", output)
         self.assertIn("restart opencode", output)
 
-    def test_skill_install_requires_force_for_different_existing_file(self) -> None:
-        source = self.root / "source-skill.md"
-        source.write_text("new skill\n", encoding="utf-8")
+    def test_skill_install_updates_different_existing_file(self) -> None:
+        source = self.root / "source-skill"
+        source.mkdir()
+        (source / "SKILL.md").write_text("new skill\n", encoding="utf-8")
+        (source / "README.md").write_text("new handbook\n", encoding="utf-8")
         skills_dir = self.root / "skills-dir"
-        destination = skills_dir / "ocmo-plan-grill" / "SKILL.md"
+        destination = skills_dir / "ocmo" / "SKILL.md"
+        handbook = skills_dir / "ocmo" / "README.md"
         destination.parent.mkdir(parents=True)
         destination.write_text("old skill\n", encoding="utf-8")
+        handbook.write_text("old handbook\n", encoding="utf-8")
         env = {"OCMO_SKILL_SOURCE": str(source), "OCMO_OPENCODE_SKILLS_DIR": str(skills_dir)}
-
-        stderr = io.StringIO()
-        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stderr(stderr):
-            code = cli.main(["skill", "install"])
-
-        self.assertEqual(code, 2)
-        self.assertIn("--force", stderr.getvalue())
-        self.assertEqual(destination.read_text(encoding="utf-8"), "old skill\n")
 
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
-            force_code = cli.main(["skill", "install", "--force"])
+            code = cli.main(["skill", "install"])
 
-        self.assertEqual(force_code, 0)
+        self.assertEqual(code, 0)
+        self.assertIn("updated:", stdout.getvalue())
         self.assertEqual(destination.read_text(encoding="utf-8"), "new skill\n")
+        self.assertEqual(handbook.read_text(encoding="utf-8"), "new handbook\n")
+
+    def test_skill_install_removes_old_managed_skill(self) -> None:
+        source = self.root / "source-skill"
+        source.mkdir()
+        (source / "SKILL.md").write_text("new skill\n", encoding="utf-8")
+        skills_dir = self.root / "skills-dir"
+        old_destination = skills_dir / "ocmo-plan-grill" / "SKILL.md"
+        old_destination.parent.mkdir(parents=True)
+        old_destination.write_text("old skill\n", encoding="utf-8")
+        env = {"OCMO_SKILL_SOURCE": str(source), "OCMO_OPENCODE_SKILLS_DIR": str(skills_dir)}
+
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
+            code = cli.main(["skill", "install"])
+
+        self.assertEqual(code, 0)
+        self.assertFalse(old_destination.exists())
+        self.assertFalse(old_destination.parent.exists())
+        self.assertIn("removed old skill:", stdout.getvalue())
+
+    def test_skill_install_keeps_old_skill_directory_when_not_empty(self) -> None:
+        source = self.root / "source-skill"
+        source.mkdir()
+        (source / "SKILL.md").write_text("new skill\n", encoding="utf-8")
+        skills_dir = self.root / "skills-dir"
+        old_destination = skills_dir / "ocmo-plan-grill" / "SKILL.md"
+        old_destination.parent.mkdir(parents=True)
+        old_destination.write_text("old skill\n", encoding="utf-8")
+        marker = old_destination.parent / "notes.txt"
+        marker.write_text("keep\n", encoding="utf-8")
+        env = {"OCMO_SKILL_SOURCE": str(source), "OCMO_OPENCODE_SKILLS_DIR": str(skills_dir)}
+
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(["skill", "install"])
+
+        self.assertEqual(code, 0)
+        self.assertFalse(old_destination.exists())
+        self.assertTrue(marker.exists())
+
+    def test_skill_install_copies_nested_skill_files(self) -> None:
+        source = self.root / "source-skill"
+        source.mkdir()
+        (source / "SKILL.md").write_text("skill\n", encoding="utf-8")
+        nested = source / "reference" / "commands.md"
+        nested.parent.mkdir()
+        nested.write_text("commands\n", encoding="utf-8")
+        skills_dir = self.root / "skills-dir"
+        env = {"OCMO_SKILL_SOURCE": str(source), "OCMO_OPENCODE_SKILLS_DIR": str(skills_dir)}
+
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(["skill", "install"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual((skills_dir / "ocmo" / "reference" / "commands.md").read_text(encoding="utf-8"), "commands\n")
+
+    def test_skill_install_errors_when_source_directory_has_no_skill_file(self) -> None:
+        source = self.root / "source-skill"
+        source.mkdir()
+
+        with self.assertRaisesRegex(cli.OcmoError, "bundled skill file not found"):
+            cli.bundled_skill_files(source)
 
     def test_skill_source_errors_when_configured_path_is_missing(self) -> None:
         with mock.patch.dict("os.environ", {"OCMO_SKILL_SOURCE": str(self.root / "missing.md")}, clear=True):
             with self.assertRaisesRegex(cli.OcmoError, "configured skill source not found"):
                 cli.bundled_skill_path()
 
+    def test_skill_source_accepts_configured_skill_file(self) -> None:
+        source = self.root / "source-skill" / "SKILL.md"
+        source.parent.mkdir()
+        source.write_text("skill\n", encoding="utf-8")
+
+        with mock.patch.dict("os.environ", {"OCMO_SKILL_SOURCE": str(source)}, clear=True):
+            self.assertEqual(cli.bundled_skill_dir(), source.parent)
+
+    def test_skill_source_accepts_configured_file_path(self) -> None:
+        source = self.root / "skill-source" / "SKILL.md"
+        source.parent.mkdir()
+        source.write_text("skill\n", encoding="utf-8")
+
+        with mock.patch.dict("os.environ", {"OCMO_SKILL_SOURCE": str(source)}, clear=True):
+            self.assertEqual(cli.bundled_skill_path(), source)
+
+    def test_bundled_skill_files_collects_nested_files(self) -> None:
+        source = self.root / "skill-source"
+        nested = source / "reference"
+        nested.mkdir(parents=True)
+        (source / "SKILL.md").write_text("skill\n", encoding="utf-8")
+        (source / "z-extra.md").write_text("extra\n", encoding="utf-8")
+        (nested / "guide.md").write_text("guide\n", encoding="utf-8")
+
+        files = cli.bundled_skill_files(source)
+
+        self.assertIn(Path("SKILL.md"), files)
+        self.assertIn(Path("reference") / "guide.md", files)
+        self.assertIn(Path("z-extra.md"), files)
+
+    def test_bundled_skill_files_requires_skill_md(self) -> None:
+        source = self.root / "skill-source"
+        source.mkdir()
+
+        with self.assertRaisesRegex(cli.OcmoError, "SKILL.md"):
+            cli.bundled_skill_files(source)
+
     def test_skill_source_finds_repo_skill_without_override(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual(cli.bundled_skill_path().name, "SKILL.md")
+            self.assertEqual(cli.bundled_skill_dir().joinpath("README.md").name, "README.md")
 
     def test_skill_source_errors_when_repo_skill_cannot_be_found(self) -> None:
         fake_cli = self.root / "isolated" / "src" / "ocmo" / "cli.py"
+        missing_resources = self.root / "missing-resources"
 
-        with mock.patch.dict("os.environ", {}, clear=True), mock.patch("ocmo.cli.__file__", str(fake_cli)):
-            with self.assertRaisesRegex(cli.OcmoError, "bundled skill file not found"):
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch("ocmo.cli.__file__", str(fake_cli)), mock.patch("ocmo.cli.resources.files", return_value=missing_resources):
+            with self.assertRaisesRegex(cli.OcmoError, "bundled skill directory not found"):
                 cli.bundled_skill_path()
+
+    def test_skill_source_falls_back_to_repo_skill_directory(self) -> None:
+        fake_cli = self.root / "repo" / "src" / "ocmo" / "cli.py"
+        skill_dir = self.root / "repo" / "skills" / "ocmo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("skill\n", encoding="utf-8")
+        missing_resources = self.root / "missing-resources"
+
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch("ocmo.cli.__file__", str(fake_cli)), mock.patch("ocmo.cli.resources.files", return_value=missing_resources):
+            self.assertEqual(cli.bundled_skill_dir(), skill_dir)
 
 
 class EdgeCaseCoverageTests(OcmoTestCase):
@@ -1601,7 +2138,7 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         self.assertEqual(code, 1)
         self.prompt.write_text("Prompt $run_id", encoding="utf-8")
 
-        with mock.patch("ocmo.cli.subprocess.run", side_effect=OSError("cannot start")):
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=OSError("cannot start")):
             code = cli.run_item(manifest, self.manifest_path, {"id": "1"}, state, None, {"enabled": False})
         self.assertEqual(code, 1)
 
@@ -1615,7 +2152,7 @@ class EdgeCaseCoverageTests(OcmoTestCase):
             code = cli.run_item(manifest, self.manifest_path, {"id": "1"}, state, None, cli.auto_worktrees_config(manifest))
         self.assertEqual(code, 9)
 
-        with mock.patch("ocmo.cli.prepare_worktree", return_value=0), mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["opencode"], 0)), mock.patch("ocmo.cli.cleanup_worktree", return_value=8):
+        with mock.patch("ocmo.cli.prepare_worktree", return_value=0), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "")), mock.patch("ocmo.cli.cleanup_worktree", return_value=8):
             code = cli.run_item(manifest, self.manifest_path, {"id": "1"}, state, None, cli.auto_worktrees_config(manifest))
         self.assertEqual(code, 8)
 
@@ -1916,6 +2453,35 @@ Generated template for $item_id
         self.assertEqual(out.read_text(encoding="utf-8"), self.planned_manifest_text())
         self.assertIn("Question before final YAML", stdout.getvalue())
 
+    def test_plan_main_ctrl_c_returns_130(self) -> None:
+        prompt = self.root / "request.txt"
+        prompt.write_text("Request", encoding="utf-8")
+
+        stderr = io.StringIO()
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=KeyboardInterrupt), contextlib.redirect_stderr(stderr):
+            code = cli.main(["plan", "--from", str(prompt), "--out", str(self.root / "out.yaml")])
+
+        self.assertEqual(code, 130)
+        self.assertIn("ocmo: interrupted", stderr.getvalue())
+
+    def test_plan_interactive_ctrl_c_terminates_child(self) -> None:
+        class InterruptingStdout:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise KeyboardInterrupt
+
+        process = mock.Mock()
+        process.pid = 4321
+        process.stdout = InterruptingStdout()
+
+        with mock.patch("ocmo.cli.subprocess.Popen", return_value=process), mock.patch("ocmo.cli.terminate_process_tree") as terminate:
+            with self.assertRaises(KeyboardInterrupt):
+                cli.run_plan_command(["opencode", "run", "prompt"], interactive=True)
+
+        terminate.assert_called_once_with(4321, force=True)
+
     def test_plan_reporter_selection_and_plain_output(self) -> None:
         args = mock.Mock(agent="build", model=None)
         with mock.patch("sys.stderr.isatty", return_value=False):
@@ -2072,7 +2638,7 @@ Generated template for $item_id
 
     def test_final_branch_coverage_for_confirmation_worktrees_and_invalid_branch(self) -> None:
         self.write_manifest()
-        with mock.patch("builtins.input", return_value="yes"), mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["opencode"], 0)), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("builtins.input", return_value="yes"), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "")), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, False)), 0)
 
         manifest = self.load()
