@@ -111,13 +111,15 @@ Shows operation item/run status and detached run information.
 - `--run-id <run-id>` resolves detached metadata and shows that run's operation status.
 - `--all` includes inactive detached run sessions.
 
+When `opencode run --format json` reports step usage, status shows operation token totals and a per-item `Tokens` column formatted as `input/output`.
+
 ### `ocmo list`
 
 ```powershell
 ocmo list [manifest-or-directory] [--run-id <run-id>] [--all]
 ```
 
-Lists detached run sessions. Use `--all` to include inactive sessions.
+Lists detached run sessions. Use `--all` to include inactive sessions. `ocmo list --run-id <run-id>` includes a state summary with token totals when usage is available.
 
 ### `ocmo pause`
 
@@ -422,7 +424,7 @@ Use `queue.autoWorktrees.enabled: true` when items may edit overlapping files, w
 
 ## State And Outputs
 
-`ocmo run` writes durable state to the manifest's configured state path. State records execution facts such as item status, run status, start/completion times, exit codes, output paths, worktree metadata, process IDs, and opencode session IDs.
+`ocmo run` writes durable state to the manifest's configured state path. State records execution facts such as item status, run status, start/completion times, exit codes, output paths, worktree metadata, process IDs, opencode session IDs, and per-run token usage when `opencode` reports it.
 
 Per-run `opencode` stdout/stderr is written under `outputs/` beside the manifest. This keeps concurrent agent output from corrupting the terminal UI and makes long-running work inspectable after the fact.
 

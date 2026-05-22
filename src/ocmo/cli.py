@@ -993,6 +993,9 @@ class PlainRunReporter:
         message = detail or status.replace("_", " ")
         print(f"[{item_id}/{run_id}] {message}")
 
+    def usage(self, item_id: str, run_id: str, usage: dict[str, Any]) -> None:
+        return None
+
     def worker_error(self, item_id: str, error: Exception) -> None:
         print(f"[{item_id}] unexpected worker error: {error}")
 
@@ -1099,6 +1102,13 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
             self.events.appendleft(f"{item_id}/{run_id}: {run_detail}")
         self.refresh()
 
+    def usage(self, item_id: str, run_id: str, usage: dict[str, Any]) -> None:
+        with self.lock:
+            item = self.items.setdefault(item_id, {"progress": "0/1", "step": "-", "detail": "-", "started": None, "ended": None})
+            item["usage"] = usage
+            item["step"] = run_id
+        self.refresh()
+
     def worker_error(self, item_id: str, error: Exception) -> None:
         self.item(item_id, "failed", f"unexpected worker error: {error}")
 
@@ -1125,7 +1135,8 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
         title = Text(f"OC Mass Operations: {self.operation_id or '-'}", style="bold cyan")
         summary = Text(
             f"selected={len(self.items)} running={counts['running']} completed={counts['completed']} "
-            f"failed={counts['failed']} pending={counts['pending']} concurrency={self.concurrency} elapsed={elapsed}"
+            f"failed={counts['failed']} pending={counts['pending']} concurrency={self.concurrency} elapsed={elapsed} "
+            f"{format_usage_summary(sum_usage(item.get('usage') for item in self.items.values()))}"
         )
         if self.auto_worktrees:
             summary.append(" autoWorktrees=true")
@@ -1135,13 +1146,22 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
         table.add_column("Step", no_wrap=True)
         table.add_column("Progress", no_wrap=True)
         table.add_column("Runtime", no_wrap=True)
+        table.add_column("Tokens", no_wrap=True)
         table.add_column("Detail")
         with self.lock:
             rows = list(self.items.items())
             events = list(self.events)
         for item_id, item in rows:
             runtime = item_runtime(item, time.monotonic())
-            table.add_row(item_id, str(item.get("status", "-")), str(item.get("step", "-")), str(item.get("progress", "-")), runtime, str(item.get("detail", "-")))
+            table.add_row(
+                item_id,
+                str(item.get("status", "-")),
+                str(item.get("step", "-")),
+                str(item.get("progress", "-")),
+                runtime,
+                format_usage_cell(item.get("usage")),
+                str(item.get("detail", "-")),
+            )
         event_text = "\n".join(events) if events else "No events yet."
         return Group(title, summary, table, Panel(event_text, title="Recent Events"))
 
@@ -1225,6 +1245,7 @@ def run_opencode_command(
     output_path: Path,
     on_start: Any | None = None,
     on_session: Any | None = None,
+    on_usage: Any | None = None,
 ) -> subprocess.CompletedProcess:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     env = opencode_capture_env()
@@ -1253,10 +1274,16 @@ def run_opencode_command(
                     session_id = extract_session_id(line)
                     if session_id:
                         on_session(session_id)
+                    usage = extract_usage_delta(line)
+                    if usage and on_usage:
+                        on_usage(usage)
                 process.wait(timeout=run_timeout)
                 stdout = "".join(chunks)
             else:
                 stdout, _ = process.communicate(timeout=run_timeout)
+                if on_usage:
+                    for usage in extract_usage_deltas(stdout or ""):
+                        on_usage(usage)
         except subprocess.TimeoutExpired:
             if process is not None:
                 terminate_process_tree(process.pid, force=True)
@@ -1298,6 +1325,122 @@ def extract_session_id(output: str) -> str | None:
             if isinstance(value, str) and value:
                 return value
     return None
+
+
+def empty_usage() -> dict[str, Any]:
+    return {"input": 0, "output": 0, "reasoning": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0, "cost": 0, "steps": 0}
+
+
+def extract_usage_deltas(output: str) -> list[dict[str, Any]]:
+    return [usage for line in output.splitlines() if (usage := extract_usage_delta(line))]
+
+
+def extract_usage_delta(output_line: str) -> dict[str, Any] | None:
+    line = output_line.strip()
+    if not line.startswith("{"):
+        return None
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    part = event.get("part") if isinstance(event, dict) else None
+    if not isinstance(part, dict):
+        return None
+    if event.get("type") != "step_finish" and part.get("type") != "step-finish":
+        return None
+    tokens = part.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+    usage = empty_usage()
+    usage["input"] = usage_int(tokens.get("input"))
+    usage["output"] = usage_int(tokens.get("output"))
+    usage["reasoning"] = usage_int(tokens.get("reasoning"))
+    usage["cacheRead"] = usage_int(cache.get("read"))
+    usage["cacheWrite"] = usage_int(cache.get("write"))
+    usage["total"] = usage_int(tokens.get("total"))
+    usage["cost"] = usage_number(part.get("cost"))
+    usage["steps"] = 1
+    return usage
+
+
+def usage_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return 0
+
+
+def usage_number(value: Any) -> int | float:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return value
+    return 0
+
+
+def add_usage(base: dict[str, Any] | None, delta: dict[str, Any] | None) -> dict[str, Any]:
+    result = empty_usage()
+    for source in (base, delta):
+        if not isinstance(source, dict):
+            continue
+        for key in result:
+            result[key] += usage_number(source.get(key))
+    if isinstance(result["cost"], float) and result["cost"].is_integer():
+        result["cost"] = int(result["cost"])
+    return result
+
+
+def sum_usage(usages: Any) -> dict[str, Any]:
+    result = empty_usage()
+    if not usages:
+        return result
+    for usage in usages:
+        result = add_usage(result, usage if isinstance(usage, dict) else None)
+    return result
+
+
+def item_usage(item_state: dict[str, Any]) -> dict[str, Any]:
+    runs = item_state.get("runs") if isinstance(item_state.get("runs"), dict) else {}
+    return sum_usage(run.get("usage") for run in runs.values() if isinstance(run, dict))
+
+
+def state_usage(state: dict[str, Any]) -> dict[str, Any]:
+    items = state.get("items") if isinstance(state.get("items"), dict) else {}
+    return sum_usage(item_usage(item) for item in items.values() if isinstance(item, dict))
+
+
+def format_token_count(value: Any) -> str:
+    count = usage_int(value)
+    if count <= 0:
+        return "-"
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}m"
+    if count >= 1_000:
+        return f"{count / 1_000:.1f}k"
+    return str(count)
+
+
+def format_usage_summary(usage: dict[str, Any] | None) -> str:
+    usage = usage if isinstance(usage, dict) else empty_usage()
+    if usage_int(usage.get("steps")) == 0 and usage_int(usage.get("total")) == 0:
+        return "tokens=-"
+    cache_total = usage_int(usage.get("cacheRead")) + usage_int(usage.get("cacheWrite"))
+    return (
+        f"tokens={format_token_count(usage.get('total'))} "
+        f"in={format_token_count(usage.get('input'))} "
+        f"out={format_token_count(usage.get('output'))} "
+        f"cache={format_token_count(cache_total)}"
+    )
+
+
+def format_usage_cell(usage: Any) -> str:
+    if not isinstance(usage, dict) or (usage_int(usage.get("steps")) == 0 and usage_int(usage.get("total")) == 0):
+        return "-"
+    return f"{format_token_count(usage.get('input'))}/{format_token_count(usage.get('output'))}"
 
 
 def strip_ansi(text: str) -> str:
@@ -1842,7 +1985,7 @@ def print_operation_status(manifest_path: Path, include_inactive: bool, selected
     print(
         f"selected={len(rows)} running={counts['running']} completed={counts['completed']} "
         f"failed={counts['failed']} pending={counts['pending']} paused={counts['paused']} "
-        f"killed={counts['killed']} updated={updated}"
+        f"killed={counts['killed']} {format_usage_summary(state_usage(state))} updated={updated}"
     )
     if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
         print("warning: detached run is inactive but state contains running items; run may be stale")
@@ -1886,6 +2029,7 @@ def operation_status_rows(manifest: dict[str, Any], state: dict[str, Any]) -> li
                 "step": run_id or "-",
                 "progress": progress,
                 "runtime": persisted_item_runtime(item_state, now),
+                "tokens": format_usage_cell(item_usage(item_state)),
                 "detail": status_detail(item, item_state, run_state),
             }
         )
@@ -1963,8 +2107,8 @@ def operation_status_counts(rows: list[dict[str, str]]) -> dict[str, int]:
 
 
 def print_status_table(rows: list[dict[str, str]]) -> None:
-    headers = ["Item", "Status", "Step", "Progress", "Runtime", "Detail"]
-    keys = ["item", "status", "step", "progress", "runtime", "detail"]
+    headers = ["Item", "Status", "Step", "Progress", "Runtime", "Tokens", "Detail"]
+    keys = ["item", "status", "step", "progress", "runtime", "tokens", "detail"]
     widths = [len(header) for header in headers]
     for row in rows:
         for index, key in enumerate(keys):
@@ -2002,6 +2146,7 @@ def print_state_summary(state: dict[str, Any]) -> None:
     updated = state.get("updatedAt")
     if updated:
         print(f"updated: {updated}")
+    print(format_usage_summary(state_usage(state)))
 
 
 def run_item(
@@ -2098,6 +2243,14 @@ def run_item(
         else:
             state.mark_run(item_id, run_id, "running", running_run_state)
         reporter.run(item_id, run_id, "running", "starting")
+        usage_total = empty_usage()
+
+        def record_usage(delta: dict[str, Any], item_id: str = item_id, run_id: str = run_id) -> None:
+            nonlocal usage_total
+            usage_total = add_usage(usage_total, delta)
+            state.patch_run(item_id, run_id, {"usage": usage_total})
+            reporter.usage(item_id, run_id, usage_total)
+
         try:
             completed = run_opencode_command(
                 command,
@@ -2106,6 +2259,7 @@ def run_item(
                 output_path,
                 on_start=lambda pid, item_id=item_id, run_id=run_id: state.mark_run(item_id, run_id, "running", {"pid": pid}),
                 on_session=lambda session_id, item_id=item_id, run_id=run_id: state.patch_run(item_id, run_id, {"sessionId": session_id}),
+                on_usage=record_usage,
             )
         except subprocess.TimeoutExpired:
             state.mark_run(item_id, run_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout})
@@ -2132,8 +2286,12 @@ def run_item(
                 reporter.run(item_id, run_id, "failed", str(exc))
                 cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
                 return cleanup_code or 1
-            state.mark_run(item_id, run_id, "completed", {"completedAt": utc_now(), "exitCode": 0, "artifacts": artifacts})
-            reporter.run(item_id, run_id, "running", "completed")
+            completion_patch: dict[str, Any] = {"completedAt": utc_now(), "exitCode": 0, "artifacts": artifacts}
+            if usage_total.get("steps"):
+                completion_patch["usage"] = usage_total
+            state.mark_run(item_id, run_id, "completed", completion_patch)
+            usage_detail = f"completed {format_usage_summary(usage_total)}" if usage_total.get("steps") else "completed"
+            reporter.run(item_id, run_id, "running", usage_detail)
         else:
             latest_status = state.run(item_id, run_id).get("status")
             if latest_status in PAUSED_STATUSES or latest_status == "killed":

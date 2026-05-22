@@ -564,6 +564,61 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("agent output for", (self.root / "outputs" / "1__one.txt").read_text(encoding="utf-8"))
         self.assertIn("[ocmo] exit code: 0", (self.root / "outputs" / "1__two.txt").read_text(encoding="utf-8"))
 
+    def test_run_manifest_persists_opencode_token_usage(self) -> None:
+        manifest = self.load()
+        manifest["items"] = [manifest["items"][0]]
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        stdout = "\n".join(
+            [
+                '{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":100,"input":40,"output":10,"reasoning":5,"cache":{"read":45,"write":0}},"cost":0.01}}',
+                "not json",
+                '{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":50,"input":20,"output":4,"reasoning":1,"cache":{"read":25,"write":0}},"cost":0.02}}',
+            ]
+        )
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, stdout)), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 0)
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        usage = state["items"]["1"]["runs"]["default"]["usage"]
+        self.assertEqual(usage["total"], 150)
+        self.assertEqual(usage["input"], 60)
+        self.assertEqual(usage["output"], 14)
+        self.assertEqual(usage["reasoning"], 6)
+        self.assertEqual(usage["cacheRead"], 70)
+        self.assertEqual(usage["steps"], 2)
+        self.assertEqual(usage["cost"], 0.03)
+
+    def test_usage_parsing_ignores_non_step_events(self) -> None:
+        self.assertIsNone(cli.extract_usage_delta("not json"))
+        self.assertIsNone(cli.extract_usage_delta("{"))
+        self.assertIsNone(cli.extract_usage_delta('{"type":"text","part":{"tokens":{"total":9}}}'))
+        self.assertIsNone(cli.extract_usage_delta('{"type":"step_finish","part":{}}'))
+        usage = cli.extract_usage_delta('{"type":"step_finish","part":{"tokens":{"total":9,"input":3,"output":2,"cache":{"read":4,"write":1}}}}')
+        self.assertEqual(usage["total"], 9)
+        self.assertEqual(usage["cacheRead"], 4)
+        self.assertEqual(usage["cacheWrite"], 1)
+        self.assertEqual(len(cli.extract_usage_deltas("x\n{")), 0)
+        self.assertEqual(cli.usage_int(True), 0)
+        self.assertEqual(cli.usage_int(1.9), 1)
+        self.assertEqual(cli.usage_number(False), 0)
+        self.assertEqual(cli.add_usage({"cost": 1.0}, None)["cost"], 1)
+        self.assertEqual(cli.sum_usage(None)["total"], 0)
+        self.assertEqual(cli.format_token_count(0), "-")
+        self.assertEqual(cli.format_token_count(1_200_000), "1.2m")
+
+    def test_run_opencode_command_reports_usage_without_session_callback(self) -> None:
+        output = self.root / "outputs" / "usage.txt"
+        events = ['{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":12,"input":8,"output":4}}}']
+        usage: list[dict[str, object]] = []
+
+        with mock.patch("ocmo.cli.subprocess.Popen", return_value=FakePopen(["opencode"], 0, "\n".join(events))):
+            completed = cli.run_opencode_command(["opencode", "run", "prompt"], self.root, None, output, on_usage=usage.append)
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(usage[0]["total"], 12)
+
     def test_run_manifest_chains_required_artifacts(self) -> None:
         manifest = self.load()
         manifest["items"] = [manifest["items"][0]]
@@ -787,12 +842,42 @@ class RunManifestTests(OcmoTestCase):
         output = stdout.getvalue()
         self.assertIn("ocmo-active active", output)
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=1 completed=1 failed=0 pending=0 paused=0 killed=0 updated=now", output)
+        self.assertIn("selected=2 running=1 completed=1 failed=0 pending=0 paused=0 killed=0 tokens=- updated=now", output)
         self.assertIn("Item", output)
         self.assertIn("Progress", output)
+        self.assertIn("Tokens", output)
         self.assertIn("1     running", output)
         self.assertIn("outputs/1__default.txt", output)
         self.assertIn("02:03", output)
+
+    def test_status_and_list_details_show_token_usage(self) -> None:
+        self.write_manifest()
+        registry = self.root / "registry"
+        registry.mkdir()
+        state = {
+            "updatedAt": "now",
+            "items": {
+                "1": {
+                    "status": "completed",
+                    "startedAt": "2026-05-21T10:00:00+00:00",
+                    "completedAt": "2026-05-21T10:00:10+00:00",
+                    "runCount": 1,
+                    "runs": {"default": {"status": "completed", "usage": {"total": 1500, "input": 400, "output": 100, "reasoning": 0, "cacheRead": 1000, "cacheWrite": 0, "cost": 0, "steps": 1}}},
+                }
+            },
+        }
+        (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        record = {"runId": "usage", "pid": 123, "startedAt": "then", "manifestPath": str(self.manifest_path), "statePath": str(self.root / "state.json")}
+        (registry / "usage.json").write_text(json.dumps(record), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=True), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["status", str(self.manifest_path)]), 0)
+            self.assertEqual(cli.main(["list", "--run-id", "usage"]), 0)
+
+        output = stdout.getvalue()
+        self.assertIn("tokens=1.5k in=400 out=100 cache=1.0k", output)
+        self.assertIn("400/100", output)
 
     def test_status_errors_for_missing_run_id_and_filters_inactive(self) -> None:
         registry = self.root / "registry"
@@ -927,7 +1012,7 @@ class RunManifestTests(OcmoTestCase):
 
         output = stdout.getvalue()
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=0 completed=1 failed=0 pending=1 paused=0 killed=0 updated=-", output)
+        self.assertIn("selected=2 running=0 completed=1 failed=0 pending=1 paused=0 killed=0 tokens=- updated=-", output)
         self.assertIn("1     pending", output)
         self.assertIn("2     completed", output)
         self.assertIn("First", output)
@@ -1389,7 +1474,7 @@ class RunManifestTests(OcmoTestCase):
         state = cli.StateStore(self.root / "state.json")
         state.ensure_operation(manifest)
 
-        def fake_run(command, run_dir, run_timeout, output_path, on_start=None, on_session=None):
+        def fake_run(command, run_dir, run_timeout, output_path, on_start=None, on_session=None, on_usage=None):
             state.mark_run("1", "default", "paused", {"sessionId": "ses-paused"})
             return subprocess.CompletedProcess(command, 1, stdout="", stderr=None)
 

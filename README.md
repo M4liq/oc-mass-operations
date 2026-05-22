@@ -143,7 +143,7 @@ ocmo status .ocmo/business-taxonomy-prompt
 ocmo status --run-id <run-id>
 ```
 
-Review `state.json` beside the manifest for durable execution status. Review per-run agent output under `outputs/` beside the manifest.
+Review `state.json` beside the manifest for durable execution status, including per-run token usage when `opencode` reports it. Review per-run agent output under `outputs/` beside the manifest.
 
 ## Commands
 
@@ -212,6 +212,8 @@ Useful options:
 
 If `policy.worktree: single` uses concurrency above `1`, `ocmo run` requires `--allow-shared-worktree-concurrency`. Use that only when selected item scopes are explicitly non-overlapping.
 
+Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata. `ocmo status` summarizes operation token usage and includes a compact per-item `Tokens` column formatted as `input/output`.
+
 ## Detached Runs
 
 `--detach` starts a child `ocmo run` with `--yes` and `--ui plain`, then returns immediately:
@@ -230,6 +232,8 @@ ocmo status .ocmo/business-taxonomy-prompt
 ```
 
 Set `OCMO_RUN_REGISTRY` to override the global registry location.
+
+Use `ocmo status --run-id <run-id>` to inspect token usage for detached runs. `ocmo list --run-id <run-id>` also includes a token summary in its detailed state section.
 
 ## Operation Control
 
