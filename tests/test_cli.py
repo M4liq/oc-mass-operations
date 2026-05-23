@@ -2749,7 +2749,7 @@ Generated template for $item_id
 class WorkflowTests(OcmoTestCase):
     def write_operation_manifest(self, name: str, state_name: str | None = None) -> Path:
         directory = self.root / name
-        directory.mkdir()
+        directory.mkdir(exist_ok=True)
         prompt = directory / "prompt.md"
         prompt.write_text("Item $item_id", encoding="utf-8")
         manifest = directory / "manifest.yaml"
@@ -2789,7 +2789,6 @@ workflow:
 state:
   path: workflow-state.json
 defaults:
-  operationSelect: uncompleted
   stopOnFailure: true
 steps:
   - id: first
@@ -2812,7 +2811,31 @@ steps:
         output = stdout.getvalue()
         self.assertIn("valid:", output)
         self.assertIn("ocmo operation run", output)
-        self.assertIn("--select uncompleted", output)
+        self.assertNotIn("--select", output)
+
+    def test_workflow_rejects_operation_overrides(self) -> None:
+        for extra in ("defaults:\n  operationSelect: uncompleted\n", "defaults:\n  concurrency: 2\n", "defaults:\n  timeoutSeconds: 30\n", "defaults:\n  allowSharedWorktreeConcurrency: true\n"):
+            workflow, _, _ = self.write_workflow(extra=extra)
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(cli.main(["workflow", "validate", str(workflow)]), 2)
+
+            self.assertIn("is not supported in workflows", stderr.getvalue())
+
+    def test_workflow_rejects_step_operation_overrides(self) -> None:
+        workflow, _, _ = self.write_workflow(
+            extra="""  - id: third
+    manifest: missing.yaml
+    timeoutSeconds: 30
+"""
+        )
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["workflow", "validate", str(workflow)]), 2)
+
+        self.assertIn("steps[3].timeoutSeconds is not supported in workflows", stderr.getvalue())
 
     def test_workflow_run_writes_step_state_and_stops_on_failure(self) -> None:
         workflow, first, second = self.write_workflow()
@@ -2831,7 +2854,7 @@ steps:
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["steps"]["first"]["status"], "failed")
 
-    def test_workflow_rerun_defaults_operation_select_to_retryable(self) -> None:
+    def test_workflow_rerun_delegates_operation_selection(self) -> None:
         workflow, first, _ = self.write_workflow()
         (self.root / "workflow-state.json").write_text(
             json.dumps({"schema": "ocmo-workflow-state/v1", "workflowId": "test-workflow", "steps": {"first": {"status": "failed"}}}),
@@ -2844,7 +2867,7 @@ steps:
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].manifest_path, first)
-        self.assertEqual(calls[0].select, "retryable")
+        self.assertIsNone(calls[0].select)
         self.assertTrue(calls[0].rerun)
 
     def test_workflow_step_rerun_clears_stale_terminal_fields(self) -> None:

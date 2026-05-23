@@ -238,18 +238,13 @@ state:
   path: state.json
 
 defaults:
-  operationSelect: uncompleted
   stopOnFailure: true
-  concurrency: null
-  timeoutSeconds: null
-  allowSharedWorktreeConcurrency: false
 
 steps:
   - id: plan-docs
     manifest: ../plan-docs/manifest.yaml
   - id: implement-docs
     manifest: ../implement-docs/manifest.yaml
-    operationSelect: uncompleted
 ```
 
 Workflow commands:
@@ -266,7 +261,7 @@ ocmo workflow rerun workflow.yaml --detach
 ocmo workflow kill workflow.yaml --force
 ```
 
-Workflow `--select` selects workflow steps. Step `operationSelect` selects operation items. `ocmo workflow rerun` defaults to retryable workflow steps and uses `operationSelect: retryable` unless the selected step explicitly defines `operationSelect`.
+Workflow `--select` selects workflow steps, not operation items. Referenced operation manifests control their own item selection, concurrency, timeouts, and worktree safety policy.
 
 ## Detached Runs
 

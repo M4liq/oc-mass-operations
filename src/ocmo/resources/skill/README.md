@@ -219,18 +219,13 @@ state:
   path: state.json
 
 defaults:
-  operationSelect: uncompleted
   stopOnFailure: true
-  concurrency: null
-  timeoutSeconds: null
-  allowSharedWorktreeConcurrency: false
 
 steps:
   - id: plan-docs
     manifest: ../plan-docs/manifest.yaml
   - id: implement-docs
     manifest: ../implement-docs/manifest.yaml
-    operationSelect: uncompleted
 ```
 
 Workflow commands:
@@ -250,9 +245,9 @@ ocmo workflow kill workflow.yaml --force
 Workflow facts:
 
 - Workflow `--select` selects workflow steps, not operation items.
-- `operationSelect` selects items inside the referenced operation manifest.
+- Referenced operation manifests control their own item selection, concurrency, timeouts, and worktree safety policy.
 - Workflow state records orchestration status; operation state remains authoritative for items, runs, sessions, outputs, artifacts, and token usage.
-- `ocmo workflow rerun` defaults to retryable workflow steps and uses operation `retryable` selection unless a selected step explicitly defines `operationSelect`.
+- `ocmo workflow rerun` defaults to retryable workflow steps, then delegates operation item selection to each referenced operation.
 - `ocmo workflow pause` and `ocmo workflow kill` delegate to the active operation step and preserve operation files.
 
 ## Selection Rules

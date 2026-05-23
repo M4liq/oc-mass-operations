@@ -902,22 +902,16 @@ def validate_workflow(workflow: dict[str, Any], workflow_path: Path) -> None:
         validate_workflow_options(step, f"steps[{index}]")
         manifest_path = workflow_step_manifest_path(workflow_path, step)
         manifest = load_manifest(manifest_path)
-        validate_manifest(manifest, manifest_path, workflow_step_bool(workflow, step, "allowSharedWorktreeConcurrency"))
+        validate_manifest(manifest, manifest_path)
 
 
 def validate_workflow_options(options: dict[str, Any], field: str) -> None:
-    for key in ("operationSelect",):
-        value = options.get(key)
-        if value is not None and (not isinstance(value, str) or not value.strip()):
-            raise OcmoError(f"{field}.{key} must be a non-empty string")
-    for key in ("concurrency", "timeoutSeconds"):
-        value = options.get(key)
-        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
-            raise OcmoError(f"{field}.{key} must be a positive integer")
-    for key in ("allowSharedWorktreeConcurrency", "stopOnFailure"):
-        value = options.get(key)
-        if value is not None and not isinstance(value, bool):
-            raise OcmoError(f"{field}.{key} must be a boolean")
+    for key in ("operationSelect", "concurrency", "timeoutSeconds", "allowSharedWorktreeConcurrency"):
+        if key in options:
+            raise OcmoError(f"{field}.{key} is not supported in workflows; configure operation selection and execution policy in the operation manifest")
+    value = options.get("stopOnFailure")
+    if value is not None and not isinstance(value, bool):
+        raise OcmoError(f"{field}.stopOnFailure must be a boolean")
 
 
 def workflow_step_manifest_path(workflow_path: Path, step: dict[str, Any]) -> Path:
@@ -933,25 +927,6 @@ def workflow_step_value(workflow: dict[str, Any], step: dict[str, Any], key: str
         return step.get(key)
     defaults = workflow.get("defaults") if isinstance(workflow.get("defaults"), dict) else {}
     return defaults.get(key, default)
-
-
-def workflow_step_operation_select(workflow: dict[str, Any], step: dict[str, Any], rerun: bool = False) -> str:
-    if rerun:
-        value = step.get("operationSelect")
-        return value.strip() if isinstance(value, str) and value.strip() else "retryable"
-    value = workflow_step_value(workflow, step, "operationSelect")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return "retryable" if rerun else "uncompleted"
-
-
-def workflow_step_bool(workflow: dict[str, Any], step: dict[str, Any], key: str) -> bool:
-    return bool(workflow_step_value(workflow, step, key, False))
-
-
-def workflow_step_int(workflow: dict[str, Any], step: dict[str, Any], key: str) -> int | None:
-    value = workflow_step_value(workflow, step, key)
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def workflow_step_stop_on_failure(workflow: dict[str, Any], step: dict[str, Any]) -> bool:
@@ -1019,7 +994,7 @@ def print_workflow_dry_run(workflow: dict[str, Any], workflow_path: Path, select
     print(f"steps: {len(selected)}")
     for step in selected:
         manifest_path = workflow_step_manifest_path(workflow_path, step)
-        print(f"- {step['id']}: ocmo operation {action} {quote_arg(str(manifest_path))} --select {quote_arg(workflow_step_operation_select(workflow, step, rerun))}")
+        print(f"- {step['id']}: ocmo operation {action} {quote_arg(str(manifest_path))}")
 
 
 def item_state_matches_statuses(item_state: dict[str, Any], statuses: set[str]) -> bool:
@@ -2088,7 +2063,6 @@ def run_workflow_step(workflow: dict[str, Any], workflow_path: Path, step: dict[
     manifest = load_manifest(manifest_path)
     operation_state_path = state_path(manifest, manifest_path)
     operation_id = str(manifest["operation"]["id"])
-    operation_select = workflow_step_operation_select(workflow, step, options.rerun)
     state.mark_step(
         step_id,
         "running",
@@ -2096,20 +2070,19 @@ def run_workflow_step(workflow: dict[str, Any], workflow_path: Path, step: dict[
             "manifestPath": str(manifest_path.resolve()),
             "statePath": str(operation_state_path),
             "operationId": operation_id,
-            "operationSelect": operation_select,
             "startedAt": utc_now(),
         },
     )
     resume_step = options.resume and operation_has_paused_work(manifest, manifest_path)
     run_options = RunOptions(
         manifest_path,
-        operation_select,
-        workflow_step_int(workflow, step, "concurrency"),
-        workflow_step_int(workflow, step, "timeoutSeconds"),
+        None,
+        None,
+        None,
         False,
         True,
         options.ui,
-        workflow_step_bool(workflow, step, "allowSharedWorktreeConcurrency"),
+        False,
         False,
         False,
         resume_step,
@@ -3346,7 +3319,6 @@ class WorkflowStateStore:
                 "manifestPath": str(manifest_path.resolve()),
                 "statePath": str(state_path(manifest, manifest_path)),
                 "operationId": str(manifest["operation"]["id"]),
-                "operationSelect": workflow_step_operation_select(workflow, step, rerun),
             },
         )
 
