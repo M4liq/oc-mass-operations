@@ -32,7 +32,7 @@ TERMINAL_STATUSES = {"completed", "failed", "timed_out", "cleanup_failed", "work
 PAUSED_STATUSES = {"paused", "paused_unresumable"}
 FAILED_STATUSES = {"failed", "cleanup_failed", "worktree_failed", "setup_failed"}
 RERUN_RETRYABLE_STATUSES = {*FAILED_STATUSES, "paused_unresumable", "timed_out", "killed"}
-SHARED_WORKTREE_CONCURRENCY_WARNING = "warning: policy.worktree=single with queue.concurrency > 1 requires non-overlapping item scopes; ocmo run requires --allow-shared-worktree-concurrency"
+SHARED_WORKTREE_CONCURRENCY_WARNING = "warning: policy.worktree=single with queue.concurrency > 1 requires non-overlapping work unit scopes; ocmo run requires --allow-shared-worktree-concurrency"
 MISSING_PLACEHOLDER = object()
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 PLAN_AGENT = "build"
@@ -78,7 +78,7 @@ class WorkflowOptions:
 
 @dataclass(frozen=True)
 class PromptPreview:
-    item_id: str
+    work_unit_id: str
     run_id: str
     text: str
 
@@ -90,11 +90,11 @@ def main(argv: list[str] | None = None) -> int:
     operation_parser = subparsers.add_parser("operation", help="Plan, inspect, run, and control one operation")
     operation_subparsers = operation_parser.add_subparsers(dest="operation_command", required=True)
 
-    run_parser = operation_subparsers.add_parser("run", help="Run operation items from a manifest")
+    run_parser = operation_subparsers.add_parser("run", help="Run work units from a manifest")
     run_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory; defaults to manifest.yaml or a single .ocmo/*/manifest.yaml")
     run_parser.add_argument("--select", help="Selection: all, pending, uncompleted, IDs, or ranges")
     run_parser.add_argument("--concurrency", type=int, help="Override queue.concurrency")
-    run_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each item")
+    run_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each work unit")
     run_parser.add_argument("--dry-run", action="store_true", help="Print commands/prompts without running opencode")
     run_parser.add_argument("--all", action="store_true", help="With --dry-run, print every rendered prompt instead of a compact preview")
     run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for non-dry runs")
@@ -109,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     validate_parser = operation_subparsers.add_parser("validate", help="Validate an operation manifest")
     validate_parser.add_argument("manifest", type=Path)
 
-    render_parser = operation_subparsers.add_parser("render", help="Render prompts for selected operation items")
+    render_parser = operation_subparsers.add_parser("render", help="Render prompts for selected work units")
     render_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory; defaults to manifest.yaml or a single .ocmo/*/manifest.yaml")
     render_parser.add_argument("--select", help="Selection: all, pending, uncompleted, IDs, or ranges")
     render_parser.add_argument("--all", action="store_true", help="Print every rendered prompt instead of a compact preview")
@@ -124,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--interactive", action="store_true", help="Allow the planner to ask terminal questions before returning marked YAML")
     plan_parser.add_argument("--dry-run", action="store_true", help="Print the planning prompt only")
 
-    status_parser = operation_subparsers.add_parser("status", help="Show operation item and run status")
+    status_parser = operation_subparsers.add_parser("status", help="Show work unit and run status")
     status_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     status_parser.add_argument("--run-id", help="Show one detached run session")
     status_parser.add_argument("--all", action="store_true", help="Include inactive detached run sessions")
@@ -144,11 +144,11 @@ def main(argv: list[str] | None = None) -> int:
     resume_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for foreground resume")
     resume_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for foreground resume")
 
-    rerun_parser = operation_subparsers.add_parser("rerun", help="Fresh-start failed, timed-out, killed, or unresumable operation items")
+    rerun_parser = operation_subparsers.add_parser("rerun", help="Fresh-start failed, timed-out, killed, or unresumable work units")
     rerun_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     rerun_parser.add_argument("--select", default="retryable", help="Rerun selector: retryable, unresumable, timed-out, failed, killed, all, IDs, or ranges")
     rerun_parser.add_argument("--concurrency", type=int, help="Override queue.concurrency")
-    rerun_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each item")
+    rerun_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each work unit")
     rerun_parser.add_argument("--detach", action="store_true", help="Rerun in the background and return immediately")
     rerun_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for foreground rerun")
     rerun_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for foreground rerun")
@@ -251,8 +251,8 @@ def main(argv: list[str] | None = None) -> int:
             validate_manifest(manifest, manifest_path)
             warn_shared_worktree_concurrency(manifest)
             previews = []
-            for item in select_items(manifest, args.select):
-                runs = item_runs(manifest, item)
+            for item in select_work_units(manifest, args.select):
+                runs = work_unit_runs(manifest, item)
                 for run in runs:
                     previews.append(PromptPreview(str(item["id"]), str(run["id"]), render_prompt(manifest, item, manifest_path, run=run, runs=runs)))
             print_prompt_previews(previews, args.all)
@@ -421,8 +421,8 @@ def validate_manifest(manifest: dict[str, Any], manifest_path: Path, allow_share
     template_path = resolve_manifest_path(manifest_path, template)
     if not template_path.exists():
         raise OcmoError(f"prompt template not found: {template_path}")
-    for index, item in enumerate(manifest["items"], start=1):
-        validate_item_run_paths(item, manifest_path, index)
+    for index, work_unit in enumerate(manifest["workUnits"], start=1):
+        validate_work_unit_run_paths(work_unit, manifest_path, index)
 
 
 def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path, allow_shared_worktree_concurrency: bool = False) -> None:
@@ -454,21 +454,21 @@ def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path, allo
     prompt = require_mapping(manifest, "prompt")
     validate_template_value(require_string(prompt, "template"), "prompt.template")
     normalize_skills(prompt.get("skills"), "prompt.skills")
-    items = manifest.get("items")
-    if not isinstance(items, list) or not items:
-        raise OcmoError("items must be a non-empty list")
+    work_units = manifest.get("workUnits")
+    if not isinstance(work_units, list) or not work_units:
+        raise OcmoError("workUnits must be a non-empty list")
     seen = set()
-    for index, item in enumerate(items, start=1):
-        if not isinstance(item, dict):
-            raise OcmoError(f"items[{index}] must be a mapping")
-        item_id = item.get("id")
-        if item_id is None:
-            raise OcmoError(f"items[{index}].id is required")
-        item_key = str(item_id)
-        if item_key in seen:
-            raise OcmoError(f"duplicate item id: {item_key}")
-        seen.add(item_key)
-        validate_item_runs(manifest, item, manifest_path, index)
+    for index, work_unit in enumerate(work_units, start=1):
+        if not isinstance(work_unit, dict):
+            raise OcmoError(f"workUnits[{index}] must be a mapping")
+        work_unit_id = work_unit.get("id")
+        if work_unit_id is None:
+            raise OcmoError(f"workUnits[{index}].id is required")
+        work_unit_key = str(work_unit_id)
+        if work_unit_key in seen:
+            raise OcmoError(f"duplicate work unit id: {work_unit_key}")
+        seen.add(work_unit_key)
+        validate_work_unit_runs(manifest, work_unit, manifest_path, index)
 
 
 def validate_template_value(value: str, field: str) -> None:
@@ -476,45 +476,45 @@ def validate_template_value(value: str, field: str) -> None:
         raise OcmoError(f"{field} must be a file path, not inline template text")
 
 
-def validate_item_runs(manifest: dict[str, Any], item: dict[str, Any], manifest_path: Path, item_index: int) -> None:
-    runs = item.get("runs")
+def validate_work_unit_runs(manifest: dict[str, Any], work_unit: dict[str, Any], manifest_path: Path, work_unit_index: int) -> None:
+    runs = work_unit.get("runs")
     if runs is None:
         return
     if not isinstance(runs, dict):
-        raise OcmoError(f"items[{item_index}].runs must be a mapping")
+        raise OcmoError(f"workUnits[{work_unit_index}].runs must be a mapping")
     mode = runs.get("mode", "sequential")
     if mode != "sequential":
-        raise OcmoError(f"items[{item_index}].runs.mode must be sequential")
+        raise OcmoError(f"workUnits[{work_unit_index}].runs.mode must be sequential")
     steps = runs.get("steps")
     if not isinstance(steps, list) or not steps:
-        raise OcmoError(f"items[{item_index}].runs.steps must be a non-empty list")
+        raise OcmoError(f"workUnits[{work_unit_index}].runs.steps must be a non-empty list")
     seen = set()
     produced_by_step: dict[str, set[str]] = {}
     for step_index, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
-            raise OcmoError(f"items[{item_index}].runs.steps[{step_index}] must be a mapping")
+            raise OcmoError(f"workUnits[{work_unit_index}].runs.steps[{step_index}] must be a mapping")
         run_id = step.get("id")
         if run_id is None or not str(run_id).strip():
-            raise OcmoError(f"items[{item_index}].runs.steps[{step_index}].id is required")
+            raise OcmoError(f"workUnits[{work_unit_index}].runs.steps[{step_index}].id is required")
         run_key = str(run_id)
         if run_key in seen:
-            raise OcmoError(f"duplicate run id for item {item['id']}: {run_key}")
+            raise OcmoError(f"duplicate run id for work unit {work_unit['id']}: {run_key}")
         timeout_seconds = step.get("timeoutSeconds")
         if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or timeout_seconds < 1):
-            raise OcmoError(f"items[{item_index}].runs.steps[{step_index}].timeoutSeconds must be a positive integer")
-        validate_build_agent(step.get("agent"), f"items[{item_index}].runs.steps[{step_index}].agent")
+            raise OcmoError(f"workUnits[{work_unit_index}].runs.steps[{step_index}].timeoutSeconds must be a positive integer")
+        validate_build_agent(step.get("agent"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].agent")
         prompt = step.get("prompt")
         if prompt is not None:
             if not isinstance(prompt, dict):
-                raise OcmoError(f"items[{item_index}].runs.steps[{step_index}].prompt must be a mapping")
+                raise OcmoError(f"workUnits[{work_unit_index}].runs.steps[{step_index}].prompt must be a mapping")
             template = prompt.get("template")
             if template is not None:
                 if not isinstance(template, str) or not template.strip():
                     raise OcmoError("template must be a non-empty string")
-                validate_template_value(template, f"items[{item_index}].runs.steps[{step_index}].prompt.template")
-            normalize_skills(prompt.get("skills"), f"items[{item_index}].runs.steps[{step_index}].prompt.skills")
-        validate_consumes(step.get("consumes"), f"items[{item_index}].runs.steps[{step_index}].consumes", produced_by_step)
-        produced_by_step[run_key] = validate_produces(step.get("produces"), f"items[{item_index}].runs.steps[{step_index}].produces")
+                validate_template_value(template, f"workUnits[{work_unit_index}].runs.steps[{step_index}].prompt.template")
+            normalize_skills(prompt.get("skills"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].prompt.skills")
+        validate_consumes(step.get("consumes"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].consumes", produced_by_step)
+        produced_by_step[run_key] = validate_produces(step.get("produces"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].produces")
         seen.add(run_key)
 
 
@@ -663,8 +663,8 @@ def consumed_artifacts(manifest_path: Path, item: dict[str, Any], run: dict[str,
     return "\n".join(sections).rstrip()
 
 
-def validate_item_run_paths(item: dict[str, Any], manifest_path: Path, item_index: int) -> None:
-    runs = item.get("runs")
+def validate_work_unit_run_paths(work_unit: dict[str, Any], manifest_path: Path, work_unit_index: int) -> None:
+    runs = work_unit.get("runs")
     if runs is None:
         return
     for step_index, step in enumerate(runs["steps"], start=1):
@@ -676,8 +676,8 @@ def validate_item_run_paths(item: dict[str, Any], manifest_path: Path, item_inde
                 raise OcmoError(f"prompt template not found: {template_path}")
 
 
-def item_runs(manifest: dict[str, Any], item: dict[str, Any]) -> list[dict[str, Any]]:
-    runs = item.get("runs")
+def work_unit_runs(manifest: dict[str, Any], work_unit: dict[str, Any]) -> list[dict[str, Any]]:
+    runs = work_unit.get("runs")
     if runs is None:
         runner = manifest.get("runner", {})
         return [{"id": "default", "mode": "sequential", "index": 1, **runner}]
@@ -763,7 +763,7 @@ def validate_auto_worktrees(config: dict[str, Any]) -> None:
     for key in ("setup", "teardown"):
         normalize_scripts(config.get(key), f"queue.autoWorktrees.{key}")
     try:
-        str(config.get("branchPattern", "ocmo/{operation_id}/{item_id}")).format(operation_id="operation", item_id="item", item_slug="item")
+        str(config.get("branchPattern", "ocmo/{operation_id}/{work_unit_id}")).format(operation_id="operation", work_unit_id="work-unit", work_unit_slug="work-unit")
     except (KeyError, ValueError, IndexError) as exc:
         raise OcmoError(f"invalid queue.autoWorktrees.branchPattern: {exc}") from exc
 
@@ -796,10 +796,10 @@ def resolve_manifest_path(manifest_path: Path, value: str) -> Path:
 
 def artifact_path(manifest_path: Path, item: dict[str, Any], run_id: str, artifact_id: str, configured_path: str | None = None) -> Path:
     validate_artifact_name(artifact_id, "artifact")
-    value = configured_path or f"{ARTIFACT_ROOT}/{slugify(str(item.get('id', 'item')))}/{slugify(run_id)}/{slugify(artifact_id)}.md"
+    value = configured_path or f"{ARTIFACT_ROOT}/{slugify(str(item.get('id', 'work-unit')))}/{slugify(run_id)}/{slugify(artifact_id)}.md"
     if configured_path is not None:
         substitutions = {
-            "item_id": slugify(str(item.get("id", ""))),
+            "work_unit_id": slugify(str(item.get("id", ""))),
             "run_id": slugify(run_id),
             "artifact_id": slugify(artifact_id),
         }
@@ -818,29 +818,29 @@ def artifact_relative_path(manifest_path: Path, item: dict[str, Any], run_id: st
     return relative_to_manifest(artifact_path(manifest_path, item, run_id, artifact_id, configured_path), manifest_path)
 
 
-def select_items(manifest: dict[str, Any], selector: str | None) -> list[dict[str, Any]]:
-    items = manifest["items"]
+def select_work_units(manifest: dict[str, Any], selector: str | None) -> list[dict[str, Any]]:
+    work_units = manifest["workUnits"]
     selector = selector or manifest.get("selection", {}).get("default") or "uncompleted"
     selector = selector.strip()
     if selector == "all":
-        return items
+        return work_units
     if selector == "pending":
-        return [item for item in items if str(item.get("status", "pending")).lower() == "pending"]
+        return [work_unit for work_unit in work_units if str(work_unit.get("status", "pending")).lower() == "pending"]
     if selector == "uncompleted":
-        return [item for item in items if str(item.get("status", "pending")).lower() not in DONE_STATUSES]
+        return [work_unit for work_unit in work_units if str(work_unit.get("status", "pending")).lower() not in DONE_STATUSES]
 
     requested = expand_selector(selector)
-    selected = [item for item in items if str(item.get("id")) in requested]
-    missing = requested - {str(item.get("id")) for item in selected}
+    selected = [work_unit for work_unit in work_units if str(work_unit.get("id")) in requested]
+    missing = requested - {str(work_unit.get("id")) for work_unit in selected}
     if missing:
-        raise OcmoError(f"selection did not match manifest item ids: {', '.join(sorted(missing))}")
+        raise OcmoError(f"selection did not match manifest work unit ids: {', '.join(sorted(missing))}")
     return selected
 
 
-def select_rerun_items(manifest: dict[str, Any], state: dict[str, Any], selector: str | None) -> list[dict[str, Any]]:
+def select_rerun_work_units(manifest: dict[str, Any], state: dict[str, Any], selector: str | None) -> list[dict[str, Any]]:
     selector = (selector or "retryable").strip()
     if selector == "all":
-        return manifest["items"]
+        return manifest["workUnits"]
     status_sets = {
         "retryable": RERUN_RETRYABLE_STATUSES,
         "unresumable": {"paused_unresumable"},
@@ -852,10 +852,10 @@ def select_rerun_items(manifest: dict[str, Any], state: dict[str, Any], selector
     }
     statuses = status_sets.get(selector)
     if statuses is None:
-        return select_items(manifest, selector)
-    item_states = state.get("items") if isinstance(state.get("items"), dict) else {}
+        return select_work_units(manifest, selector)
+    item_states = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
     selected = []
-    for item in manifest["items"]:
+    for item in manifest["workUnits"]:
         item_id = str(item.get("id"))
         item_state = item_states.get(item_id) if isinstance(item_states.get(item_id), dict) else {}
         if item_state_matches_statuses(item_state, statuses):
@@ -1027,7 +1027,7 @@ def render_prompt(
     run: dict[str, Any] | None = None,
     runs: list[dict[str, Any]] | None = None,
 ) -> str:
-    run = run or item_runs(manifest, item)[0]
+    run = run or work_unit_runs(manifest, item)[0]
     runs = runs or [run]
     runner = effective_runner(manifest, run)
     prompt = effective_prompt(manifest, run)
@@ -1040,13 +1040,13 @@ def render_prompt(
     context = {
         "operation_json": json.dumps(operation, indent=2, ensure_ascii=False),
         "policy_json": json.dumps(manifest.get("policy", {}), indent=2, ensure_ascii=False),
-        "item_json": json.dumps(item, indent=2, ensure_ascii=False),
+        "work_unit_json": json.dumps(item, indent=2, ensure_ascii=False),
         "payload_json": json.dumps(item.get("payload", {}), indent=2, ensure_ascii=False),
         "operation_id": str(operation.get("id", "")),
         "workspace": str(operation.get("workspace", "")),
-        "item_id": str(item.get("id", "")),
-        "item_title": str(item.get("title", "")),
-        "item_file": str(item.get("file", "")),
+        "work_unit_id": str(item.get("id", "")),
+        "work_unit_title": str(item.get("title", "")),
+        "work_unit_file": str(item.get("file", "")),
         "worktree_path": str(execution.get("worktreePath", "")),
         "source_workspace": str(execution.get("sourceWorkspace", operation.get("workspace", ""))),
         "branch_name": str(execution.get("branchName", "")),
@@ -1089,7 +1089,7 @@ def render_brace_placeholders(
         "manifest": manifest,
         "operation": operation,
         "policy": manifest.get("policy", {}),
-        "item": item,
+        "workUnit": item,
         "payload": item.get("payload", {}),
         "execution": execution,
         "run": run,
@@ -1141,7 +1141,7 @@ def print_prompt_previews(previews: list[PromptPreview], show_all: bool) -> None
             print(f"# ... {preview} prompt(s) omitted ...")
             print("\n" + "=" * 80 + "\n")
             continue
-        print(f"# item {preview.item_id} / run {preview.run_id}")
+        print(f"# work unit {preview.work_unit_id} / run {preview.run_id}")
         print(preview.text)
         print("\n" + "=" * 80 + "\n")
 
@@ -1254,12 +1254,12 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
                 self.items[item_id] = {
                     "status": "queued",
                     "step": "-",
-                    "progress": f"0/{len(item_runs(manifest, item))}",
+                    "progress": f"0/{len(work_unit_runs(manifest, item))}",
                     "detail": str(item.get("title") or "-"),
                     "started": None,
                     "ended": None,
                 }
-            self.events.appendleft(f"selected {len(selected)} item(s), concurrency={concurrency}")
+            self.events.appendleft(f"selected {len(selected)} work unit(s), concurrency={concurrency}")
         self.refresh()
 
     def item(self, item_id: str, status: str, detail: str = "") -> None:
@@ -1339,7 +1339,7 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
         if self.auto_worktrees:
             summary.append(" autoWorktrees=true")
         table = Table(expand=True)
-        table.add_column("Item", no_wrap=True)
+        table.add_column("Work Unit", no_wrap=True)
         table.add_column("Status", no_wrap=True)
         table.add_column("Step", no_wrap=True)
         table.add_column("Progress", no_wrap=True)
@@ -1607,8 +1607,8 @@ def item_usage(item_state: dict[str, Any]) -> dict[str, Any]:
 
 
 def state_usage(state: dict[str, Any]) -> dict[str, Any]:
-    items = state.get("items") if isinstance(state.get("items"), dict) else {}
-    return sum_usage(item_usage(item) for item in items.values() if isinstance(item, dict))
+    work_units = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
+    return sum_usage(item_usage(work_unit) for work_unit in work_units.values() if isinstance(work_unit, dict))
 
 
 def format_token_count(value: Any) -> str:
@@ -1658,11 +1658,11 @@ def run_manifest(options: RunOptions) -> int:
     validate_manifest(manifest, options.manifest_path, options.allow_shared_worktree_concurrency)
     existing_state = read_json_file(state_path(manifest, options.manifest_path)) if state_path(manifest, options.manifest_path).exists() else {}
     if options.resume:
-        selected = select_paused_items(manifest, existing_state)
+        selected = select_paused_work_units(manifest, existing_state)
     elif options.rerun:
-        selected = select_rerun_items(manifest, existing_state, options.select)
+        selected = select_rerun_work_units(manifest, existing_state, options.select)
     else:
-        selected = select_items(manifest, options.select)
+        selected = select_work_units(manifest, options.select)
     concurrency = options.concurrency if options.concurrency is not None else manifest.get("queue", {}).get("concurrency", 1)
     timeout_seconds = options.timeout_seconds
     auto_worktrees = auto_worktrees_config(manifest)
@@ -1675,7 +1675,7 @@ def run_manifest(options: RunOptions) -> int:
     if manifest.get("policy", {}).get("worktree") == "single" and auto_worktrees["enabled"]:  # pragma: no cover
         raise OcmoError("policy.worktree=single cannot be used with queue.autoWorktrees.enabled=true")
     if not selected:
-        print("No items selected.")
+        print("No work units selected.")
         return 0
 
     if options.detach:
@@ -1688,7 +1688,7 @@ def run_manifest(options: RunOptions) -> int:
         for item in selected:
             execution = worktree_execution(manifest, options.manifest_path, item) if auto_worktrees["enabled"] else {}
             run_dir = Path(execution["worktreePath"]) if execution else None
-            runs = item_runs(manifest, item)
+            runs = work_unit_runs(manifest, item)
             for run in runs:
                 runner = effective_runner(manifest, run)
                 run_timeout = timeout_seconds if timeout_seconds is not None else runner.get("timeoutSeconds")
@@ -1711,7 +1711,7 @@ def run_manifest(options: RunOptions) -> int:
     if not options.yes:
         timeout_text = f", timeout={timeout_seconds}s" if timeout_seconds else ""
         worktree_text = ", autoWorktrees=true" if auto_worktrees["enabled"] else ""
-        print(f"About to run {len(selected)} item(s) with concurrency={concurrency}{timeout_text}{worktree_text}.")
+        print(f"About to run {len(selected)} work unit(s) with concurrency={concurrency}{timeout_text}{worktree_text}.")
         answer = input("Continue? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled.")
@@ -2100,8 +2100,8 @@ def run_workflow_step(workflow: dict[str, Any], workflow_path: Path, step: dict[
 def workflow_failed_step_status(operation_state_path: Path) -> str:
     if operation_state_path.exists():
         state = read_json_file(operation_state_path)
-        items = state.get("items") if isinstance(state.get("items"), dict) else {}
-        statuses = [item.get("status") for item in items.values() if isinstance(item, dict)]
+        work_units = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
+        statuses = [work_unit.get("status") for work_unit in work_units.values() if isinstance(work_unit, dict)]
         if any(status in PAUSED_STATUSES for status in statuses):
             return "paused" if any(status == "paused" for status in statuses) else "paused_unresumable"
         if any(status == "killed" for status in statuses):
@@ -2116,7 +2116,7 @@ def operation_has_paused_work(manifest: dict[str, Any], manifest_path: Path) -> 
     if not path.exists():
         return False
     state = read_json_file(path)
-    return bool(select_paused_items(manifest, state))
+    return bool(select_paused_work_units(manifest, state))
 
 
 def start_detached_workflow(options: WorkflowOptions, workflow: dict[str, Any]) -> int:
@@ -2327,11 +2327,11 @@ def stop_operation_processes(manifest_path: Path, state: dict[str, Any], selecte
 
 def active_state_pids(state: dict[str, Any]) -> list[int]:
     pids = []
-    items = state.get("items") if isinstance(state.get("items"), dict) else {}
-    for item in items.values():
-        if not isinstance(item, dict):
+    work_units = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
+    for work_unit in work_units.values():
+        if not isinstance(work_unit, dict):
             continue
-        runs = item.get("runs") if isinstance(item.get("runs"), dict) else {}
+        runs = work_unit.get("runs") if isinstance(work_unit.get("runs"), dict) else {}
         for run in runs.values():
             if isinstance(run, dict) and run.get("status") == "running" and isinstance(run.get("pid"), int):
                 pids.append(run["pid"])
@@ -2370,7 +2370,7 @@ def mark_active_runs(path: Path, status: str) -> int:
     if not path.exists():
         return 0
     data = read_json_file(path)
-    items = data.get("items") if isinstance(data.get("items"), dict) else {}
+    items = data.get("workUnits") if isinstance(data.get("workUnits"), dict) else {}
     changed = 0
     now = utc_now()
     for item in items.values():
@@ -2398,10 +2398,10 @@ def mark_active_runs(path: Path, status: str) -> int:
     return changed
 
 
-def select_paused_items(manifest: dict[str, Any], state: dict[str, Any]) -> list[dict[str, Any]]:
-    item_states = state.get("items") if isinstance(state.get("items"), dict) else {}
+def select_paused_work_units(manifest: dict[str, Any], state: dict[str, Any]) -> list[dict[str, Any]]:
+    item_states = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
     selected = []
-    for item in manifest.get("items", []):
+    for item in manifest.get("workUnits", []):
         if not isinstance(item, dict) or "id" not in item:
             continue
         item_state = item_states.get(str(item["id"]), {})
@@ -2414,7 +2414,7 @@ def select_paused_items(manifest: dict[str, Any], state: dict[str, Any]) -> list
 
 
 def resume_prompt(item_id: str, run_id: str) -> str:
-    return f"Continue the previous OCMO session for item {item_id}, run {run_id}. Preserve prior work, inspect current files and state, and finish the original assigned task."
+    return f"Continue the previous OCMO session for work unit {item_id}, run {run_id}. Preserve prior work, inspect current files and state, and finish the original assigned task."
 
 
 def is_generated_operation_manifest(manifest_path: Path) -> bool:
@@ -2501,7 +2501,7 @@ def print_operation_status(manifest_path: Path, include_inactive: bool, selected
         f"killed={counts['killed']} {format_usage_summary(state_usage(state))} updated={updated}"
     )
     if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
-        print("warning: detached run is inactive but state contains running items; run may be stale")
+        print("warning: detached run is inactive but state contains running work units; run may be stale")
     print_status_table(rows)
 
 
@@ -2626,9 +2626,9 @@ def related_detached_records(manifest_path: Path, include_inactive: bool) -> lis
 
 
 def operation_status_rows(manifest: dict[str, Any], state: dict[str, Any]) -> list[dict[str, str]]:
-    item_states = state.get("items") if isinstance(state.get("items"), dict) else {}
-    manifest_items = {str(item["id"]): item for item in manifest.get("items", []) if isinstance(item, dict) and "id" in item}
-    item_ids = [str(item["id"]) for item in manifest.get("items", []) if isinstance(item, dict) and "id" in item]
+    item_states = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
+    manifest_items = {str(item["id"]): item for item in manifest.get("workUnits", []) if isinstance(item, dict) and "id" in item}
+    item_ids = [str(item["id"]) for item in manifest.get("workUnits", []) if isinstance(item, dict) and "id" in item]
     for item_id in item_states:
         if item_id not in manifest_items:
             item_ids.append(item_id)
@@ -2640,7 +2640,7 @@ def operation_status_rows(manifest: dict[str, Any], state: dict[str, Any]) -> li
         status = str(item_state.get("status") or item.get("status") or "pending")
         runs = item_state.get("runs") if isinstance(item_state.get("runs"), dict) else {}
         run_id, run_state = current_run_state(runs)
-        total = int(item_state.get("runCount") or len(item_runs(manifest, item)) or 1)
+        total = int(item_state.get("runCount") or len(work_unit_runs(manifest, item)) or 1)
         current = total if not runs and (status in TERMINAL_STATUSES or status in DONE_STATUSES) else started_run_count(runs)
         progress = f"{current}/{total}"
         rows.append(
@@ -2728,7 +2728,7 @@ def operation_status_counts(rows: list[dict[str, str]]) -> dict[str, int]:
 
 
 def print_status_table(rows: list[dict[str, str]]) -> None:
-    headers = ["Item", "Status", "Step", "Progress", "Runtime", "Tokens", "Detail"]
+    headers = ["Work Unit", "Status", "Step", "Progress", "Runtime", "Tokens", "Detail"]
     keys = ["item", "status", "step", "progress", "runtime", "tokens", "detail"]
     widths = [len(header) for header in headers]
     for row in rows:
@@ -2762,15 +2762,15 @@ def print_detached_record(record: dict[str, Any], details: bool, prefix: str = "
 
 
 def print_state_summary(state: dict[str, Any]) -> None:
-    items = state.get("items") if isinstance(state.get("items"), dict) else {}
+    items = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
     if not items:
-        print("items: none")
+        print("workUnits: none")
         return
     counts: dict[str, int] = {}
     for item in items.values():
         status = str(item.get("status", "unknown")) if isinstance(item, dict) else "unknown"
         counts[status] = counts.get(status, 0) + 1
-    print("items: " + ", ".join(f"{status}={counts[status]}" for status in sorted(counts)))
+    print("workUnits: " + ", ".join(f"{status}={counts[status]}" for status in sorted(counts)))
     updated = state.get("updatedAt")
     if updated:
         print(f"updated: {updated}")
@@ -2813,7 +2813,7 @@ def run_item(
             worktree_code = prepare_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, reporter)
             if worktree_code != 0:
                 return worktree_code
-        runs = item_runs(manifest, item)
+        runs = work_unit_runs(manifest, item)
     except (OSError, OcmoError) as exc:
         state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
         reporter.item(item_id, "failed", f"failed before start: {exc}")
@@ -2963,9 +2963,9 @@ def worktree_execution(manifest: dict[str, Any], manifest_path: Path, item: dict
     operation_id = str(manifest["operation"]["id"])
     item_id = str(item["id"])
     item_slug = slugify(item_id)
-    branch_pattern = config.get("branchPattern", "ocmo/{operation_id}/{item_id}")
+    branch_pattern = config.get("branchPattern", "ocmo/{operation_id}/{work_unit_id}")
     try:
-        branch_name = branch_pattern.format(operation_id=slugify(operation_id), item_id=item_slug, item_slug=item_slug)
+        branch_name = branch_pattern.format(operation_id=slugify(operation_id), work_unit_id=item_slug, work_unit_slug=item_slug)
     except (KeyError, ValueError, IndexError) as exc:
         raise OcmoError(f"invalid queue.autoWorktrees.branchPattern: {exc}") from exc
     worktree_path = root / slugify(operation_id) / item_slug
@@ -3175,7 +3175,7 @@ class StateStore:
             data = self._read()
             data.setdefault("schema", "ocmo-state/v1")
             data.setdefault("operationId", manifest["operation"]["id"])
-            data.setdefault("items", {})
+            data.setdefault("workUnits", {})
             data["control"] = {"status": "running", "updatedAt": utc_now()}
             data["updatedAt"] = utc_now()
             self._write(data)
@@ -3183,8 +3183,8 @@ class StateStore:
     def mark(self, item_id: str, status: str, patch: dict[str, Any]) -> None:
         with self.lock:
             data = self._read()
-            data.setdefault("items", {})
-            item_state = data["items"].setdefault(item_id, {})
+            data.setdefault("workUnits", {})
+            item_state = data["workUnits"].setdefault(item_id, {})
             item_state.update(patch)
             item_state["status"] = status
             data["updatedAt"] = utc_now()
@@ -3193,8 +3193,8 @@ class StateStore:
     def mark_run(self, item_id: str, run_id: str, status: str, patch: dict[str, Any]) -> None:
         with self.lock:
             data = self._read()
-            data.setdefault("items", {})
-            item_state = data["items"].setdefault(item_id, {})
+            data.setdefault("workUnits", {})
+            item_state = data["workUnits"].setdefault(item_id, {})
             runs = item_state.setdefault("runs", {})
             run_state = runs.setdefault(run_id, {})
             run_state.update(patch)
@@ -3205,8 +3205,8 @@ class StateStore:
     def replace_run(self, item_id: str, run_id: str, status: str, patch: dict[str, Any]) -> None:
         with self.lock:
             data = self._read()
-            data.setdefault("items", {})
-            item_state = data["items"].setdefault(item_id, {})
+            data.setdefault("workUnits", {})
+            item_state = data["workUnits"].setdefault(item_id, {})
             runs = item_state.setdefault("runs", {})
             runs[run_id] = {**patch, "status": status}
             data["updatedAt"] = utc_now()
@@ -3215,8 +3215,8 @@ class StateStore:
     def clear_item_terminal_fields(self, item_id: str) -> None:
         with self.lock:
             data = self._read()
-            data.setdefault("items", {})
-            item_state = data["items"].setdefault(item_id, {})
+            data.setdefault("workUnits", {})
+            item_state = data["workUnits"].setdefault(item_id, {})
             for key in ("completedAt", "exitCode", "error", "pausedAt", "killedAt", "resumedAt"):
                 item_state.pop(key, None)
             data["updatedAt"] = utc_now()
@@ -3225,8 +3225,8 @@ class StateStore:
     def patch_run(self, item_id: str, run_id: str, patch: dict[str, Any]) -> None:
         with self.lock:
             data = self._read()
-            data.setdefault("items", {})
-            item_state = data["items"].setdefault(item_id, {})
+            data.setdefault("workUnits", {})
+            item_state = data["workUnits"].setdefault(item_id, {})
             runs = item_state.setdefault("runs", {})
             run_state = runs.setdefault(run_id, {})
             run_state.update(patch)
@@ -3236,8 +3236,8 @@ class StateStore:
     def patch(self, item_id: str, patch: dict[str, Any]) -> None:
         with self.lock:
             data = self._read()
-            data.setdefault("items", {})
-            item_state = data["items"].setdefault(item_id, {})
+            data.setdefault("workUnits", {})
+            item_state = data["workUnits"].setdefault(item_id, {})
             item_state.update(patch)
             data["updatedAt"] = utc_now()
             self._write(data)
@@ -3257,7 +3257,7 @@ class StateStore:
             return self._read()
 
     def item(self, item_id: str) -> dict[str, Any]:
-        item = self.data().get("items", {}).get(item_id, {})
+        item = self.data().get("workUnits", {}).get(item_id, {})
         return item if isinstance(item, dict) else {}
 
     def run(self, item_id: str, run_id: str) -> dict[str, Any]:
@@ -3637,7 +3637,7 @@ def validate_generated_plan_files(manifest: dict[str, Any], manifest_path: Path,
 
 def plan_template_paths(manifest: dict[str, Any]) -> list[str]:
     templates = [str(manifest["prompt"]["template"])]
-    for item in manifest.get("items", []):
+    for item in manifest.get("workUnits", []):
         runs = item.get("runs") if isinstance(item, dict) else None
         if not isinstance(runs, dict):
             continue
@@ -3696,18 +3696,18 @@ Rules:
 - The top-level schema field must be exactly: schema: ocmo/v1.
 - Do not use apiVersion.
 - operation.workspace must be exactly: {workspace}
-- Use a common ocmo/v1 envelope: operation, runner, queue, policy, prompt, state, items.
+- Use a common ocmo/v1 envelope: operation, runner, queue, policy, prompt, state, workUnits.
 - Do not invent unsupported top-level sections or custom policy/runner/state fields.
 - runner.command must usually be opencode.
 - Use queue.concurrency: 1 when the request uses one git worktree or branch-changing workflow.
-- You may use policy.worktree: single with queue.concurrency > 1 only when the request explicitly says item scopes are non-overlapping and safe to run in one shared workspace; the operator must run it with ocmo run --allow-shared-worktree-concurrency.
-- Use queue.autoWorktrees.enabled: true only when the user wants ocmo to create one git worktree per item.
-- Put task-specific fields under each item's payload.
-- If one item needs multiple prompt phases, use items[].runs.mode: sequential and put runs under items[].runs.steps.
+- You may use policy.worktree: single with queue.concurrency > 1 only when the request explicitly says work unit scopes are non-overlapping and safe to run in one shared workspace; the operator must run it with ocmo run --allow-shared-worktree-concurrency.
+- Use queue.autoWorktrees.enabled: true only when the user wants ocmo to create one git worktree per work unit.
+- Put task-specific fields under each work unit's payload.
+- If one work unit needs multiple prompt phases, use workUnits[].runs.mode: sequential and put runs under workUnits[].runs.steps.
 - Use agent: build for every explicit top-level or per-run agent value.
 - Use per-run prompt.template values when different phases need different instructions.
 - Use produces and consumes when one sequential phase should hand a deliberate file artifact to a later phase.
-- Produced artifacts default to artifacts/<item-id>/<step-id>/<artifact-id>.md and custom artifact paths must stay under artifacts/.
+- Produced artifacts default to artifacts/<work-unit-id>/<step-id>/<artifact-id>.md and custom artifact paths must stay under artifacts/.
 - Use the top-level prompt.template only when every run can share the same template.
 - prompt.template and per-run prompt.template must be file paths, not inline YAML block text.
 - Put generated prompt templates under: {prompt_dir}
@@ -3754,9 +3754,9 @@ prompt:
   skills: []
 state:
   path: state.json
-items:
+workUnits:
   - id: ITEM-001
-    title: Example item
+    title: Example work unit
     status: pending
     payload: {{}}
 

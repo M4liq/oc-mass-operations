@@ -2,7 +2,7 @@ schema: ocmo/v1
 
 operation:
   id: report-rewrite-auto-worktrees-example
-  description: Rewrite selected report-like work items using per-item worktrees.
+  description: Rewrite selected report-like work units using per-work-unit worktrees.
   workspace: ..
 
 runner:
@@ -24,13 +24,13 @@ queue:
     enabled: true
     root: .ocmo/worktrees
     baseBranch: main
-    branchPattern: ocmo/{operation_id}/{item_id}
+    branchPattern: ocmo/{operation_id}/{work_unit_id}
     setup: []
     teardown: []
     cleanup: never
 
 policy:
-  worktree: per-item
+  worktree: per-work-unit
   baseBranch: main
   reviewLoop:
     enabled: true
@@ -42,7 +42,7 @@ prompt:
 state:
   path: ../.ocmo/state/report-rewrite-auto-worktrees-example.json
 
-items:
+workUnits:
   - id: WORK-001
     title: ExampleReportOne
     status: pending

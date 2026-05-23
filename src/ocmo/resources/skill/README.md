@@ -10,12 +10,12 @@ OC Mass Operations (`ocmo`) is a deterministic queue runner for repeatable `open
 
 - OCMO schedules `opencode`; it does not replace agent reasoning.
 - One operation is backed by one `manifest.yaml`.
-- One operation item is one independently schedulable unit of work.
-- One selected item produces one rendered prompt per run step.
+- One work unit is one independently schedulable unit of work within an operation.
+- One selected work unit produces one rendered prompt per run step.
 - Each run step starts a separate `opencode run` process.
 - One workflow is backed by one `workflow.yaml` and runs operation manifests sequentially.
 - OCMO writes durable state for status, resume, retry, and audit.
-- Task-specific meaning belongs in manifest item payloads and prompt templates, not in OCMO itself.
+- Task-specific meaning belongs in manifest work unit payloads and prompt templates, not in OCMO itself.
 - Use OCMO when one large request naturally splits into many similar units of work.
 
 ## Inspect First
@@ -46,7 +46,7 @@ Prefer this workflow for existing operations:
 ocmo operation plan --from <prompt-file> [--out <manifest>] [--workspace <path>] [--read <source-file>] [--model <model>] [--max-attempts <count>] [--interactive] [--dry-run]
 ```
 
-Converts a natural-language mass-operation request into an `ocmo/v1` manifest and any generated prompt templates. Planning does not execute operation items.
+Converts a natural-language mass-operation request into an `ocmo/v1` manifest and any generated prompt templates. Planning does not execute work units.
 
 - `--from <prompt-file>`: required natural-language operation prompt.
 - `--out <manifest>`: manifest output path. If omitted, writes under `<workspace>/.ocmo/<prompt-stem>/manifest.yaml`.
@@ -65,7 +65,7 @@ Use `--read` for CSV exports, inventories, design notes, existing manifests, or 
 ocmo operation validate <manifest>
 ```
 
-Validates manifest schema, paths, prompt templates, worktree settings, item run paths, and workspace assumptions.
+Validates manifest schema, paths, prompt templates, worktree settings, work unit run paths, and workspace assumptions.
 
 ### `ocmo operation render`
 
@@ -73,7 +73,7 @@ Validates manifest schema, paths, prompt templates, worktree settings, item run 
 ocmo operation render [manifest-or-directory] [--select <selector>] [--all]
 ```
 
-Renders prompts for selected items without running agents.
+Renders prompts for selected work units without running agents.
 
 - `--select <selector>`: overrides the manifest default selector.
 - `--all`: prints every rendered prompt instead of a compact preview.
@@ -86,7 +86,7 @@ Use `render` to inspect exact prompt text before launching agents.
 ocmo operation run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--dry-run] [--all] [--yes] [--ui auto|live|plain] [--detach] [--allow-shared-worktree-concurrency]
 ```
 
-Runs selected operation items.
+Runs selected work units.
 
 - `--select <selector>`: overrides the manifest default selector.
 - `--concurrency <count>`: overrides `queue.concurrency`.
@@ -96,7 +96,7 @@ Runs selected operation items.
 - `--yes`, `-y`: skips confirmation for foreground runs.
 - `--ui auto|live|plain`: controls foreground terminal output.
 - `--detach`: starts a background `ocmo operation run` with `--yes` and `--ui plain`, writes detached metadata/logs under `.ocmo/runs/`, writes a global registry entry, returns a run ID, and exits.
-- `--allow-shared-worktree-concurrency`: allows concurrency above `1` when `policy.worktree: single`. Use only when selected item scopes are explicitly non-overlapping.
+- `--allow-shared-worktree-concurrency`: allows concurrency above `1` when `policy.worktree: single`. Use only when selected work unit scopes are explicitly non-overlapping.
 
 Pressing `Ctrl+C` during foreground `ocmo operation run` uses pause semantics: tracked child processes are terminated, active runs are marked `paused` or `paused_unresumable`, and the command exits `130`.
 
@@ -106,14 +106,14 @@ Pressing `Ctrl+C` during foreground `ocmo operation run` uses pause semantics: t
 ocmo operation status [manifest-or-directory] [--run-id <run-id>] [--all]
 ```
 
-Shows operation item/run status and detached run information.
+Shows work unit/run status and detached run information.
 
 - No argument lists active detached runs from the global registry when no manifest can be inferred.
 - `[manifest-or-directory]` shows status for one operation.
 - `--run-id <run-id>` resolves detached metadata and shows that run's operation status.
 - `--all` includes inactive detached run sessions.
 
-When `opencode run --format json` reports step usage, status shows operation token totals and a per-item `Tokens` column formatted as `input/output`.
+When `opencode run --format json` reports step usage, status shows operation token totals and a per-work-unit `Tokens` column formatted as `input/output`.
 
 ### `ocmo operation list`
 
@@ -129,7 +129,7 @@ Lists detached operation run sessions. Use `--all` to include inactive sessions.
 ocmo operation pause [manifest-or-directory] [--run-id <run-id>]
 ```
 
-Stops active tracked processes and marks running items/runs as paused.
+Stops active tracked processes and marks running work units/runs as paused.
 
 - `pause` is stop-and-resume, not an operating-system suspend.
 - Runs with a known opencode `sessionId` are marked `paused`.
@@ -154,11 +154,11 @@ Strictly resumes paused runs by persisted opencode session id.
 ocmo operation rerun [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--detach] [--yes] [--ui auto|live|plain] [--allow-shared-worktree-concurrency]
 ```
 
-Fresh-starts selected operation items. It never uses `--session`.
+Fresh-starts selected work units. It never uses `--session`.
 
 - Default selector is `retryable`.
 - `retryable` includes `paused_unresumable`, `timed_out`, `failed`, `cleanup_failed`, `worktree_failed`, `setup_failed`, and `killed`.
-- Use `--select unresumable`, `--select paused_unresumable`, `--select timed-out`, `--select timed_out`, `--select failed`, `--select killed`, `--select all`, exact item IDs, or numeric ranges.
+- Use `--select unresumable`, `--select paused_unresumable`, `--select timed-out`, `--select timed_out`, `--select failed`, `--select killed`, `--select all`, exact work unit IDs, or numeric ranges.
 
 Use rerun for failed, timed-out, killed, or unresumable work. Use resume for clean paused work with session ids.
 
@@ -244,21 +244,21 @@ ocmo workflow kill workflow.yaml --force
 
 Workflow facts:
 
-- Workflow `--select` selects workflow steps, not operation items.
-- Referenced operation manifests control their own item selection, concurrency, timeouts, and worktree safety policy.
-- Workflow state records orchestration status; operation state remains authoritative for items, runs, sessions, outputs, artifacts, and token usage.
-- `ocmo workflow rerun` defaults to retryable workflow steps, then delegates operation item selection to each referenced operation.
+- Workflow `--select` selects workflow steps, not work units.
+- Referenced operation manifests control their own work unit selection, concurrency, timeouts, and worktree safety policy.
+- Workflow state records orchestration status; operation state remains authoritative for work units, runs, sessions, outputs, artifacts, and token usage.
+- `ocmo workflow rerun` defaults to retryable workflow steps, then delegates work unit selection to each referenced operation.
 - `ocmo workflow pause` and `ocmo workflow kill` delegate to the active operation step and preserve operation files.
 
 ## Selection Rules
 
-General selectors match manifest item IDs or item status categories.
+General selectors match manifest work unit IDs or work unit status categories.
 
-- `all`: every item.
-- `pending`: items whose manifest status is `pending`.
-- `uncompleted`: items whose manifest status is not `completed`, `done`, or `skipped`.
-- `WORK-001`: one exact item ID.
-- `WORK-001,WORK-002`: multiple exact item IDs.
+- `all`: every work unit.
+- `pending`: work units whose manifest status is `pending`.
+- `uncompleted`: work units whose manifest status is not `completed`, `done`, or `skipped`.
+- `WORK-001`: one exact work unit ID.
+- `WORK-001,WORK-002`: multiple exact work unit IDs.
 - `41-48`: numeric range matching IDs `41` through `48`.
 - `41-48,93-96,141`: mixed numeric ranges and exact IDs.
 
@@ -279,7 +279,7 @@ schema: ocmo/v1
 
 operation:
   id: example-operation
-  description: Process a set of example work items.
+  description: Process a set of example work units.
   workspace: C:\path\to\target-repo
 
 runner:
@@ -301,7 +301,7 @@ queue:
     enabled: false
     root: .ocmo/worktrees
     baseBranch: main
-    branchPattern: ocmo/{operation_id}/{item_id}
+    branchPattern: ocmo/{operation_id}/{work_unit_id}
     setup: []
     teardown: []
     cleanup: never
@@ -317,9 +317,9 @@ prompt:
 state:
   path: state.json
 
-items:
+workUnits:
   - id: ITEM-001
-    title: Example item
+    title: Example work unit
     status: pending
     payload:
       targetName: Example
@@ -337,16 +337,16 @@ Manifest rules:
 - `runner.timeoutSeconds` is an optional per-run timeout.
 - `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` when true.
 - `selection.default` is used when `--select` is omitted. Prefer `uncompleted`.
-- `queue.concurrency` is maximum active operation items.
+- `queue.concurrency` is maximum active work units.
 - `queue.order` is currently `manifest`.
 - `queue.stopOnFailure` is reserved for stricter failure handling.
-- `queue.autoWorktrees` configures native git worktree creation per selected item.
+- `queue.autoWorktrees` configures native git worktree creation per selected work unit.
 - `policy.worktree` is usually `single` or isolated through auto worktrees.
 - `prompt.template` is resolved relative to `manifest.yaml`.
-- `prompt.skills` lists opencode skills required in rendered item prompts.
+- `prompt.skills` lists opencode skills required in rendered work unit prompts.
 - `state.path` is resolved relative to `manifest.yaml`.
-- Every item needs a unique `id`.
-- Item `payload` is task-specific and should contain the data needed by the prompt template.
+- Every work unit needs a unique `id`.
+- Work unit `payload` is task-specific and should contain the data needed by the prompt template.
 - Do not use `operation.kind` or `runner.mode`; OCMO rejects those fields.
 
 ## Prompt Templates
@@ -357,14 +357,14 @@ Common variables:
 
 - `$operation_json`
 - `$policy_json`
-- `$item_json`
+- `$work_unit_json`
 - `$payload_json`
 - `$run_json`
 - `$operation_id`
 - `$workspace`
-- `$item_id`
-- `$item_title`
-- `$item_file`
+- `$work_unit_id`
+- `$work_unit_title`
+- `$work_unit_file`
 - `$run_id`
 - `$run_agent`
 - `$run_model`
@@ -378,13 +378,13 @@ Common variables:
 - `$source_workspace`
 - `$branch_name`
 
-Prompt templates should tell the agent exactly how to complete one item and how to stop. They must make clear that the agent must not work on any other item.
+Prompt templates should tell the agent exactly how to complete one work unit and how to stop. They must make clear that the agent must not work on any other work unit.
 
 Unknown dotted placeholders fail before launching agents. YAML `null` placeholder values render as empty strings.
 
-## Skills Inside Item Prompts
+## Skills Inside Work Unit Prompts
 
-Use `prompt.skills` when every rendered item prompt must require specific opencode skills.
+Use `prompt.skills` when every rendered work unit prompt must require specific opencode skills.
 
 ```yaml
 prompt:
@@ -399,10 +399,10 @@ Run-specific `prompt.skills` can replace top-level skills for one sequential ste
 
 ## Sequential Runs And Artifacts
 
-By default, one selected item starts one `opencode run` process. Use `items[].runs.mode: sequential` when each item needs multiple phases.
+By default, one selected work unit starts one `opencode run` process. Use `workUnits[].runs.mode: sequential` when each work unit needs multiple phases.
 
 ```yaml
-items:
+workUnits:
   - id: ITEM-001
     runs:
       mode: sequential
@@ -419,19 +419,19 @@ items:
 
 Sequential run facts:
 
-- Runs within one item execute in manifest order.
+- Runs within one work unit execute in manifest order.
 - Each run starts a separate `opencode run` process.
-- `queue.concurrency` remains item-level concurrency.
-- Auto worktrees are per item, not per run.
+- `queue.concurrency` remains work-unit-level concurrency.
+- Auto worktrees are per work unit, not per run.
 - Setup runs once before the first step.
 - Teardown and cleanup run once after all steps succeed or after the first failed step.
-- The item is `completed` only after every step succeeds.
-- If one step fails or times out, later steps for that item are skipped.
+- The work unit is `completed` only after every step succeeds.
+- If one step fails or times out, later steps for that work unit are skipped.
 
 Use `produces` and `consumes` for files passed between sequential run steps.
 
 ```yaml
-items:
+workUnits:
   - id: ITEM-001
     runs:
       mode: sequential
@@ -441,7 +441,7 @@ items:
           produces:
             plan:
               required: true
-              description: Implementation plan for this item.
+              description: Implementation plan for this work unit.
         - id: implement
           agent: build
           consumes:
@@ -452,27 +452,27 @@ Artifact rules:
 
 - `produces.<artifact-id>` declares a file produced by a run step.
 - `consumes` references earlier artifacts with `step.artifact` syntax.
-- By default, `produces.plan` writes to `artifacts/<item-id>/<step-id>/plan.md` beside `manifest.yaml`.
+- By default, `produces.plan` writes to `artifacts/<work-unit-id>/<step-id>/plan.md` beside `manifest.yaml`.
 - Custom artifact paths are allowed only under `artifacts/`.
 - Required artifacts must exist and be non-empty after the producing run, or the step fails.
 - Consuming steps receive artifact content under `## Chained Inputs` in the rendered prompt.
 
 ## Worktree And Concurrency Safety
 
-`queue.concurrency` is item-level concurrency. It does not make run steps inside one item parallel.
+`queue.concurrency` is work-unit-level concurrency. It does not make run steps inside one work unit parallel.
 
-`policy.worktree: single` means selected items operate in one shared workspace.
+`policy.worktree: single` means selected work units operate in one shared workspace.
 
-- Safe only when item scopes are explicitly non-overlapping.
+- Safe only when work unit scopes are explicitly non-overlapping.
 - `validate` and `render` warn for `queue.concurrency > 1`.
 - `ocmo operation run` rejects shared single-worktree concurrency above `1` unless passed `--allow-shared-worktree-concurrency`.
 - `policy.worktree: single` cannot be combined with `queue.autoWorktrees.enabled: true`.
 
-Use `queue.autoWorktrees.enabled: true` when items may edit overlapping files, when isolation matters, or when parallel item execution is desired without shared-workspace risk. Auto worktrees use native `git worktree`; they are per item, not per run step.
+Use `queue.autoWorktrees.enabled: true` when work units may edit overlapping files, when isolation matters, or when parallel work unit execution is desired without shared-workspace risk. Auto worktrees use native `git worktree`; they are per work unit, not per run step.
 
 ## State And Outputs
 
-`ocmo operation run` writes durable state to the manifest's configured state path. State records execution facts such as item status, run status, start/completion times, exit codes, output paths, worktree metadata, process IDs, opencode session IDs, and per-run token usage when `opencode` reports it.
+`ocmo operation run` writes durable state to the manifest's configured state path. State records execution facts such as work unit status, run status, start/completion times, exit codes, output paths, worktree metadata, process IDs, opencode session IDs, and per-run token usage when `opencode` reports it.
 
 Per-run `opencode` stdout/stderr is written under `outputs/` beside the manifest. This keeps concurrent agent output from corrupting the terminal UI and makes long-running work inspectable after the fact.
 
@@ -482,12 +482,12 @@ Generated operation layout usually looks like:
 <workspace>/.ocmo/<operation>/manifest.yaml
 <workspace>/.ocmo/<operation>/state.json
 <workspace>/.ocmo/<operation>/prompts/<template>.md
-<workspace>/.ocmo/<operation>/outputs/<item-id>__<run-id>.txt
-<workspace>/.ocmo/<operation>/artifacts/<item-id>/<run-id>/<artifact-id>.md
+<workspace>/.ocmo/<operation>/outputs/<work-unit-id>__<run-id>.txt
+<workspace>/.ocmo/<operation>/artifacts/<work-unit-id>/<run-id>/<artifact-id>.md
 <workspace>/.ocmo/<operation>/.ocmo/runs/<detached-run-id>.json
 ```
 
-Failed items remain selectable through `uncompleted` unless you mark them completed or skipped in the manifest.
+Failed work units remain selectable through `uncompleted` unless you mark them completed or skipped in the manifest.
 
 ## Planning Checklist
 
@@ -495,14 +495,14 @@ Before running `ocmo operation plan`, make sure the request identifies enough of
 
 - Target workspace.
 - Operation goal and definition of done.
-- Item boundaries and item IDs.
-- Whether item scopes overlap.
+- Work unit boundaries and work unit IDs.
+- Whether work unit scopes overlap.
 - Worktree policy and concurrency.
 - Timeout expectations.
-- Prompt constraints every item must follow.
+- Prompt constraints every work unit must follow.
 - Whether one run step is enough or sequential phases are needed.
 - Whether artifacts should pass information between phases.
-- Which opencode skills, if any, should be required in rendered item prompts.
+- Which opencode skills, if any, should be required in rendered work unit prompts.
 - Files to attach with `--read`.
 
 If the request is vague, ask focused questions. Do not turn this into a long grilling ritual by default; ask only what is necessary for safe planning or execution.

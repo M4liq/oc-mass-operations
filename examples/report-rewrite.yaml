@@ -2,7 +2,7 @@ schema: ocmo/v1
 
 operation:
   id: report-rewrite-example
-  description: Rewrite selected report-like work items from a tracker export.
+  description: Rewrite selected report-like work units from a tracker export.
   workspace: ..
 
 runner:
@@ -24,7 +24,7 @@ queue:
     enabled: false
     root: .ocmo/worktrees
     baseBranch: main
-    branchPattern: ocmo/{operation_id}/{item_id}
+    branchPattern: ocmo/{operation_id}/{work_unit_id}
     setup: []
     teardown: []
     cleanup: never
@@ -42,7 +42,7 @@ prompt:
 state:
   path: ../.ocmo/state/report-rewrite-example.json
 
-items:
+workUnits:
   - id: WORK-001
     title: ExampleReportOne
     status: pending

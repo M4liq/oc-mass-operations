@@ -2,7 +2,7 @@ schema: ocmo/v1
 
 operation:
   id: report-rewrite-multi-agent-example
-  description: Rewrite and review selected report-like work items with multiple sequential phases per item.
+  description: Rewrite and review selected report-like work units with multiple sequential phases per work unit.
   workspace: ..
 
 runner:
@@ -23,7 +23,7 @@ queue:
     enabled: false
     root: .ocmo/worktrees
     baseBranch: main
-    branchPattern: ocmo/{operation_id}/{item_id}
+    branchPattern: ocmo/{operation_id}/{work_unit_id}
     setup: []
     teardown: []
     cleanup: never
@@ -38,7 +38,7 @@ prompt:
 state:
   path: ../.ocmo/state/report-rewrite-multi-agent-example.json
 
-items:
+workUnits:
   - id: WORK-001
     title: ExampleReportOne
     status: pending

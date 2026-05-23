@@ -82,8 +82,8 @@ The execution model is deliberately simple:
 
 ```text
 manifest.yaml
-  -> select operation items
-  -> render prompt template for each selected item/run
+  -> select work units
+  -> render prompt template for each selected work unit/run
   -> start opencode run processes
   -> write outputs and durable state
 
@@ -96,11 +96,11 @@ workflow.yaml
 Core concepts:
 
 - Operation: one mass operation, backed by one manifest.
-- Operation item: one independently schedulable unit of work.
+- Work unit: one independently schedulable unit of work within an operation.
 - Workflow: one sequential orchestration of multiple operation manifests.
-- Manifest: generated plan describing items, prompts, queue settings, and state path.
-- Prompt template: text rendered once per selected item/run and passed to `opencode run`.
-- Selection: item filter such as `uncompleted`, `all`, `ITEM-001`, or `1-10`.
+- Manifest: generated plan describing work units, prompts, queue settings, and state path.
+- Prompt template: text rendered once per selected work unit/run and passed to `opencode run`.
+- Selection: work unit filter such as `uncompleted`, `all`, `ITEM-001`, or `1-10`.
 - State file: durable JSON state written by `ocmo operation run` or `ocmo workflow run` for status, resume, and audit.
 
 ## Typical Operation
@@ -113,7 +113,7 @@ This walkthrough creates and runs one operation. Workflow orchestration is cover
 notepad business-taxonomy-prompt.txt
 ```
 
-Describe the work, item boundaries, constraints, and desired output. Use the `/ocmo` skill when you want an agent to help inspect, plan, validate, render, run, or control an OCMO operation.
+Describe the work, work unit boundaries, constraints, and desired output. Use the `/ocmo` skill when you want an agent to help inspect, plan, validate, render, run, or control an OCMO operation.
 
 2. Generate an operation folder.
 
@@ -188,7 +188,7 @@ ocmo operation plan --from <prompt-file> [--out <manifest>] [--workspace <path>]
 - `--dry-run` prints the planning prompt without starting `opencode`.
 - `--interactive` allows the planner to ask terminal questions before returning the final manifest.
 
-Planning does not execute operation items.
+Planning does not execute work units.
 
 ## Rendering And Dry Runs
 
@@ -215,15 +215,15 @@ ocmo operation run [manifest-or-directory] [--select <selector>] [--concurrency 
 Useful options:
 
 - `--select <selector>`: overrides the manifest default selector.
-- `--concurrency <count>`: overrides item-level queue concurrency.
+- `--concurrency <count>`: overrides work-unit-level queue concurrency.
 - `--timeout-seconds <seconds>`: overrides per-process timeouts.
 - `--ui auto|live|plain`: controls foreground terminal output.
 - `--yes`, `-y`: skips confirmation for foreground runs.
 - `--detach`: starts a background `ocmo operation run` and returns a run ID.
 
-If `policy.worktree: single` uses concurrency above `1`, `ocmo operation run` requires `--allow-shared-worktree-concurrency`. Use that only when selected item scopes are explicitly non-overlapping.
+If `policy.worktree: single` uses concurrency above `1`, `ocmo operation run` requires `--allow-shared-worktree-concurrency`. Use that only when selected work unit scopes are explicitly non-overlapping.
 
-Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata. `ocmo operation status` summarizes operation token usage and includes a compact per-item `Tokens` column formatted as `input/output`.
+Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata. `ocmo operation status` summarizes operation token usage and includes a compact per-work-unit `Tokens` column formatted as `input/output`.
 
 ## Workflows
 
@@ -263,7 +263,7 @@ ocmo workflow rerun workflow.yaml --detach
 ocmo workflow kill workflow.yaml --force
 ```
 
-Workflow `--select` selects workflow steps, not operation items. Referenced operation manifests control their own item selection, concurrency, timeouts, and worktree safety policy.
+Workflow `--select` selects workflow steps, not work units. Referenced operation manifests control their own work unit selection, concurrency, timeouts, and worktree safety policy.
 
 ## Detached Runs
 
@@ -299,7 +299,7 @@ ocmo operation kill .ocmo/business-taxonomy-prompt --force
 ocmo operation erase .ocmo/business-taxonomy-prompt --force
 ```
 
-`pause` is stop-and-resume, not an operating-system suspend. It terminates the active detached supervisor and any tracked child `opencode run` processes, then marks running items/runs as `paused` when their opencode `sessionId` is known. If a process had not emitted a session id yet, the run is marked `paused_unresumable`.
+`pause` is stop-and-resume, not an operating-system suspend. It terminates the active detached supervisor and any tracked child `opencode run` processes, then marks running work units/runs as `paused` when their opencode `sessionId` is known. If a process had not emitted a session id yet, the run is marked `paused_unresumable`.
 
 Pressing `Ctrl+C` during a foreground `ocmo operation run` or `ocmo workflow run` uses pause semantics: tracked child processes are terminated, active work is marked paused when possible, and the command exits with code `130`.
 
@@ -307,33 +307,33 @@ Pressing `Ctrl+C` during `ocmo operation plan` terminates the active planner pro
 
 `resume` is strict session continuation. It resumes only paused runs that have a persisted opencode session id and starts them with `opencode run --session <sessionId>`. It never falls back to `opencode --continue` because that can resume the wrong session during concurrent work.
 
-`rerun` is a fresh start and never uses `--session`. By default, `ocmo operation rerun` selects `retryable` items: `paused_unresumable`, `timed_out`, `failed`, `cleanup_failed`, `worktree_failed`, `setup_failed`, and `killed`. Use `--select unresumable`, `--select timed-out`, `--select failed`, `--select killed`, `--select all`, or explicit item IDs/ranges to narrow or expand the fresh rerun.
+`rerun` is a fresh start and never uses `--session`. By default, `ocmo operation rerun` selects `retryable` work units: `paused_unresumable`, `timed_out`, `failed`, `cleanup_failed`, `worktree_failed`, `setup_failed`, and `killed`. Use `--select unresumable`, `--select timed-out`, `--select failed`, `--select killed`, `--select all`, or explicit work unit IDs/ranges to narrow or expand the fresh rerun.
 
-If an `opencode run` exceeds `timeoutSeconds`, ocmo terminates the child process tree, marks the run and item `timed_out`, and treats that item as retryable for `ocmo operation rerun --select timed-out` or the default `--select retryable`.
+If an `opencode run` exceeds `timeoutSeconds`, ocmo terminates the child process tree, marks the run and work unit `timed_out`, and treats that work unit as retryable for `ocmo operation rerun --select timed-out` or the default `--select retryable`.
 
-`kill` terminates tracked processes and marks active items/runs as `killed`, preserving the operation directory, state, outputs, logs, and artifacts for audit.
+`kill` terminates tracked processes and marks active work units/runs as `killed`, preserving the operation directory, state, outputs, logs, and artifacts for audit.
 
 `erase` runs the same termination step and then deletes the generated operation directory, such as `.ocmo/business-taxonomy-prompt/`. It requires `--force` when non-interactive and refuses manifests outside `.ocmo/<operation>/manifest.yaml`.
 
 ## Selection Rules
 
-Selectors match manifest item IDs:
+Selectors match manifest work unit IDs:
 
-- `all`: every item.
-- `pending`: items whose manifest status is `pending`.
-- `uncompleted`: items whose manifest status is not `completed`, `done`, or `skipped`.
-- `WORK-001`: one exact item ID.
-- `WORK-001,WORK-002`: multiple exact item IDs.
+- `all`: every work unit.
+- `pending`: work units whose manifest status is `pending`.
+- `uncompleted`: work units whose manifest status is not `completed`, `done`, or `skipped`.
+- `WORK-001`: one exact work unit ID.
+- `WORK-001,WORK-002`: multiple exact work unit IDs.
 - `41-48`: numeric range matching IDs `41` through `48`.
 - `41-48,93-96,141`: mixed numeric ranges and exact IDs.
 
 ## State And Outputs
 
-`ocmo operation run` writes durable state to the manifest's configured state path. State records execution facts such as item status, run status, start/completion times, exit codes, output paths, and worktree metadata.
+`ocmo operation run` writes durable state to the manifest's configured state path. State records execution facts such as work unit status, run status, start/completion times, exit codes, output paths, and worktree metadata.
 
 Per-run `opencode` stdout/stderr is written under `outputs/` beside the manifest. This keeps concurrent agent output from corrupting the terminal UI and makes long-running work inspectable after the fact.
 
-Failed items remain selectable through `uncompleted` unless you mark them completed or skipped in the manifest.
+Failed work units remain selectable through `uncompleted` unless you mark them completed or skipped in the manifest.
 
 ## Examples
 

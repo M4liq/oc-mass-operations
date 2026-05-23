@@ -22,4 +22,4 @@ If the skill README is unavailable, use these safety rules:
 
 ## Core Model
 
-OCMO is a deterministic queue runner for repeatable `opencode run` jobs. It selects operation items from a manifest, renders a prompt for each selected item/run, starts isolated `opencode run` processes, and writes durable state and outputs for inspection. Workflows run multiple operation manifests sequentially and keep separate workflow state.
+OCMO is a deterministic queue runner for repeatable `opencode run` jobs. It selects work units from a manifest, renders a prompt for each selected work unit/run, starts isolated `opencode run` processes, and writes durable state and outputs for inspection. Workflows run multiple operation manifests sequentially and keep separate workflow state.

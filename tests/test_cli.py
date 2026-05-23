@@ -20,7 +20,7 @@ class OcmoTestCase(unittest.TestCase):
         self.workspace.mkdir()
         self.prompt = self.root / "prompt.md"
         self.prompt.write_text(
-            "Item $item_id $item_title run $run_id/$run_count agent $run_agent model $run_model in $worktree_path payload $payload_json",
+            "Item $work_unit_id $work_unit_title run $run_id/$run_count agent $run_agent model $run_model in $worktree_path payload $payload_json",
             encoding="utf-8",
         )
         self.manifest_path = self.root / "manifest.yaml"
@@ -47,7 +47,7 @@ prompt:
   template: {self.prompt.as_posix()}
 state:
   path: {str((self.root / 'state.json').as_posix())}
-items:
+workUnits:
   - id: "1"
     title: First
     status: pending
@@ -83,7 +83,7 @@ prompt:
   template: {template}
 state:
   path: .ocmo/state/planned-op.json
-items:
+workUnits:
   - id: ITEM-001
     status: pending
     payload: {{}}
@@ -144,7 +144,7 @@ class ValidationTests(OcmoTestCase):
         review_prompt.write_text("Review $run_id", encoding="utf-8")
         manifest = self.load()
         manifest["prompt"]["skills"] = ["code-review"]
-        manifest["items"][0]["runs"] = {
+        manifest["workUnits"][0]["runs"] = {
             "mode": "sequential",
             "steps": [
                 {"id": "implement", "agent": "build", "prompt": {"template": str(self.prompt)}},
@@ -156,14 +156,14 @@ class ValidationTests(OcmoTestCase):
 
     def test_rejects_unsupported_run_mode(self) -> None:
         manifest = self.load()
-        manifest["items"][0]["runs"] = {"mode": "parallel", "steps": [{"id": "one"}]}
+        manifest["workUnits"][0]["runs"] = {"mode": "parallel", "steps": [{"id": "one"}]}
 
         with self.assertRaisesRegex(cli.OcmoError, "runs.mode must be sequential"):
             cli.validate_manifest(manifest, self.manifest_path)
 
     def test_rejects_duplicate_run_ids(self) -> None:
         manifest = self.load()
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "one"}, {"id": "one"}]}
+        manifest["workUnits"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "one"}, {"id": "one"}]}
 
         with self.assertRaisesRegex(cli.OcmoError, "duplicate run id"):
             cli.validate_manifest(manifest, self.manifest_path)
@@ -184,10 +184,10 @@ class ValidationTests(OcmoTestCase):
             ({"runner": {"command": "opencode", "timeoutSeconds": 0}}, "runner.timeoutSeconds"),
             ({"queue": {"concurrency": 0}}, "queue.concurrency"),
             ({"prompt": {"template": str(self.root / "missing.md")}}, "prompt template not found"),
-            ({"items": []}, "items must be a non-empty list"),
-            ({"items": ["bad"]}, r"items\[1\] must be a mapping"),
-            ({"items": [{}]}, r"items\[1\].id is required"),
-            ({"items": [{"id": "1"}, {"id": "1"}]}, "duplicate item id"),
+            ({"workUnits": []}, "workUnits must be a non-empty list"),
+            ({"workUnits": ["bad"]}, r"workUnits\[1\] must be a mapping"),
+            ({"workUnits": [{}]}, r"workUnits\[1\].id is required"),
+            ({"workUnits": [{"id": "1"}, {"id": "1"}]}, "duplicate work unit id"),
         ]
         for patch, message in cases:
             manifest = self.load()
@@ -219,7 +219,7 @@ class ValidationTests(OcmoTestCase):
         ]
         for patch, message in cases:
             manifest = self.load()
-            manifest["items"] = [{"id": "1", **patch}]
+            manifest["workUnits"] = [{"id": "1", **patch}]
             with self.subTest(message=message):
                 with self.assertRaisesRegex(cli.OcmoError, message):
                     cli.validate_manifest(manifest, self.manifest_path)
@@ -274,37 +274,37 @@ class ValidationTests(OcmoTestCase):
 
 
 class SelectionAndRenderingTests(OcmoTestCase):
-    def test_select_items_supports_pending_uncompleted_all_ids_and_ranges(self) -> None:
+    def test_select_workUnits_supports_pending_uncompleted_all_ids_and_ranges(self) -> None:
         manifest = self.load()
-        manifest["items"].append({"id": "3", "status": "skipped"})
+        manifest["workUnits"].append({"id": "3", "status": "skipped"})
 
-        self.assertEqual([item["id"] for item in cli.select_items(manifest, "pending")], ["1"])
-        self.assertEqual([item["id"] for item in cli.select_items(manifest, "uncompleted")], ["1"])
-        self.assertEqual([item["id"] for item in cli.select_items(manifest, "all")], ["1", "2", "3"])
-        self.assertEqual([item["id"] for item in cli.select_items(manifest, "1,3")], ["1", "3"])
+        self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "pending")], ["1"])
+        self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "uncompleted")], ["1"])
+        self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "all")], ["1", "2", "3"])
+        self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "1,3")], ["1", "3"])
 
-        numeric = {"items": [{"id": "1"}, {"id": "2"}, {"id": "3"}]}
-        self.assertEqual([item["id"] for item in cli.select_items(numeric, "1-2")], ["1", "2"])
+        numeric = {"workUnits": [{"id": "1"}, {"id": "2"}, {"id": "3"}]}
+        self.assertEqual([item["id"] for item in cli.select_work_units(numeric, "1-2")], ["1", "2"])
 
-    def test_select_items_rejects_missing_and_descending_ranges(self) -> None:
+    def test_select_workUnits_rejects_missing_and_descending_ranges(self) -> None:
         manifest = self.load()
 
         with self.assertRaisesRegex(cli.OcmoError, "selection did not match"):
-            cli.select_items(manifest, "missing")
+            cli.select_work_units(manifest, "missing")
         with self.assertRaisesRegex(cli.OcmoError, "invalid descending range"):
-            cli.select_items(manifest, "3-1")
+            cli.select_work_units(manifest, "3-1")
 
     def test_implicit_default_run_uses_top_level_runner(self) -> None:
         manifest = self.load()
 
-        runs = cli.item_runs(manifest, manifest["items"][0])
+        runs = cli.work_unit_runs(manifest, manifest["workUnits"][0])
 
         self.assertEqual(runs[0]["id"], "default")
         self.assertEqual(runs[0]["agent"], "build")
 
     def test_render_prompt_includes_run_and_execution_context(self) -> None:
         manifest = self.load()
-        item = manifest["items"][0]
+        item = manifest["workUnits"][0]
         run = {"id": "review", "index": 2, "mode": "sequential", "agent": "build", "model": "review-model"}
 
         rendered = cli.render_prompt(
@@ -323,11 +323,11 @@ class SelectionAndRenderingTests(OcmoTestCase):
 
     def test_render_prompt_supports_brace_dotted_placeholders(self) -> None:
         self.prompt.write_text(
-            "Range {{payload.rangeStart}}-{{ payload.rangeEnd }} for {{item.id}}/{{item_id}} in {{operation.id}} run {{run.id}} at {{execution.worktreePath}} payload {{payload}}",
+            "Range {{payload.rangeStart}}-{{ payload.rangeEnd }} for {{workUnit.id}}/{{work_unit_id}} in {{operation.id}} run {{run.id}} at {{execution.worktreePath}} payload {{payload}}",
             encoding="utf-8",
         )
         manifest = self.load()
-        item = manifest["items"][0]
+        item = manifest["workUnits"][0]
         item["payload"] = {"rangeStart": 41, "rangeEnd": 48, "optional": None}
         self.prompt.write_text(self.prompt.read_text(encoding="utf-8") + " optional {{payload.optional}}", encoding="utf-8")
 
@@ -342,11 +342,11 @@ class SelectionAndRenderingTests(OcmoTestCase):
         manifest = self.load()
 
         with self.assertRaisesRegex(cli.OcmoError, r"unresolved prompt placeholder: \{\{payload\.missing\}\}"):
-            cli.render_prompt(manifest, manifest["items"][0], self.manifest_path)
+            cli.render_prompt(manifest, manifest["workUnits"][0], self.manifest_path)
 
         self.prompt.write_text("Range {{missing.value}}", encoding="utf-8")
         with self.assertRaisesRegex(cli.OcmoError, r"unresolved prompt placeholder: \{\{missing\.value\}\}"):
-            cli.render_prompt(manifest, manifest["items"][0], self.manifest_path)
+            cli.render_prompt(manifest, manifest["workUnits"][0], self.manifest_path)
 
     def test_format_placeholder_value_handles_none(self) -> None:
         self.assertEqual(cli.format_placeholder_value(None), "")
@@ -361,11 +361,11 @@ class SelectionAndRenderingTests(OcmoTestCase):
         self.assertEqual(cli.compact_prompt_previews(previews, True), previews)
 
     def test_render_prompt_prepends_deterministic_skill_instructions(self) -> None:
-        self.prompt.write_text("Skills: $skill_names\nCommands:\n$skill_commands\n$item_id", encoding="utf-8")
+        self.prompt.write_text("Skills: $skill_names\nCommands:\n$skill_commands\n$work_unit_id", encoding="utf-8")
         manifest = self.load()
         manifest["prompt"]["skills"] = ["analysis", "/code-review"]
 
-        rendered = cli.render_prompt(manifest, manifest["items"][0], self.manifest_path)
+        rendered = cli.render_prompt(manifest, manifest["workUnits"][0], self.manifest_path)
 
         self.assertTrue(rendered.startswith("You must use the following opencode skills before doing this task, in order:\n- /analysis\n- /code-review"))
         self.assertIn("Skills: analysis, code-review", rendered)
@@ -376,14 +376,14 @@ class SelectionAndRenderingTests(OcmoTestCase):
         manifest["prompt"]["skills"] = ["implement"]
         run = {"id": "review", "index": 1, "mode": "sequential", "prompt": {"skills": ["review"]}}
 
-        rendered = cli.render_prompt(manifest, manifest["items"][0], self.manifest_path, run=run)
+        rendered = cli.render_prompt(manifest, manifest["workUnits"][0], self.manifest_path, run=run)
 
         self.assertIn("- /review", rendered)
         self.assertNotIn("- /implement", rendered)
 
     def test_render_prompt_injects_chained_artifacts(self) -> None:
         manifest = self.load()
-        item = manifest["items"][0]
+        item = manifest["workUnits"][0]
         plan_path = self.root / "artifacts" / "1" / "plan" / "plan.md"
         plan_path.parent.mkdir(parents=True)
         plan_path.write_text("Plan content", encoding="utf-8")
@@ -435,11 +435,11 @@ class SelectionAndRenderingTests(OcmoTestCase):
 
     def test_artifact_helpers_cover_defaults_and_errors(self) -> None:
         manifest = self.load()
-        item = manifest["items"][0]
+        item = manifest["workUnits"][0]
         self.assertEqual(cli.produced_artifacts({}), {})
         self.assertEqual(cli.validate_produces(None, "field"), set())
         self.assertEqual(cli.validate_produces({"plan": None}, "field"), {"plan"})
-        self.assertEqual(cli.artifact_relative_path(self.manifest_path, item, "run", "note", "artifacts/$item_id/$run_id/$artifact_id.md"), "artifacts/1/run/note.md")
+        self.assertEqual(cli.artifact_relative_path(self.manifest_path, item, "run", "note", "artifacts/$work_unit_id/$run_id/$artifact_id.md"), "artifacts/1/run/note.md")
         self.assertIn("will be generated", cli.consumed_artifacts(self.manifest_path, item, {"id": "implement", "consumes": ["plan.plan"]}, [{"id": "plan", "produces": {"plan": {}}}]))
         with self.assertRaisesRegex(cli.OcmoError, "artifact names"):
             cli.validate_artifact_name("bad name", "field")
@@ -513,7 +513,7 @@ class RunManifestTests(OcmoTestCase):
         impl_prompt.write_text("Implement $run_id $run_index", encoding="utf-8")
         review_prompt.write_text("Review $run_id $run_index", encoding="utf-8")
         manifest = self.load()
-        manifest["items"][0]["runs"] = {
+        manifest["workUnits"][0]["runs"] = {
             "mode": "sequential",
             "steps": [
                 {"id": "implement", "agent": "build", "prompt": {"template": str(impl_prompt)}, "produces": {"plan": {}}},
@@ -528,8 +528,8 @@ class RunManifestTests(OcmoTestCase):
 
         self.assertEqual(code, 0)
         output = stdout.getvalue()
-        self.assertIn("# item 1 / run implement", output)
-        self.assertIn("# item 1 / run review", output)
+        self.assertIn("# work unit 1 / run implement", output)
+        self.assertIn("# work unit 1 / run review", output)
         self.assertIn("# produces: plan -> artifacts/1/implement/plan.md", output)
         self.assertIn("# consumes: implement.plan", output)
         self.assertIn("Implement implement 1", output)
@@ -539,8 +539,8 @@ class RunManifestTests(OcmoTestCase):
 
     def test_run_manifest_executes_runs_in_order_and_writes_nested_state(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "one"}, {"id": "two", "agent": "build"}]}
+        manifest["workUnits"] = [manifest["workUnits"][0]]
+        manifest["workUnits"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "one"}, {"id": "two", "agent": "build"}]}
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
         calls: list[list[str]] = []
 
@@ -558,17 +558,17 @@ class RunManifestTests(OcmoTestCase):
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["control"]["status"], "completed")
         self.assertIn("completedAt", state)
-        self.assertEqual(state["items"]["1"]["status"], "completed")
-        self.assertEqual(state["items"]["1"]["runs"]["one"]["status"], "completed")
-        self.assertEqual(state["items"]["1"]["runs"]["two"]["status"], "completed")
-        self.assertEqual(state["items"]["1"]["runs"]["one"]["outputPath"], "outputs/1__one.txt")
-        self.assertEqual(state["items"]["1"]["runs"]["two"]["outputPath"], "outputs/1__two.txt")
+        self.assertEqual(state["workUnits"]["1"]["status"], "completed")
+        self.assertEqual(state["workUnits"]["1"]["runs"]["one"]["status"], "completed")
+        self.assertEqual(state["workUnits"]["1"]["runs"]["two"]["status"], "completed")
+        self.assertEqual(state["workUnits"]["1"]["runs"]["one"]["outputPath"], "outputs/1__one.txt")
+        self.assertEqual(state["workUnits"]["1"]["runs"]["two"]["outputPath"], "outputs/1__two.txt")
         self.assertIn("agent output for", (self.root / "outputs" / "1__one.txt").read_text(encoding="utf-8"))
         self.assertIn("[ocmo] exit code: 0", (self.root / "outputs" / "1__two.txt").read_text(encoding="utf-8"))
 
     def test_run_manifest_persists_opencode_token_usage(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
+        manifest["workUnits"] = [manifest["workUnits"][0]]
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
         stdout = "\n".join(
             [
@@ -583,7 +583,7 @@ class RunManifestTests(OcmoTestCase):
 
         self.assertEqual(code, 0)
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        usage = state["items"]["1"]["runs"]["default"]["usage"]
+        usage = state["workUnits"]["1"]["runs"]["default"]["usage"]
         self.assertEqual(usage["total"], 150)
         self.assertEqual(usage["input"], 60)
         self.assertEqual(usage["output"], 14)
@@ -623,8 +623,8 @@ class RunManifestTests(OcmoTestCase):
 
     def test_run_manifest_chains_required_artifacts(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
-        manifest["items"][0]["runs"] = {
+        manifest["workUnits"] = [manifest["workUnits"][0]]
+        manifest["workUnits"][0]["runs"] = {
             "mode": "sequential",
             "steps": [
                 {"id": "plan", "agent": "build", "produces": {"plan": {}}},
@@ -648,12 +648,12 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(code, 0)
         self.assertIn("artifact plan", prompts[1])
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(state["items"]["1"]["runs"]["plan"]["artifacts"], {"plan": "artifacts/1/plan/plan.md"})
+        self.assertEqual(state["workUnits"]["1"]["runs"]["plan"]["artifacts"], {"plan": "artifacts/1/plan/plan.md"})
 
     def test_run_manifest_fails_when_required_artifact_missing(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "plan", "agent": "build", "produces": {"plan": {}}}]}
+        manifest["workUnits"] = [manifest["workUnits"][0]]
+        manifest["workUnits"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "plan", "agent": "build", "produces": {"plan": {}}}]}
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
 
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "ok")), contextlib.redirect_stdout(io.StringIO()):
@@ -661,8 +661,8 @@ class RunManifestTests(OcmoTestCase):
 
         self.assertEqual(code, 1)
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(state["items"]["1"]["runs"]["plan"]["status"], "failed")
-        self.assertIn("required artifact", state["items"]["1"]["runs"]["plan"]["error"])
+        self.assertEqual(state["workUnits"]["1"]["runs"]["plan"]["status"], "failed")
+        self.assertIn("required artifact", state["workUnits"]["1"]["runs"]["plan"]["error"])
 
     def test_run_manifest_writes_clean_utf8_output_files(self) -> None:
         manifest = self.load()
@@ -688,8 +688,8 @@ class RunManifestTests(OcmoTestCase):
 
     def test_run_manifest_stops_later_runs_after_failure(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "one"}, {"id": "two"}]}
+        manifest["workUnits"] = [manifest["workUnits"][0]]
+        manifest["workUnits"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "one"}, {"id": "two"}]}
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
 
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(7, "")), contextlib.redirect_stdout(io.StringIO()):
@@ -698,13 +698,13 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(code, 1)
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["control"]["status"], "failed")
-        self.assertEqual(state["items"]["1"]["status"], "failed")
-        self.assertEqual(state["items"]["1"]["runs"]["one"]["status"], "failed")
-        self.assertNotIn("two", state["items"]["1"].get("runs", {}))
+        self.assertEqual(state["workUnits"]["1"]["status"], "failed")
+        self.assertEqual(state["workUnits"]["1"]["runs"]["one"]["status"], "failed")
+        self.assertNotIn("two", state["workUnits"]["1"].get("runs", {}))
 
     def test_timeout_marks_item_and_run_timed_out(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
+        manifest["workUnits"] = [manifest["workUnits"][0]]
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
 
         with mock.patch("ocmo.cli.subprocess.Popen", return_value=FakePopen(["opencode"], 0, "", timeout=True)), mock.patch("ocmo.cli.terminate_process_tree"), contextlib.redirect_stdout(io.StringIO()):
@@ -712,9 +712,9 @@ class RunManifestTests(OcmoTestCase):
 
         self.assertEqual(code, 1)
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(state["items"]["1"]["status"], "timed_out")
-        self.assertEqual(state["items"]["1"]["runs"]["default"]["status"], "timed_out")
-        self.assertEqual(state["items"]["1"]["runs"]["default"]["outputPath"], "outputs/1__default.txt")
+        self.assertEqual(state["workUnits"]["1"]["status"], "timed_out")
+        self.assertEqual(state["workUnits"]["1"]["runs"]["default"]["status"], "timed_out")
+        self.assertEqual(state["workUnits"]["1"]["runs"]["default"]["outputPath"], "outputs/1__default.txt")
         self.assertIn("[ocmo] timed out after 1 seconds", (self.root / "outputs" / "1__default.txt").read_text(encoding="utf-8"))
 
     def test_run_manifest_ctrl_c_marks_active_runs_paused_and_stops_processes(self) -> None:
@@ -734,8 +734,8 @@ class RunManifestTests(OcmoTestCase):
         terminate.assert_called_once_with(222, force=True)
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["control"]["status"], "paused")
-        self.assertEqual(state["items"]["1"]["status"], "paused")
-        self.assertEqual(state["items"]["1"]["runs"]["default"]["status"], "paused")
+        self.assertEqual(state["workUnits"]["1"]["status"], "paused")
+        self.assertEqual(state["workUnits"]["1"]["runs"]["default"]["status"], "paused")
 
     def test_run_opencode_command_ctrl_c_terminates_child_and_logs_interrupt(self) -> None:
         class InterruptingPopen(FakePopen):
@@ -757,9 +757,9 @@ class RunManifestTests(OcmoTestCase):
         terminate_before_start.assert_not_called()
         self.assertIn("[ocmo] interrupted", before_start_output.read_text(encoding="utf-8"))
 
-    def test_no_selected_items_returns_zero(self) -> None:
+    def test_no_selected_workUnits_returns_zero(self) -> None:
         manifest = self.load()
-        manifest["items"][0]["status"] = "completed"
+        manifest["workUnits"][0]["status"] = "completed"
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
 
         stdout = io.StringIO()
@@ -767,7 +767,7 @@ class RunManifestTests(OcmoTestCase):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, None, None, None, False, True))
 
         self.assertEqual(code, 0)
-        self.assertIn("No items selected.", stdout.getvalue())
+        self.assertIn("No work units selected.", stdout.getvalue())
 
     def test_run_manifest_rejects_invalid_cli_overrides(self) -> None:
         self.write_manifest()
@@ -816,7 +816,7 @@ class RunManifestTests(OcmoTestCase):
         registry = self.root / "registry"
         state = {
             "updatedAt": "now",
-            "items": {
+            "workUnits": {
                 "1": {"status": "running", "startedAt": "2026-05-21T10:00:00+00:00", "runCount": 1, "runs": {"default": {"status": "running", "outputPath": "outputs/1__default.txt"}}},
                 "2": {"status": "completed", "startedAt": "2026-05-21T10:00:00+00:00", "completedAt": "2026-05-21T10:02:03+00:00", "runCount": 1, "runs": {"default": {"status": "completed", "outputPath": "outputs/2__default.txt"}}},
             },
@@ -847,10 +847,10 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("ocmo-active active", output)
         self.assertIn("OC Mass Operations: test-op", output)
         self.assertIn("selected=2 running=1 completed=1 failed=0 pending=0 paused=0 killed=0 tokens=- updated=now", output)
-        self.assertIn("Item", output)
+        self.assertIn("Work Unit", output)
         self.assertIn("Progress", output)
         self.assertIn("Tokens", output)
-        self.assertIn("1     running", output)
+        self.assertRegex(output, r"1\s+running")
         self.assertIn("outputs/1__default.txt", output)
         self.assertIn("02:03", output)
 
@@ -860,7 +860,7 @@ class RunManifestTests(OcmoTestCase):
         registry.mkdir()
         state = {
             "updatedAt": "now",
-            "items": {
+            "workUnits": {
                 "1": {
                     "status": "completed",
                     "startedAt": "2026-05-21T10:00:00+00:00",
@@ -979,12 +979,12 @@ class RunManifestTests(OcmoTestCase):
             with contextlib.redirect_stdout(stdout):
                 cli.print_manifest_detached_runs(generated_manifest, include_inactive=True)
                 cli.print_detached_record(record, details=True)
-                cli.print_state_summary({"items": {"x": "bad"}})
+                cli.print_state_summary({"workUnits": {"x": "bad"}})
         finally:
             test_os.chdir(old_cwd)
         output = stdout.getvalue()
-        self.assertIn("items: none", output)
-        self.assertIn("items: unknown=1", output)
+        self.assertIn("workUnits: none", output)
+        self.assertIn("workUnits: unknown=1", output)
 
         inactive_record = cli.local_detached_record_path(generated_manifest, "inactive")
         inactive_record.write_text(json.dumps({"runId": "inactive", "pid": 2}), encoding="utf-8")
@@ -1007,7 +1007,7 @@ class RunManifestTests(OcmoTestCase):
             cli.print_manifest_detached_runs(generated_manifest, include_inactive=False)
         self.assertNotIn("detached runs:", stdout.getvalue())
 
-    def test_status_without_state_shows_manifest_items_as_snapshot(self) -> None:
+    def test_status_without_state_shows_manifest_workUnits_as_snapshot(self) -> None:
         self.write_manifest()
 
         stdout = io.StringIO()
@@ -1017,14 +1017,14 @@ class RunManifestTests(OcmoTestCase):
         output = stdout.getvalue()
         self.assertIn("OC Mass Operations: test-op", output)
         self.assertIn("selected=2 running=0 completed=1 failed=0 pending=1 paused=0 killed=0 tokens=- updated=-", output)
-        self.assertIn("1     pending", output)
-        self.assertIn("2     completed", output)
+        self.assertIn("1          pending", output)
+        self.assertRegex(output, r"2\s+completed")
         self.assertIn("First", output)
 
     def test_status_warns_when_detached_run_is_stale(self) -> None:
         self.write_manifest()
         state = {
-            "items": {
+            "workUnits": {
                 "1": {"status": "running", "startedAt": "2026-05-21T10:00:00+00:00", "runs": {"default": {"status": "running"}}},
             },
         }
@@ -1037,11 +1037,11 @@ class RunManifestTests(OcmoTestCase):
 
         output = stdout.getvalue()
         self.assertIn("detached: stale inactive", output)
-        self.assertIn("warning: detached run is inactive but state contains running items", output)
+        self.assertIn("warning: detached run is inactive but state contains running work units", output)
 
     def test_status_multistep_progress_uses_current_run(self) -> None:
         manifest = self.load()
-        manifest["items"][0]["runs"] = {
+        manifest["workUnits"][0]["runs"] = {
             "mode": "sequential",
             "steps": [
                 {"id": "analyze", "prompt": {"template": self.prompt.as_posix()}},
@@ -1050,7 +1050,7 @@ class RunManifestTests(OcmoTestCase):
         }
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
         state = {
-            "items": {
+            "workUnits": {
                 "1": {
                     "status": "running",
                     "startedAt": "2026-05-21T10:00:00+00:00",
@@ -1077,7 +1077,7 @@ class RunManifestTests(OcmoTestCase):
         self.write_manifest()
         registry = self.root / "registry"
         registry.mkdir()
-        state = {"updatedAt": "later", "items": {"1": {"status": "failed"}}}
+        state = {"updatedAt": "later", "workUnits": {"1": {"status": "failed"}}}
         (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
         record = {
             "runId": "details",
@@ -1123,7 +1123,7 @@ class RunManifestTests(OcmoTestCase):
     def test_operation_status_helper_edge_cases(self) -> None:
         manifest = self.load()
         state = {
-            "items": {
+            "workUnits": {
                 "1": {"status": "failed", "startedAt": "not-a-date", "error": "item error"},
                 "2": {"status": "queued", "startedAt": "2026-05-21T10:00:00"},
                 "state-only": {"status": "running", "worktreePath": "wt-path", "runs": {"default": "bad"}},
@@ -1149,7 +1149,7 @@ class RunManifestTests(OcmoTestCase):
     def test_pause_and_kill_mark_active_runs_and_stop_processes(self) -> None:
         self.write_manifest()
         state = {
-            "items": {
+            "workUnits": {
                 "1": {"status": "running", "runs": {"default": {"status": "running", "pid": 111, "sessionId": "ses-one"}}},
                 "2": {"status": "running", "runs": {"default": {"status": "running", "pid": 222}}},
             }
@@ -1162,25 +1162,25 @@ class RunManifestTests(OcmoTestCase):
             self.assertEqual(cli.main(["operation", "pause", str(self.manifest_path)]), 0)
 
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["items"]["1"]["status"], "paused")
-        self.assertEqual(data["items"]["2"]["status"], "paused_unresumable")
+        self.assertEqual(data["workUnits"]["1"]["status"], "paused")
+        self.assertEqual(data["workUnits"]["2"]["status"], "paused_unresumable")
         self.assertEqual(sorted(stopped), [111, 222])
         self.assertIn("paused: test-op", stdout.getvalue())
 
-        data["items"]["1"]["status"] = "running"
-        data["items"]["1"]["runs"]["default"]["status"] = "running"
+        data["workUnits"]["1"]["status"] = "running"
+        data["workUnits"]["1"]["runs"]["default"]["status"] = "running"
         (self.root / "state.json").write_text(json.dumps(data), encoding="utf-8")
         with mock.patch("ocmo.cli.terminate_process_tree"), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["operation", "kill", str(self.manifest_path), "--force"]), 0)
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["items"]["1"]["status"], "killed")
+        self.assertEqual(data["workUnits"]["1"]["status"], "killed")
 
     def test_resume_uses_session_id_and_refuses_unresumable_runs(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
+        manifest["workUnits"] = [manifest["workUnits"][0]]
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
         state = {
-            "items": {
+            "workUnits": {
                 "1": {"status": "paused", "runs": {"default": {"status": "paused", "sessionId": "ses-123"}}},
             }
         }
@@ -1197,18 +1197,18 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("ses-123", commands[0])
         self.assertNotIn("--continue", commands[0])
 
-        state["items"]["1"]["status"] = "paused_unresumable"
-        state["items"]["1"]["runs"]["default"] = {"status": "paused_unresumable"}
+        state["workUnits"]["1"]["status"] = "paused_unresumable"
+        state["workUnits"]["1"]["runs"]["default"] = {"status": "paused_unresumable"}
         (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["operation", "resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 1)
 
     def test_rerun_unresumable_starts_fresh_and_clears_stale_run_state(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
+        manifest["workUnits"] = [manifest["workUnits"][0]]
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
         state = {
-            "items": {
+            "workUnits": {
                 "1": {
                     "status": "paused_unresumable",
                     "error": "old item error",
@@ -1239,9 +1239,9 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(len(commands), 1)
         self.assertNotIn("--session", commands[0])
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["items"]["1"]["status"], "completed")
-        self.assertNotIn("error", data["items"]["1"])
-        run_state = data["items"]["1"]["runs"]["default"]
+        self.assertEqual(data["workUnits"]["1"]["status"], "completed")
+        self.assertNotIn("error", data["workUnits"]["1"])
+        run_state = data["workUnits"]["1"]["runs"]["default"]
         self.assertEqual(run_state["status"], "completed")
         self.assertNotIn("sessionId", run_state)
         self.assertEqual(run_state["pid"], 1234)
@@ -1264,7 +1264,7 @@ class RunManifestTests(OcmoTestCase):
 """
         )
         state = {
-            "items": {
+            "workUnits": {
                 "1": {"status": "timed_out", "runs": {"default": {"status": "timed_out"}}},
                 "2": {"status": "paused", "runs": {"default": {"status": "paused", "sessionId": "ses-2"}}},
                 "3": {"status": "failed", "runs": {"default": {"status": "failed"}}},
@@ -1272,18 +1272,18 @@ class RunManifestTests(OcmoTestCase):
                 "5": {"status": "running", "runs": {"default": {"status": "paused_unresumable"}}},
             }
         }
-        selected = cli.select_rerun_items(manifest, state, "retryable")
+        selected = cli.select_rerun_work_units(manifest, state, "retryable")
         self.assertEqual([str(item["id"]) for item in selected], ["1", "3", "4", "5"])
-        self.assertEqual([str(item["id"]) for item in cli.select_rerun_items(manifest, state, "timed-out")], ["1"])
-        self.assertEqual([str(item["id"]) for item in cli.select_rerun_items(manifest, state, "failed")], ["3"])
-        self.assertEqual([str(item["id"]) for item in cli.select_rerun_items(manifest, state, "killed")], ["4"])
-        self.assertEqual([str(item["id"]) for item in cli.select_rerun_items(manifest, state, "all")], ["1", "2", "3", "4", "5"])
-        self.assertEqual([str(item["id"]) for item in cli.select_rerun_items(manifest, state, "1")], ["1"])
+        self.assertEqual([str(item["id"]) for item in cli.select_rerun_work_units(manifest, state, "timed-out")], ["1"])
+        self.assertEqual([str(item["id"]) for item in cli.select_rerun_work_units(manifest, state, "failed")], ["3"])
+        self.assertEqual([str(item["id"]) for item in cli.select_rerun_work_units(manifest, state, "killed")], ["4"])
+        self.assertEqual([str(item["id"]) for item in cli.select_rerun_work_units(manifest, state, "all")], ["1", "2", "3", "4", "5"])
+        self.assertEqual([str(item["id"]) for item in cli.select_rerun_work_units(manifest, state, "1")], ["1"])
 
     def test_detached_rerun_starts_rerun_child_command(self) -> None:
         self.write_manifest()
         registry = self.root / "registry"
-        state = {"items": {"1": {"status": "timed_out", "runs": {"default": {"status": "timed_out"}}}}}
+        state = {"workUnits": {"1": {"status": "timed_out", "runs": {"default": {"status": "timed_out"}}}}}
         (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
         captured = {}
 
@@ -1335,10 +1335,10 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("detached run not found", stderr.getvalue())
 
         state_path = self.root / "state.json"
-        state_path.write_text(json.dumps({"items": {"x": "bad", "1": {"status": "running", "runs": {"default": {"status": "completed"}}}}}), encoding="utf-8")
+        state_path.write_text(json.dumps({"workUnits": {"x": "bad", "1": {"status": "running", "runs": {"default": {"status": "completed"}}}}}), encoding="utf-8")
         self.assertEqual(cli.mark_active_runs(state_path, "paused"), 0)
         self.assertEqual(cli.mark_active_runs(self.root / "missing.json", "paused"), 0)
-        self.assertEqual(cli.active_state_pids({"items": {"x": "bad"}}), [])
+        self.assertEqual(cli.active_state_pids({"workUnits": {"x": "bad"}}), [])
 
         self.assertEqual(cli.extract_session_id("not json\n{"), None)
         self.assertEqual(cli.extract_session_id('{"session":{}}\n'), None)
@@ -1405,7 +1405,7 @@ class RunManifestTests(OcmoTestCase):
             self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 0)
         self.assertFalse(generated_dir.exists())
 
-        self.assertEqual(cli.select_paused_items({"items": ["bad", {"id": "1"}, {"id": "2"}]}, {"items": {"1": "bad", "2": {"runs": {"default": {"status": "completed"}}}}}), [])
+        self.assertEqual(cli.select_paused_work_units({"workUnits": ["bad", {"id": "1"}, {"id": "2"}]}, {"workUnits": {"1": "bad", "2": {"runs": {"default": {"status": "completed"}}}}}), [])
 
     def test_process_termination_helpers(self) -> None:
         cli.terminate_process_tree(0)
@@ -1439,11 +1439,11 @@ class RunManifestTests(OcmoTestCase):
 
     def test_resume_multistep_skip_and_missing_session_branches(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "done"}, {"id": "one"}, {"id": "two"}, {"id": "three"}]}
+        manifest["workUnits"] = [manifest["workUnits"][0]]
+        manifest["workUnits"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "done"}, {"id": "one"}, {"id": "two"}, {"id": "three"}]}
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
         state = {
-            "items": {
+            "workUnits": {
                 "1": {
                     "status": "paused",
                     "runs": {
@@ -1467,14 +1467,14 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("--session", commands[0])
         self.assertNotIn("--session", commands[1])
 
-        state["items"]["1"]["runs"]["two"] = {"status": "paused"}
+        state["workUnits"]["1"]["runs"]["two"] = {"status": "paused"}
         (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["operation", "resume", str(self.manifest_path), "--yes", "--ui", "plain"]), 1)
 
     def test_run_item_preserves_control_status_after_terminated_child(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
+        manifest["workUnits"] = [manifest["workUnits"][0]]
         state = cli.StateStore(self.root / "state.json")
         state.ensure_operation(manifest)
 
@@ -1483,22 +1483,22 @@ class RunManifestTests(OcmoTestCase):
             return subprocess.CompletedProcess(command, 1, stdout="", stderr=None)
 
         with mock.patch("ocmo.cli.run_opencode_command", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.run_item(manifest, self.manifest_path, manifest["items"][0], state, None, {"enabled": False}), 1)
+            self.assertEqual(cli.run_item(manifest, self.manifest_path, manifest["workUnits"][0], state, None, {"enabled": False}), 1)
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["items"]["1"]["runs"]["default"]["status"], "paused")
+        self.assertEqual(data["workUnits"]["1"]["runs"]["default"]["status"], "paused")
 
     def test_run_item_preserves_existing_resumed_at_on_normal_run(self) -> None:
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
+        manifest["workUnits"] = [manifest["workUnits"][0]]
         state = cli.StateStore(self.root / "state.json")
         state.ensure_operation(manifest)
         state.patch("1", {"resumedAt": "previous-resume"})
 
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "ok")), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.run_item(manifest, self.manifest_path, manifest["items"][0], state, None, {"enabled": False}), 0)
+            self.assertEqual(cli.run_item(manifest, self.manifest_path, manifest["workUnits"][0], state, None, {"enabled": False}), 0)
 
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["items"]["1"]["resumedAt"], "previous-resume")
+        self.assertEqual(data["workUnits"]["1"]["resumedAt"], "previous-resume")
 
     def test_run_manifest_rejects_single_worktree_runtime_conflicts(self) -> None:
         manifest = self.load()
@@ -1512,7 +1512,7 @@ class RunManifestTests(OcmoTestCase):
         with contextlib.redirect_stdout(stdout):
             code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", 2, None, True, False, allow_shared_worktree_concurrency=True))
         self.assertEqual(code, 0)
-        self.assertIn("# item 1 / run default", stdout.getvalue())
+        self.assertIn("# work unit 1 / run default", stdout.getvalue())
 
         manifest["queue"]["concurrency"] = 2
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
@@ -1547,8 +1547,8 @@ class RunManifestTests(OcmoTestCase):
 
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(code, 1)
-        self.assertEqual(state["items"]["1"]["status"], "failed")
-        self.assertIn("unexpected worker error", state["items"]["1"]["error"])
+        self.assertEqual(state["workUnits"]["1"]["status"], "failed")
+        self.assertIn("unexpected worker error", state["workUnits"]["1"]["error"])
 
     def test_run_item_failed_before_start_and_render_failures_are_recorded(self) -> None:
         manifest = self.load()
@@ -1568,8 +1568,8 @@ class RunManifestTests(OcmoTestCase):
             code = cli.run_item(manifest, self.manifest_path, {"id": "1"}, state, None, {"enabled": False})
         data = json.loads((self.root / "state2.json").read_text(encoding="utf-8"))
         self.assertEqual(code, 1)
-        self.assertEqual(data["items"]["1"]["status"], "failed")
-        self.assertEqual(data["items"]["1"]["runs"]["default"]["status"], "failed")
+        self.assertEqual(data["workUnits"]["1"]["status"], "failed")
+        self.assertEqual(data["workUnits"]["1"]["runs"]["default"]["status"], "failed")
 
     def test_run_item_oserror_from_subprocess_records_failed_run(self) -> None:
         manifest = self.load()
@@ -1577,12 +1577,12 @@ class RunManifestTests(OcmoTestCase):
         state.ensure_operation(manifest)
 
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=OSError("cannot start")), contextlib.redirect_stdout(io.StringIO()):
-            code = cli.run_item(manifest, self.manifest_path, manifest["items"][0], state, None, {"enabled": False})
+            code = cli.run_item(manifest, self.manifest_path, manifest["workUnits"][0], state, None, {"enabled": False})
 
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(code, 1)
-        self.assertEqual(data["items"]["1"]["status"], "failed")
-        self.assertEqual(data["items"]["1"]["runs"]["default"]["status"], "failed")
+        self.assertEqual(data["workUnits"]["1"]["status"], "failed")
+        self.assertEqual(data["workUnits"]["1"]["runs"]["default"]["status"], "failed")
 
     def test_cleanup_failure_after_success_marks_cleanup_failed(self) -> None:
         manifest = self.load()
@@ -1602,14 +1602,14 @@ class RunManifestTests(OcmoTestCase):
 
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(code, 1)
-        self.assertEqual(data["items"]["1"]["status"], "cleanup_failed")
+        self.assertEqual(data["workUnits"]["1"]["status"], "cleanup_failed")
 
 
 class WorktreeTests(OcmoTestCase):
     def test_worktree_execution_slugifies_paths_and_branch(self) -> None:
         manifest = self.load()
         manifest["operation"]["id"] = "My Operation"
-        manifest["queue"]["autoWorktrees"] = {"enabled": True, "root": "worktrees", "baseBranch": "main", "branchPattern": "ocmo/{operation_id}/{item_slug}"}
+        manifest["queue"]["autoWorktrees"] = {"enabled": True, "root": "worktrees", "baseBranch": "main", "branchPattern": "ocmo/{operation_id}/{work_unit_slug}"}
         item = {"id": "Item 01 / A"}
 
         execution = cli.worktree_execution(manifest, self.manifest_path, item)
@@ -1629,7 +1629,7 @@ class WorktreeTests(OcmoTestCase):
 
         self.assertEqual(code, 1)
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["items"]["1"]["status"], "worktree_failed")
+        self.assertEqual(data["workUnits"]["1"]["status"], "worktree_failed")
 
     def test_cleanup_worktree_marks_removed_on_success(self) -> None:
         manifest = self.load()
@@ -1644,7 +1644,7 @@ class WorktreeTests(OcmoTestCase):
         self.assertEqual(code, 0)
         run.assert_called_once()
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["items"]["1"]["worktreeStatus"], "removed")
+        self.assertEqual(data["workUnits"]["1"]["worktreeStatus"], "removed")
 
     def test_worktree_env_sets_ocmo_and_paseo_variables(self) -> None:
         env = cli.worktree_env({"sourceWorkspace": "src", "worktreePath": "wt", "branchName": "branch"})
@@ -1671,7 +1671,7 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertEqual(render_code, 0)
         output = stdout.getvalue()
         self.assertIn("valid:", output)
-        self.assertIn("# item 1 / run default", output)
+        self.assertIn("# work unit 1 / run default", output)
 
     def test_main_validate_and_render_warn_for_shared_single_worktree_concurrency(self) -> None:
         manifest = self.load()
@@ -1688,7 +1688,7 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertEqual(validate_code, 0)
         self.assertEqual(render_code, 0)
         self.assertIn("valid:", stdout.getvalue())
-        self.assertIn("# item 1 / run default", stdout.getvalue())
+        self.assertIn("# work unit 1 / run default", stdout.getvalue())
         self.assertEqual(stderr.getvalue().count("--allow-shared-worktree-concurrency"), 2)
 
     def test_main_render_defaults_manifest_and_accepts_directory(self) -> None:
@@ -1701,13 +1701,13 @@ class CliEntrypointTests(OcmoTestCase):
         with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), contextlib.redirect_stdout(stdout):
             code = cli.main(["operation", "render", "--select", "1"])
         self.assertEqual(code, 0)
-        self.assertIn("# item 1 / run default", stdout.getvalue())
+        self.assertIn("# work unit 1 / run default", stdout.getvalue())
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             code = cli.main(["operation", "render", str(manifest_dir), "--select", "1"])
         self.assertEqual(code, 0)
-        self.assertIn("# item 1 / run default", stdout.getvalue())
+        self.assertIn("# work unit 1 / run default", stdout.getvalue())
 
     def test_main_render_and_run_infer_single_generated_manifest(self) -> None:
         self.write_manifest()
@@ -1721,7 +1721,7 @@ class CliEntrypointTests(OcmoTestCase):
         with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), contextlib.redirect_stdout(stdout):
             code = cli.main(["operation", "render", "--select", "1"])
         self.assertEqual(code, 0)
-        self.assertIn("# item 1 / run default", stdout.getvalue())
+        self.assertIn("# work unit 1 / run default", stdout.getvalue())
 
         with mock.patch("ocmo.cli.Path.cwd", return_value=self.root), mock.patch("ocmo.cli.run_manifest", return_value=0) as run:
             code = cli.main(["operation", "run", "--dry-run"])
@@ -1730,7 +1730,7 @@ class CliEntrypointTests(OcmoTestCase):
 
     def test_main_render_compacts_many_prompts_unless_all_is_set(self) -> None:
         manifest = self.load()
-        manifest["items"] = [
+        manifest["workUnits"] = [
             {"id": f"ITEM-{index}", "status": "pending", "payload": {"name": f"Item {index}"}}
             for index in range(1, 6)
         ]
@@ -1742,18 +1742,18 @@ class CliEntrypointTests(OcmoTestCase):
 
         self.assertEqual(code, 0)
         output = stdout.getvalue()
-        self.assertIn("# item ITEM-1 / run default", output)
-        self.assertIn("# item ITEM-2 / run default", output)
-        self.assertIn("# item ITEM-5 / run default", output)
+        self.assertIn("# work unit ITEM-1 / run default", output)
+        self.assertIn("# work unit ITEM-2 / run default", output)
+        self.assertIn("# work unit ITEM-5 / run default", output)
         self.assertIn("# ... 2 prompt(s) omitted ...", output)
-        self.assertNotIn("# item ITEM-3 / run default", output)
+        self.assertNotIn("# work unit ITEM-3 / run default", output)
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             code = cli.main(["operation", "render", str(self.manifest_path), "--select", "all", "--all"])
 
         self.assertEqual(code, 0)
-        self.assertIn("# item ITEM-3 / run default", stdout.getvalue())
+        self.assertIn("# work unit ITEM-3 / run default", stdout.getvalue())
 
     def test_main_run_defaults_manifest_and_accepts_directory(self) -> None:
         self.write_manifest()
@@ -2056,7 +2056,7 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         with self.assertRaisesRegex(cli.OcmoError, "runner.mode is no longer supported"):
             cli.validate_manifest(manifest, self.manifest_path)
 
-    def test_validation_rejects_invalid_timeout_concurrency_prompt_and_items(self) -> None:
+    def test_validation_rejects_invalid_timeout_concurrency_prompt_and_workUnits(self) -> None:
         manifest = self.load()
         manifest["runner"]["timeoutSeconds"] = 0
         with self.assertRaisesRegex(cli.OcmoError, "runner.timeoutSeconds"):
@@ -2073,53 +2073,53 @@ class EdgeCaseCoverageTests(OcmoTestCase):
             cli.validate_manifest(manifest, self.manifest_path)
 
         manifest = self.load()
-        manifest["items"] = []
-        with self.assertRaisesRegex(cli.OcmoError, "items must be a non-empty list"):
+        manifest["workUnits"] = []
+        with self.assertRaisesRegex(cli.OcmoError, "workUnits must be a non-empty list"):
             cli.validate_manifest(manifest, self.manifest_path)
 
         manifest = self.load()
-        manifest["items"] = ["bad"]
-        with self.assertRaisesRegex(cli.OcmoError, r"items\[1\] must be a mapping"):
+        manifest["workUnits"] = ["bad"]
+        with self.assertRaisesRegex(cli.OcmoError, r"workUnits\[1\] must be a mapping"):
             cli.validate_manifest(manifest, self.manifest_path)
 
         manifest = self.load()
-        del manifest["items"][0]["id"]
-        with self.assertRaisesRegex(cli.OcmoError, r"items\[1\].id is required"):
+        del manifest["workUnits"][0]["id"]
+        with self.assertRaisesRegex(cli.OcmoError, r"workUnits\[1\].id is required"):
             cli.validate_manifest(manifest, self.manifest_path)
 
         manifest = self.load()
-        manifest["items"][1]["id"] = "1"
-        with self.assertRaisesRegex(cli.OcmoError, "duplicate item id"):
+        manifest["workUnits"][1]["id"] = "1"
+        with self.assertRaisesRegex(cli.OcmoError, "duplicate work unit id"):
             cli.validate_manifest(manifest, self.manifest_path)
 
     def test_validation_rejects_invalid_runs_shape_and_prompt(self) -> None:
         manifest = self.load()
-        manifest["items"][0]["runs"] = []
+        manifest["workUnits"][0]["runs"] = []
         with self.assertRaisesRegex(cli.OcmoError, "runs must be a mapping"):
             cli.validate_manifest(manifest, self.manifest_path)
 
         manifest = self.load()
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": []}
+        manifest["workUnits"][0]["runs"] = {"mode": "sequential", "steps": []}
         with self.assertRaisesRegex(cli.OcmoError, "runs.steps must be a non-empty list"):
             cli.validate_manifest(manifest, self.manifest_path)
 
         manifest = self.load()
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": ["bad"]}
+        manifest["workUnits"][0]["runs"] = {"mode": "sequential", "steps": ["bad"]}
         with self.assertRaisesRegex(cli.OcmoError, r"runs.steps\[1\] must be a mapping"):
             cli.validate_manifest(manifest, self.manifest_path)
 
         manifest = self.load()
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": ""}]}
+        manifest["workUnits"][0]["runs"] = {"mode": "sequential", "steps": [{"id": ""}]}
         with self.assertRaisesRegex(cli.OcmoError, "id is required"):
             cli.validate_manifest(manifest, self.manifest_path)
 
         manifest = self.load()
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "x", "prompt": []}]}
+        manifest["workUnits"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "x", "prompt": []}]}
         with self.assertRaisesRegex(cli.OcmoError, "prompt must be a mapping"):
             cli.validate_manifest(manifest, self.manifest_path)
 
         manifest = self.load()
-        manifest["items"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "x", "prompt": {"template": str(self.root / "missing.md")}}]}
+        manifest["workUnits"][0]["runs"] = {"mode": "sequential", "steps": [{"id": "x", "prompt": {"template": str(self.root / "missing.md")}}]}
         with self.assertRaisesRegex(cli.OcmoError, "prompt template not found"):
             cli.validate_manifest(manifest, self.manifest_path)
 
@@ -2205,7 +2205,7 @@ class EdgeCaseCoverageTests(OcmoTestCase):
                 cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, True, False))
 
         manifest = self.load()
-        manifest["items"] = [manifest["items"][0]]
+        manifest["workUnits"] = [manifest["workUnits"][0]]
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.run_item", side_effect=RuntimeError("boom")), contextlib.redirect_stdout(stdout):
@@ -2337,12 +2337,12 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         self.assertEqual(cli.state_path(manifest, self.manifest_path), (self.root / ".ocmo" / "state" / "test-op.json").resolve())
 
         state_path = self.root / "state.json"
-        state_path.write_text(json.dumps({"items": {"1": {"old": True}}}), encoding="utf-8")
+        state_path.write_text(json.dumps({"workUnits": {"1": {"old": True}}}), encoding="utf-8")
         store = cli.StateStore(state_path)
         store.mark("1", "running", {"new": True})
         data = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertTrue(data["items"]["1"]["old"])
-        self.assertTrue(data["items"]["1"]["new"])
+        self.assertTrue(data["workUnits"]["1"]["old"])
+        self.assertTrue(data["workUnits"]["1"]["new"])
 
     def test_plan_manifest_missing_prompt_success_and_failure(self) -> None:
         missing = self.root / "missing.txt"
@@ -2472,7 +2472,7 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         output = f"""{cli.MANIFEST_START}
 {manifest_text}{cli.MANIFEST_END}
 {cli.FILE_START} prompts/generated.md
-Generated template for $item_id
+Generated template for $work_unit_id
 {cli.FILE_END}
 """
 
@@ -2481,7 +2481,7 @@ Generated template for $item_id
 
         self.assertEqual(code, 0)
         self.assertEqual(out.read_text(encoding="utf-8"), manifest_text)
-        self.assertEqual((out.parent / "prompts" / "generated.md").read_text(encoding="utf-8"), "Generated template for $item_id\n")
+        self.assertEqual((out.parent / "prompts" / "generated.md").read_text(encoding="utf-8"), "Generated template for $work_unit_id\n")
 
     def test_plan_output_rejects_unsafe_duplicate_and_missing_generated_files(self) -> None:
         with self.assertRaisesRegex(cli.OcmoError, "require OCMO_MANIFEST_START"):
@@ -2519,8 +2519,8 @@ Generated template for $item_id
             + "            template: prompts/review.md\n"
         )
         self.assertEqual(cli.plan_template_paths(multi_run), ["prompts/default.md", "prompts/review.md"])
-        multi_run["items"][1]["runs"]["steps"].append({"id": "no-prompt"})
-        multi_run["items"].append({"id": "bad-runs", "runs": {"steps": "not-a-list"}})
+        multi_run["workUnits"][1]["runs"]["steps"].append({"id": "no-prompt"})
+        multi_run["workUnits"].append({"id": "bad-runs", "runs": {"steps": "not-a-list"}})
         self.assertEqual(cli.plan_template_paths(multi_run), ["prompts/default.md", "prompts/review.md"])
 
     def test_plan_manifest_interactive_extracts_marked_yaml(self) -> None:
@@ -2609,7 +2609,7 @@ Generated template for $item_id
         prompt = self.root / "request.txt"
         prompt.write_text("Request", encoding="utf-8")
         out = self.root / "planned.yaml"
-        invalid = "schema: ocmo/v1\noperation:\n  id: op\n  workspace: .\nrunner:\n  command: opencode\nqueue:\n  concurrency: 1\nprompt:\n  template: |\n    inline text\nitems:\n  - id: one\n"
+        invalid = "schema: ocmo/v1\noperation:\n  id: op\n  workspace: .\nrunner:\n  command: opencode\nqueue:\n  concurrency: 1\nprompt:\n  template: |\n    inline text\nworkUnits:\n  - id: one\n"
 
         with mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["opencode"], 0, stdout=invalid, stderr="")):
             with self.assertRaisesRegex(cli.OcmoError, "planner did not produce"):
@@ -2751,7 +2751,7 @@ class WorkflowTests(OcmoTestCase):
         directory = self.root / name
         directory.mkdir(exist_ok=True)
         prompt = directory / "prompt.md"
-        prompt.write_text("Item $item_id", encoding="utf-8")
+        prompt.write_text("Item $work_unit_id", encoding="utf-8")
         manifest = directory / "manifest.yaml"
         manifest.write_text(
             f"""schema: ocmo/v1
@@ -2769,7 +2769,7 @@ prompt:
   template: {prompt.as_posix()}
 state:
   path: {(directory / (state_name or 'state.json')).as_posix()}
-items:
+workUnits:
   - id: "1"
     status: pending
     payload: {{}}
@@ -2949,7 +2949,7 @@ steps:
         manifest = cli.load_manifest(first)
         operation_state_path = cli.state_path(manifest, first)
         operation_state_path.write_text(
-            json.dumps({"items": {"1": {"status": "running", "runs": {"default": {"status": "running", "pid": 222}}}}}),
+            json.dumps({"workUnits": {"1": {"status": "running", "runs": {"default": {"status": "running", "pid": 222}}}}}),
             encoding="utf-8",
         )
         (self.root / "workflow-state.json").write_text(
@@ -2970,8 +2970,8 @@ steps:
         operation_state = json.loads(operation_state_path.read_text(encoding="utf-8"))
         workflow_state = json.loads((self.root / "workflow-state.json").read_text(encoding="utf-8"))
         self.assertNotIn("completedAt", workflow_state)
-        self.assertEqual(operation_state["items"]["1"]["status"], "killed")
-        self.assertEqual(operation_state["items"]["1"]["runs"]["default"]["status"], "killed")
+        self.assertEqual(operation_state["workUnits"]["1"]["status"], "killed")
+        self.assertEqual(operation_state["workUnits"]["1"]["runs"]["default"]["status"], "killed")
 
     def test_workflow_status_aggregates_operation_usage(self) -> None:
         workflow, first, _ = self.write_workflow()
@@ -2980,7 +2980,7 @@ steps:
             json.dumps(
                 {
                     "schema": "ocmo-state/v1",
-                    "items": {
+                    "workUnits": {
                         "1": {
                             "status": "completed",
                             "runs": {"default": {"status": "completed", "usage": {"input": 10, "output": 5, "total": 15, "steps": 1}}},
