@@ -103,7 +103,9 @@ Core concepts:
 - Selection: item filter such as `uncompleted`, `all`, `ITEM-001`, or `1-10`.
 - State file: durable JSON state written by `ocmo operation run` or `ocmo workflow run` for status, resume, and audit.
 
-## Typical Workflow
+## Typical Operation
+
+This walkthrough creates and runs one operation. Workflow orchestration is covered separately in [Workflows](#workflows).
 
 1. Write a rough mass-operation request.
 
