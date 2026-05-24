@@ -1,0 +1,38 @@
+schema: ocmo/v1
+operation:
+  id: handoff-smoke-block
+  workspace: .
+runner:
+  command: python
+  agent: build
+queue:
+  concurrency: 1
+policy:
+  worktree: isolated
+prompt:
+  template: prompt.md
+state:
+  path: state-block.json
+workUnits:
+  - id: BUG-BLOCK
+    title: Blocked handoff smoke
+    status: pending
+    payload:
+      mode: block
+    runs:
+      mode: sequential
+      steps:
+        - id: plan
+          agent: build
+          produces:
+            handoff:
+              type: handoff
+              required: true
+              gates:
+                decision: proceed
+                minConfidence: 0.9
+                requireConditionsMet: true
+        - id: implement
+          agent: build
+          consumes:
+            - plan.handoff

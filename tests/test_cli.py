@@ -154,6 +154,25 @@ class ValidationTests(OcmoTestCase):
 
         cli.validate_manifest(manifest, self.manifest_path)
 
+    def test_validates_handoff_artifact_gates(self) -> None:
+        manifest = self.load()
+        manifest["workUnits"][0]["runs"] = {
+            "mode": "sequential",
+            "steps": [
+                {
+                    "id": "plan",
+                    "produces": {
+                        "handoff": {
+                            "type": "handoff",
+                            "gates": {"decision": "proceed", "minConfidence": 0.9, "requireConditionsMet": True},
+                        }
+                    },
+                }
+            ],
+        }
+
+        cli.validate_manifest(manifest, self.manifest_path)
+
     def test_rejects_unsupported_run_mode(self) -> None:
         manifest = self.load()
         manifest["workUnits"][0]["runs"] = {"mode": "parallel", "steps": [{"id": "one"}]}
@@ -213,6 +232,11 @@ class ValidationTests(OcmoTestCase):
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": []}]}}, r"produces must be a mapping"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"bad name": {}}}]}}, r"simple artifact name"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"path": "../plan.md"}}}]}}, r"under artifacts/"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"type": "note"}}}]}}, r"type must be handoff"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"gates": {"decision": "proceed"}}}}]}}, r"gates requires type: handoff"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"type": "handoff", "gates": []}}}]}}, r"gates must be a mapping"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"type": "handoff", "gates": {"minConfidence": 2}}}}]}}, r"minConfidence"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"type": "handoff", "gates": {"requireConditionsMet": "yes"}}}}]}}, r"requireConditionsMet"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "consumes": "plan.plan"}]}}, r"consumes must be a list"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "consumes": ["plan.plan"]}]}}, r"earlier step"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "plan", "produces": {"notes": {}}}, {"id": "build", "consumes": ["plan.plan"]}]}}, r"unknown artifact"),
@@ -425,6 +449,7 @@ class SelectionAndRenderingTests(OcmoTestCase):
         self.assertEqual(cli.validate_produces({"plan": None}, "field"), {"plan"})
         self.assertEqual(cli.produced_artifacts({}), {})
         self.assertEqual(cli.verify_required_artifacts(self.manifest_path, {"id": "1"}, {"id": "run", "produces": {"note": {"required": False}}}), {})
+        self.assertEqual(cli.produced_artifact_relative_path(self.manifest_path, {"id": "1"}, "plan", "handoff", {"type": "handoff"}), "artifacts/1/plan/handoff.json")
         rendered = cli.consumed_artifacts(
             self.manifest_path,
             {"id": "1"},
@@ -432,6 +457,42 @@ class SelectionAndRenderingTests(OcmoTestCase):
             [{"id": "plan", "produces": {"plan": {}}}, {"id": "implement"}],
         )
         self.assertIn("will be generated", rendered)
+
+    def test_handoff_verification_applies_gates(self) -> None:
+        path = self.root / "artifacts" / "1" / "plan" / "handoff.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": "ocmo-handoff/v1",
+                    "decision": "proceed",
+                    "confidence": 0.95,
+                    "handoff": "Implement the proposed fix.",
+                    "conditions": [{"name": "root_cause", "met": True}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        verified = cli.verify_required_artifacts(
+            self.manifest_path,
+            {"id": "1"},
+            {"id": "plan", "produces": {"handoff": {"type": "handoff", "gates": {"decision": "proceed", "minConfidence": 0.9, "requireConditionsMet": True}}}},
+        )
+
+        self.assertEqual(verified, {"handoff": "artifacts/1/plan/handoff.json"})
+
+    def test_handoff_verification_blocks_on_low_confidence(self) -> None:
+        path = self.root / "artifacts" / "1" / "plan" / "handoff.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"schema": "ocmo-handoff/v1", "decision": "proceed", "confidence": 0.7, "handoff": "Maybe fix parser."}), encoding="utf-8")
+
+        with self.assertRaisesRegex(cli.OcmoBlocked, "confidence"):
+            cli.verify_required_artifacts(
+                self.manifest_path,
+                {"id": "1"},
+                {"id": "plan", "produces": {"handoff": {"type": "handoff", "gates": {"minConfidence": 0.9}}}},
+            )
 
     def test_artifact_helpers_cover_defaults_and_errors(self) -> None:
         manifest = self.load()
@@ -650,6 +711,68 @@ class RunManifestTests(OcmoTestCase):
         state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["workUnits"]["1"]["runs"]["plan"]["artifacts"], {"plan": "artifacts/1/plan/plan.md"})
 
+    def test_run_manifest_blocks_later_runs_when_handoff_gate_fails(self) -> None:
+        manifest = self.load()
+        manifest["workUnits"] = [manifest["workUnits"][0]]
+        manifest["workUnits"][0]["runs"] = {
+            "mode": "sequential",
+            "steps": [
+                {"id": "plan", "agent": "build", "produces": {"handoff": {"type": "handoff", "gates": {"decision": "proceed", "minConfidence": 0.9}}}},
+                {"id": "implement", "agent": "build", "consumes": ["plan.handoff"]},
+            ],
+        }
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        handoff = self.root / "artifacts" / "1" / "plan" / "handoff.json"
+        calls = 0
+
+        def fake_popen(command: list[str], **kwargs):
+            nonlocal calls
+            calls += 1
+            handoff.parent.mkdir(parents=True)
+            handoff.write_text(json.dumps({"schema": "ocmo-handoff/v1", "decision": "block", "confidence": 0.75, "handoff": "Not enough evidence."}), encoding="utf-8")
+            return FakePopen(command, 0, "ok")
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, 1)
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["control"]["status"], "blocked")
+        self.assertEqual(state["workUnits"]["1"]["status"], "blocked")
+        self.assertEqual(state["workUnits"]["1"]["runs"]["plan"]["status"], "blocked")
+        self.assertNotIn("implement", state["workUnits"]["1"].get("runs", {}))
+
+    def test_run_manifest_allows_later_runs_when_handoff_gate_passes(self) -> None:
+        manifest = self.load()
+        manifest["workUnits"] = [manifest["workUnits"][0]]
+        manifest["workUnits"][0]["runs"] = {
+            "mode": "sequential",
+            "steps": [
+                {"id": "plan", "agent": "build", "produces": {"handoff": {"type": "handoff", "gates": {"decision": "proceed", "minConfidence": 0.9}}}},
+                {"id": "implement", "agent": "build", "consumes": ["plan.handoff"]},
+            ],
+        }
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        handoff = self.root / "artifacts" / "1" / "plan" / "handoff.json"
+        prompts: list[str] = []
+
+        def fake_popen(command: list[str], **kwargs):
+            prompts.append(command[-1])
+            if "Required Artifacts" in command[-1]:
+                handoff.parent.mkdir(parents=True)
+                handoff.write_text(json.dumps({"schema": "ocmo-handoff/v1", "decision": "proceed", "confidence": 0.95, "handoff": "Implement minimal fix."}), encoding="utf-8")
+            return FakePopen(command, 0, "ok")
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Implement minimal fix", prompts[1])
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["workUnits"]["1"]["runs"]["plan"]["artifacts"], {"handoff": "artifacts/1/plan/handoff.json"})
+
     def test_run_manifest_fails_when_required_artifact_missing(self) -> None:
         manifest = self.load()
         manifest["workUnits"] = [manifest["workUnits"][0]]
@@ -846,7 +969,7 @@ class RunManifestTests(OcmoTestCase):
         output = stdout.getvalue()
         self.assertIn("ocmo-active active", output)
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=1 completed=1 failed=0 pending=0 paused=0 killed=0 tokens=- updated=now", output)
+        self.assertIn("selected=2 running=1 completed=1 failed=0 blocked=0 pending=0 paused=0 killed=0 tokens=- updated=now", output)
         self.assertIn("Work Unit", output)
         self.assertIn("Progress", output)
         self.assertIn("Tokens", output)
@@ -1016,7 +1139,7 @@ class RunManifestTests(OcmoTestCase):
 
         output = stdout.getvalue()
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=0 completed=1 failed=0 pending=1 paused=0 killed=0 tokens=- updated=-", output)
+        self.assertIn("selected=2 running=0 completed=1 failed=0 blocked=0 pending=1 paused=0 killed=0 tokens=- updated=-", output)
         self.assertIn("1          pending", output)
         self.assertRegex(output, r"2\s+completed")
         self.assertIn("First", output)

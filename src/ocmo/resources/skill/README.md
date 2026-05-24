@@ -492,9 +492,58 @@ Artifact rules:
 - `produces.<artifact-id>` declares a file produced by a run step.
 - `consumes` references earlier artifacts with `step.artifact` syntax.
 - By default, `produces.plan` writes to `artifacts/<work-unit-id>/<step-id>/plan.md` beside `manifest.yaml`.
+- By default, `type: handoff` artifacts write to `.json` instead of `.md`.
 - Custom artifact paths are allowed only under `artifacts/`.
 - Required artifacts must exist and be non-empty after the producing run, or the step fails.
 - Consuming steps receive artifact content under `## Chained Inputs` in the rendered prompt.
+
+Use `type: handoff` when one run must decide whether later sequential runs are safe to start. Handoff artifacts must be JSON objects with schema `ocmo-handoff/v1`. If a handoff gate fails, OCMO marks the run and work unit `blocked` and does not start later runs.
+
+```yaml
+workUnits:
+  - id: BUG-123
+    runs:
+      mode: sequential
+      steps:
+        - id: plan
+          agent: build
+          produces:
+            handoff:
+              type: handoff
+              required: true
+              gates:
+                decision: proceed
+                minConfidence: 0.9
+                requireConditionsMet: true
+        - id: implement
+          agent: build
+          consumes:
+            - plan.handoff
+```
+
+Handoff JSON shape:
+
+```json
+{
+  "schema": "ocmo-handoff/v1",
+  "decision": "proceed",
+  "confidence": 0.92,
+  "summary": "Root cause identified.",
+  "handoff": "Implement the minimal parser span fix and add regression coverage.",
+  "conditions": [
+    {"name": "root_cause_identified", "met": true, "evidence": "Failing behavior traced to span end normalization."}
+  ],
+  "risks": [],
+  "nextAgentInstructions": "Add regression test first, then implement the fix."
+}
+```
+
+Gate rules:
+
+- `gates.decision` requires exact `decision` match.
+- `gates.minConfidence` requires numeric `confidence` between `0` and `1` and at least the configured value.
+- `gates.requireConditionsMet: true` requires every `conditions[].met` value to be `true`.
+- Invalid handoff JSON is a failure; valid JSON that does not satisfy a gate is blocked.
 
 ## Worktree And Concurrency Safety
 

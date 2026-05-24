@@ -507,6 +507,48 @@ workUnits:
 
 Sequential run steps can pass files with `produces` and `consumes`. Produced artifacts are written under `artifacts/<work-unit-id>/<step-id>/` beside the manifest unless a custom path under `artifacts/` is configured.
 
+Use `type: handoff` when an earlier run must explicitly authorize the next run. Handoff artifacts default to `.json`, must use schema `ocmo-handoff/v1`, and can gate later sequential runs by decision, confidence, and conditions. If a gate fails, OCMO marks the run and work unit `blocked` and does not start later runs.
+
+```yaml
+workUnits:
+  - id: BUG-123
+    title: Fix parser bug
+    runs:
+      mode: sequential
+      steps:
+        - id: plan
+          agent: build
+          produces:
+            handoff:
+              type: handoff
+              required: true
+              gates:
+                decision: proceed
+                minConfidence: 0.9
+                requireConditionsMet: true
+        - id: implement
+          agent: build
+          consumes:
+            - plan.handoff
+```
+
+Example handoff JSON:
+
+```json
+{
+  "schema": "ocmo-handoff/v1",
+  "decision": "proceed",
+  "confidence": 0.92,
+  "summary": "Root cause identified.",
+  "handoff": "Implement the minimal parser span fix and add regression coverage.",
+  "conditions": [
+    {"name": "root_cause_identified", "met": true, "evidence": "Failing behavior traced to span end normalization."}
+  ],
+  "risks": [],
+  "nextAgentInstructions": "Add regression test first, then implement the fix."
+}
+```
+
 Worktree safety matters when using concurrency. With `policy.worktree: single`, selected work units operate in one shared workspace, so concurrency above `1` is rejected unless you pass `--allow-shared-worktree-concurrency`. Use `queue.autoWorktrees.enabled: true` when work units may edit overlapping files or when parallel isolation is required.
 
 The installed `/ocmo` skill includes a fuller, version-matched operational handbook for agents. If the installed skill docs look stale, run:

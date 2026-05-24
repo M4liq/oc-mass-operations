@@ -24,14 +24,15 @@ import yaml
 
 
 DONE_STATUSES = {"completed", "done", "skipped"}
+BLOCKED_STATUSES = {"blocked"}
 MANIFEST_START = "OCMO_MANIFEST_START"
 MANIFEST_END = "OCMO_MANIFEST_END"
 FILE_START = "OCMO_FILE_START"
 FILE_END = "OCMO_FILE_END"
-TERMINAL_STATUSES = {"completed", "failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed", "paused", "paused_unresumable", "killed"}
+TERMINAL_STATUSES = {"completed", "failed", "blocked", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed", "paused", "paused_unresumable", "killed"}
 PAUSED_STATUSES = {"paused", "paused_unresumable"}
 FAILED_STATUSES = {"failed", "cleanup_failed", "worktree_failed", "setup_failed"}
-RERUN_RETRYABLE_STATUSES = {*FAILED_STATUSES, "paused_unresumable", "timed_out", "killed"}
+RERUN_RETRYABLE_STATUSES = {*FAILED_STATUSES, *BLOCKED_STATUSES, "paused_unresumable", "timed_out", "killed"}
 SHARED_WORKTREE_CONCURRENCY_WARNING = "warning: policy.worktree=single with queue.concurrency > 1 requires non-overlapping work unit scopes; ocmo run requires --allow-shared-worktree-concurrency"
 MISSING_PLACEHOLDER = object()
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
@@ -45,6 +46,10 @@ OCMO_SKILL_RESOURCE = "resources/skill"
 
 
 class OcmoError(Exception):
+    pass
+
+
+class OcmoBlocked(OcmoError):
     pass
 
 
@@ -576,8 +581,30 @@ def validate_produces(value: Any, field: str) -> set[str]:
             raise OcmoError(f"{field}.{artifact_key}.required must be a boolean")
         if "description" in config and not isinstance(config["description"], str):
             raise OcmoError(f"{field}.{artifact_key}.description must be a string")
+        artifact_type = config.get("type")
+        if artifact_type is not None and artifact_type != "handoff":
+            raise OcmoError(f"{field}.{artifact_key}.type must be handoff")
+        if "gates" in config and artifact_type != "handoff":
+            raise OcmoError(f"{field}.{artifact_key}.gates requires type: handoff")
+        validate_handoff_gates(config.get("gates"), f"{field}.{artifact_key}.gates")
         artifact_ids.add(artifact_key)
     return artifact_ids
+
+
+def validate_handoff_gates(value: Any, field: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise OcmoError(f"{field} must be a mapping")
+    decision = value.get("decision")
+    if decision is not None and (not isinstance(decision, str) or not decision.strip()):
+        raise OcmoError(f"{field}.decision must be a non-empty string")
+    min_confidence = value.get("minConfidence")
+    if min_confidence is not None and (not isinstance(min_confidence, (int, float)) or isinstance(min_confidence, bool) or min_confidence < 0 or min_confidence > 1):
+        raise OcmoError(f"{field}.minConfidence must be a number between 0 and 1")
+    require_conditions = value.get("requireConditionsMet")
+    if require_conditions is not None and not isinstance(require_conditions, bool):
+        raise OcmoError(f"{field}.requireConditionsMet must be a boolean")
 
 
 def validate_consumes(value: Any, field: str, produced_by_step: dict[str, set[str]]) -> None:
@@ -620,7 +647,7 @@ def artifact_reference_map(manifest_path: Path, item: dict[str, Any], runs: list
     for run in runs:
         run_id = str(run["id"])
         for artifact_id, config in produced_artifacts(run).items():
-            artifacts[f"{run_id}.{artifact_id}"] = artifact_path(manifest_path, item, run_id, artifact_id, config.get("path"))
+            artifacts[f"{run_id}.{artifact_id}"] = default_artifact_path(manifest_path, item, run_id, artifact_id, config)
     return artifacts
 
 
@@ -630,15 +657,27 @@ def artifact_instructions(manifest_path: Path, item: dict[str, Any], run: dict[s
         return ""
     lines = ["## Required Artifacts", "", "Before finishing this run, write these handoff artifact files exactly as specified:"]
     for artifact_id, config in artifacts.items():
-        path = artifact_path(manifest_path, item, str(run["id"]), artifact_id, config.get("path"))
+        path = default_artifact_path(manifest_path, item, str(run["id"]), artifact_id, config)
         required = config.get("required", True)
         lines.append(f"- {artifact_id}: {path}")
         lines.append(f"  Manifest-relative path: {relative_to_manifest(path, manifest_path)}")
+        if config.get("type") == "handoff":
+            gates = config.get("gates") if isinstance(config.get("gates"), dict) else {}
+            lines.append("  Type: handoff JSON")
+            lines.append("  Schema: ocmo-handoff/v1")
+            if gates.get("decision") is not None:
+                lines.append(f"  Required decision: {gates['decision']}")
+            if gates.get("minConfidence") is not None:
+                lines.append(f"  Minimum confidence: {gates['minConfidence']}")
+            if gates.get("requireConditionsMet"):
+                lines.append("  All conditions[].met values must be true")
         if config.get("description"):
             lines.append(f"  Description: {config['description']}")
         lines.append(f"  Required: {'yes' if required else 'no'}")
     lines.append("")
     lines.append("Create parent directories if needed. Required artifacts must be non-empty.")
+    if any(config.get("type") == "handoff" for config in artifacts.values()):
+        lines.append('For handoff JSON, set decision to "block" when the next run should not proceed. Do not inflate confidence to satisfy a gate.')
     return "\n".join(lines)
 
 
@@ -814,8 +853,18 @@ def artifact_path(manifest_path: Path, item: dict[str, Any], run_id: str, artifa
     return path
 
 
+def default_artifact_path(manifest_path: Path, item: dict[str, Any], run_id: str, artifact_id: str, config: dict[str, Any]) -> Path:
+    extension = "json" if config.get("type") == "handoff" else "md"
+    configured_path = config.get("path") or f"{ARTIFACT_ROOT}/{slugify(str(item.get('id', 'work-unit')))}/{slugify(run_id)}/{slugify(artifact_id)}.{extension}"
+    return artifact_path(manifest_path, item, run_id, artifact_id, configured_path)
+
+
 def artifact_relative_path(manifest_path: Path, item: dict[str, Any], run_id: str, artifact_id: str, configured_path: str | None = None) -> str:
     return relative_to_manifest(artifact_path(manifest_path, item, run_id, artifact_id, configured_path), manifest_path)
+
+
+def produced_artifact_relative_path(manifest_path: Path, item: dict[str, Any], run_id: str, artifact_id: str, config: dict[str, Any]) -> str:
+    return relative_to_manifest(default_artifact_path(manifest_path, item, run_id, artifact_id, config), manifest_path)
 
 
 def select_work_units(manifest: dict[str, Any], selector: str | None) -> list[dict[str, Any]]:
@@ -1420,20 +1469,56 @@ def run_output_path(manifest_path: Path, item_id: str, run_id: str) -> Path:
 
 
 def relative_to_manifest(path: Path, manifest_path: Path) -> str:
-    return path.relative_to(manifest_path.parent).as_posix()
+    return path.resolve().relative_to(manifest_path.parent.resolve()).as_posix()
 
 
 def verify_required_artifacts(manifest_path: Path, item: dict[str, Any], run: dict[str, Any]) -> dict[str, str]:
     produced = produced_artifacts(run)
     verified: dict[str, str] = {}
     for artifact_id, config in produced.items():
-        path = artifact_path(manifest_path, item, str(run["id"]), artifact_id, config.get("path"))
+        path = default_artifact_path(manifest_path, item, str(run["id"]), artifact_id, config)
         relative = relative_to_manifest(path, manifest_path)
         if config.get("required", True) and (not path.exists() or not path.read_text(encoding="utf-8", errors="replace").strip()):
             raise OcmoError(f"required artifact was not written or is empty: {relative}")
         if path.exists():
+            if config.get("type") == "handoff":
+                verify_handoff_artifact(path, relative, config)
             verified[artifact_id] = relative
     return verified
+
+
+def verify_handoff_artifact(path: Path, relative: str, config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        handoff = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise OcmoError(f"handoff artifact is not valid JSON: {relative}: {exc}") from exc
+    if not isinstance(handoff, dict):
+        raise OcmoError(f"handoff artifact must be a JSON object: {relative}")
+    if handoff.get("schema") != "ocmo-handoff/v1":
+        raise OcmoError(f"handoff artifact schema must be ocmo-handoff/v1: {relative}")
+    decision = handoff.get("decision")
+    if not isinstance(decision, str) or not decision.strip():
+        raise OcmoError(f"handoff artifact decision must be a non-empty string: {relative}")
+    confidence = handoff.get("confidence")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or confidence < 0 or confidence > 1:
+        raise OcmoError(f"handoff artifact confidence must be a number between 0 and 1: {relative}")
+    if not isinstance(handoff.get("handoff"), str) or not handoff.get("handoff", "").strip():
+        raise OcmoError(f"handoff artifact handoff must be a non-empty string: {relative}")
+    gates = config.get("gates") if isinstance(config.get("gates"), dict) else {}
+    required_decision = gates.get("decision")
+    if required_decision is not None and decision != required_decision:
+        raise OcmoBlocked(f"handoff gate blocked {relative}: decision {decision!r} does not match {required_decision!r}")
+    min_confidence = gates.get("minConfidence")
+    if min_confidence is not None and confidence < min_confidence:
+        raise OcmoBlocked(f"handoff gate blocked {relative}: confidence {confidence} is below {min_confidence}")
+    if gates.get("requireConditionsMet"):
+        conditions = handoff.get("conditions", [])
+        if not isinstance(conditions, list):
+            raise OcmoError(f"handoff artifact conditions must be a list: {relative}")
+        for index, condition in enumerate(conditions, start=1):
+            if not isinstance(condition, dict) or condition.get("met") is not True:
+                raise OcmoBlocked(f"handoff gate blocked {relative}: conditions[{index}].met is not true")
+    return handoff
 
 
 def run_opencode_command(
@@ -1701,7 +1786,7 @@ def run_manifest(options: RunOptions) -> int:
                 if run_timeout:
                     header.append(f"# timeout: {run_timeout} seconds")
                 for artifact_id, config in produced_artifacts(run).items():
-                    header.append(f"# produces: {artifact_id} -> {artifact_relative_path(options.manifest_path, item, str(run['id']), artifact_id, config.get('path'))}")
+                    header.append(f"# produces: {artifact_id} -> {produced_artifact_relative_path(options.manifest_path, item, str(run['id']), artifact_id, config)}")
                 for reference in run.get("consumes") or []:
                     header.append(f"# consumes: {reference}")
                 previews.append(PromptPreview(str(item["id"]), str(run["id"]), "\n".join(header) + "\n\n--- prompt ---\n\n" + prompt_text))
@@ -1751,10 +1836,18 @@ def run_manifest(options: RunOptions) -> int:
             executor.shutdown(wait=True)
 
     if any(code != 0 for code in results):
-        state.finish("failed")
+        state.finish(operation_failed_status(state.data()))
         return 1
     state.finish("completed")
     return 0
+
+
+def operation_failed_status(state: dict[str, Any]) -> str:
+    work_units = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
+    statuses = [work_unit.get("status") for work_unit in work_units.values() if isinstance(work_unit, dict)]
+    if statuses and all(status in {*BLOCKED_STATUSES, "completed"} for status in statuses) and any(status in BLOCKED_STATUSES for status in statuses):
+        return "blocked"
+    return "failed"
 
 
 def start_detached_run(options: RunOptions, manifest: dict[str, Any], concurrency: int, timeout_seconds: int | None) -> int:
@@ -2108,6 +2201,8 @@ def workflow_failed_step_status(operation_state_path: Path) -> str:
             return "killed"
         if any(status == "timed_out" for status in statuses):
             return "timed_out"
+        if any(status in BLOCKED_STATUSES for status in statuses):
+            return "blocked"
     return "failed"
 
 
@@ -2497,7 +2592,7 @@ def print_operation_status(manifest_path: Path, include_inactive: bool, selected
     updated = state.get("updatedAt") or "-"
     print(
         f"selected={len(rows)} running={counts['running']} completed={counts['completed']} "
-        f"failed={counts['failed']} pending={counts['pending']} paused={counts['paused']} "
+        f"failed={counts['failed']} blocked={counts['blocked']} pending={counts['pending']} paused={counts['paused']} "
         f"killed={counts['killed']} {format_usage_summary(state_usage(state))} updated={updated}"
     )
     if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
@@ -2523,7 +2618,7 @@ def print_workflow_status(workflow_path: Path, include_inactive: bool, selected_
     updated = state.get("updatedAt") or "-"
     print(
         f"steps={len(rows)} running={counts['running']} completed={counts['completed']} "
-        f"failed={counts['failed']} pending={counts['pending']} paused={counts['paused']} "
+        f"failed={counts['failed']} blocked={counts['blocked']} pending={counts['pending']} paused={counts['paused']} "
         f"killed={counts['killed']} {format_usage_summary(workflow_usage(workflow, workflow_path))} updated={updated}"
     )
     if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
@@ -2709,7 +2804,7 @@ def status_detail(item: dict[str, Any], item_state: dict[str, Any], run_state: d
 
 
 def operation_status_counts(rows: list[dict[str, str]]) -> dict[str, int]:
-    counts = {"running": 0, "completed": 0, "failed": 0, "pending": 0, "paused": 0, "killed": 0}
+    counts = {"running": 0, "completed": 0, "failed": 0, "blocked": 0, "pending": 0, "paused": 0, "killed": 0}
     for row in rows:
         status = row["status"]
         if status in DONE_STATUSES:
@@ -2718,6 +2813,8 @@ def operation_status_counts(rows: list[dict[str, str]]) -> dict[str, int]:
             counts["paused"] += 1
         elif status == "killed":
             counts["killed"] += 1
+        elif status in BLOCKED_STATUSES:
+            counts["blocked"] += 1
         elif status in {"failed", "timed_out", "cleanup_failed", "worktree_failed", "setup_failed"}:
             counts["failed"] += 1
         elif status in {"queued", "pending"}:
@@ -2871,7 +2968,7 @@ def run_item(
             "timeoutSeconds": run_timeout,
             "outputPath": relative_to_manifest(output_path, manifest_path),
             "artifacts": {
-                artifact_id: artifact_relative_path(manifest_path, item, run_id, artifact_id, config.get("path"))
+                artifact_id: produced_artifact_relative_path(manifest_path, item, run_id, artifact_id, config)
                 for artifact_id, config in produced_artifacts(run).items()
             },
         }
@@ -2923,6 +3020,12 @@ def run_item(
         if completed.returncode == 0:
             try:
                 artifacts = verify_required_artifacts(manifest_path, item, run)
+            except OcmoBlocked as exc:
+                state.mark_run(item_id, run_id, "blocked", {"completedAt": utc_now(), "exitCode": 0, "error": str(exc)})
+                state.mark(item_id, "blocked", {"completedAt": utc_now(), "exitCode": 0, "error": str(exc), **execution})
+                reporter.run(item_id, run_id, "blocked", str(exc))
+                cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
+                return cleanup_code or 1
             except OcmoError as exc:
                 state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
                 state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
