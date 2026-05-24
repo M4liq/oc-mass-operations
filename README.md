@@ -103,6 +103,63 @@ Core concepts:
 - Selection: work unit filter such as `uncompleted`, `all`, `ITEM-001`, or `1-10`.
 - State file: durable JSON state written by `ocmo operation run` or `ocmo workflow run` for status, resume, and audit.
 
+## Manifest Quick Start
+
+An operation starts from an `ocmo/v1` `manifest.yaml`. The manifest tells OCMO where the target workspace is, how to run `opencode`, which work units exist, which prompt template to render, and where durable state should be written.
+
+Minimal example:
+
+```yaml
+schema: ocmo/v1
+
+operation:
+  id: docs-refresh
+  description: Refresh selected documentation pages.
+  workspace: C:\path\to\target-repo
+
+runner:
+  command: opencode
+  agent: build
+  model: openai/gpt-5.5
+  timeoutSeconds: 14400
+
+selection:
+  default: uncompleted
+
+queue:
+  concurrency: 1
+  order: manifest
+  stopOnFailure: false
+  autoWorktrees:
+    enabled: false
+
+policy:
+  worktree: single
+
+prompt:
+  template: prompts/docs-refresh.md
+  skills: []
+
+state:
+  path: state.json
+
+workUnits:
+  - id: DOC-001
+    title: Refresh README
+    status: pending
+    payload:
+      path: README.md
+```
+
+Key sections:
+
+- `operation` identifies the operation and target workspace.
+- `runner` configures the `opencode run` process used for each selected work unit.
+- `selection` and `queue` control which work units run and how much parallelism is allowed.
+- `policy` describes worktree safety assumptions.
+- `prompt.template` points to the prompt rendered for each work unit.
+- `workUnits[].payload` is task-specific data available to the prompt template.
+
 ## Typical Operation
 
 This walkthrough creates and runs one operation. Workflow orchestration is covered separately in [Workflows](#workflows).
@@ -334,6 +391,92 @@ Selectors match manifest work unit IDs:
 Per-run `opencode` stdout/stderr is written under `outputs/` beside the manifest. This keeps concurrent agent output from corrupting the terminal UI and makes long-running work inspectable after the fact.
 
 Failed work units remain selectable through `uncompleted` unless you mark them completed or skipped in the manifest.
+
+## Manifest Reference
+
+The current operation manifest schema is `ocmo/v1`. Generated operation manifests usually live at `.ocmo/<operation>/manifest.yaml`, but commands accepting `[manifest-or-directory]` can also receive the operation directory.
+
+Required shape:
+
+```yaml
+schema: ocmo/v1
+operation: {}
+runner: {}
+selection: {}
+queue: {}
+policy: {}
+prompt: {}
+state: {}
+workUnits: []
+```
+
+Manifest rules:
+
+- `schema` must be `ocmo/v1`.
+- `operation.id` is the stable operation identifier.
+- `operation.description` should explain the operation goal in human-readable terms.
+- `operation.workspace` is the target repository or directory where `opencode run` executes.
+- `runner.command` is normally `opencode`.
+- `runner.agent` is normally `build`; explicit run-step `agent` values must also be `build`.
+- `runner.model` is optional and is passed to `opencode` when set.
+- `runner.attach` is an optional `opencode serve` URL.
+- `runner.timeoutSeconds` controls the per-run timeout unless overridden from the CLI.
+- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` when true.
+- `selection.default` is used when `--select` is omitted. Prefer `uncompleted` for repeatable operations.
+- `queue.concurrency` is maximum active work units, not maximum run steps inside one work unit.
+- `queue.order` is currently `manifest`.
+- `queue.stopOnFailure` controls whether the queue stops after failed work.
+- `queue.autoWorktrees` configures native git worktree creation for isolated work-unit execution.
+- `policy.worktree` is usually `single` or `per-work-unit`.
+- `prompt.template` is resolved relative to `manifest.yaml`.
+- `prompt.skills` lists opencode skills required in rendered work-unit prompts.
+- `state.path` is resolved relative to `manifest.yaml`.
+- Every `workUnits[]` entry needs a unique `id`.
+- Work unit `status` is normally `pending`, `completed`, `done`, or `skipped` in the manifest.
+- Work unit `payload` is task-specific data made available to the prompt template.
+
+Prompt templates support Python `string.Template` variables such as `$operation_id`, `$workspace`, `$work_unit_id`, `$work_unit_title`, `$payload_json`, and `$work_unit_json`. They also support dotted placeholders such as `{{payload.path}}`. Unknown dotted placeholders fail before launching agents.
+
+Use `prompt.skills` when every rendered work-unit prompt should require specific opencode skills:
+
+```yaml
+prompt:
+  template: prompts/docs-refresh.md
+  skills:
+    - code-review
+```
+
+By default, one selected work unit starts one `opencode run` process. Use `workUnits[].runs.mode: sequential` when a work unit needs multiple ordered phases:
+
+```yaml
+workUnits:
+  - id: DOC-001
+    title: Refresh README
+    status: pending
+    payload:
+      path: README.md
+    runs:
+      mode: sequential
+      steps:
+        - id: analyze
+          agent: build
+          prompt:
+            template: prompts/analyze.md
+        - id: implement
+          agent: build
+          prompt:
+            template: prompts/implement.md
+```
+
+Sequential run steps can pass files with `produces` and `consumes`. Produced artifacts are written under `artifacts/<work-unit-id>/<step-id>/` beside the manifest unless a custom path under `artifacts/` is configured.
+
+Worktree safety matters when using concurrency. With `policy.worktree: single`, selected work units operate in one shared workspace, so concurrency above `1` is rejected unless you pass `--allow-shared-worktree-concurrency`. Use `queue.autoWorktrees.enabled: true` when work units may edit overlapping files or when parallel isolation is required.
+
+The installed `/ocmo` skill includes a fuller, version-matched operational handbook for agents. If the installed skill docs look stale, run:
+
+```powershell
+ocmo skill install
+```
 
 ## Examples
 
