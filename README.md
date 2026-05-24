@@ -435,6 +435,43 @@ Manifest rules:
 - Work unit `status` is normally `pending`, `completed`, `done`, or `skipped` in the manifest.
 - Work unit `payload` is task-specific data made available to the prompt template.
 
+### Work Units
+
+`workUnits[]` is the queue input for an operation. Each entry should describe one independently schedulable piece of work that can be rendered into a prompt and run without requiring OCMO to understand the task domain.
+
+Common fields:
+
+- `id`: stable unique identifier used by selectors, state, outputs, artifacts, and worktree branch names.
+- `title`: short human-readable label shown in rendered prompts and status output.
+- `status`: manifest-level starting status. Use `pending` for work that should run, or `completed`, `done`, or `skipped` for work that should be excluded by `uncompleted`.
+- `payload`: task-specific data consumed by the prompt template. OCMO treats this as schema-free YAML/JSON data.
+- `runs`: optional ordered run plan for multi-phase work inside one work unit.
+
+Example:
+
+```yaml
+workUnits:
+  - id: DOC-001
+    title: Refresh README install instructions
+    status: pending
+    payload:
+      path: README.md
+      section: Install From Git
+
+  - id: DOC-002
+    title: Refresh workflow guide
+    status: pending
+    payload:
+      path: docs/workflows.md
+      section: Running workflows
+```
+
+Good work units have clear boundaries. Prefer payloads that identify the exact target files, records, entities, or ranges the agent may touch. If two selected work units may edit the same files, use concurrency `1` or enable auto worktrees so parallel agents do not collide in one checkout.
+
+Selection uses work unit IDs and manifest statuses. For example, `--select DOC-001` runs one work unit, while `--select uncompleted` selects work units whose manifest status is not `completed`, `done`, or `skipped`. Runtime results are written to `state.json`; they do not rewrite manifest statuses automatically.
+
+`queue.concurrency` is work-unit-level concurrency. If a work unit defines sequential `runs`, those run steps execute in order inside that one work unit and do not become independently queued work.
+
 Prompt templates support Python `string.Template` variables such as `$operation_id`, `$workspace`, `$work_unit_id`, `$work_unit_title`, `$payload_json`, and `$work_unit_json`. They also support dotted placeholders such as `{{payload.path}}`. Unknown dotted placeholders fail before launching agents.
 
 Use `prompt.skills` when every rendered work-unit prompt should require specific opencode skills:
