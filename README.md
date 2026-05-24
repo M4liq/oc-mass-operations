@@ -507,7 +507,7 @@ workUnits:
 
 Sequential run steps can pass files with `produces` and `consumes`. Produced artifacts are written under `artifacts/<work-unit-id>/<step-id>/` beside the manifest unless a custom path under `artifacts/` is configured.
 
-Use `type: handoff` when an earlier run must explicitly authorize the next run. Handoff artifacts default to `.json`, must use schema `ocmo-handoff/v1`, and can gate later sequential runs by decision, confidence, and conditions. If a gate fails, OCMO marks the run and work unit `blocked` and does not start later runs.
+Use a `handoff` artifact when an earlier run must explicitly authorize the next run. Handoff artifacts default to `.json`, must use schema `ocmo-handoff/v1`, and can gate later sequential runs by decision, confidence, and conditions. If a gate fails, OCMO marks the run and work unit `blocked` and does not start later runs.
 
 ```yaml
 workUnits:
@@ -520,7 +520,6 @@ workUnits:
           agent: build
           produces:
             handoff:
-              type: handoff
               required: true
               gates:
                 decision: proceed

@@ -492,12 +492,12 @@ Artifact rules:
 - `produces.<artifact-id>` declares a file produced by a run step.
 - `consumes` references earlier artifacts with `step.artifact` syntax.
 - By default, `produces.plan` writes to `artifacts/<work-unit-id>/<step-id>/plan.md` beside `manifest.yaml`.
-- By default, `type: handoff` artifacts write to `.json` instead of `.md`.
+- By default, `handoff` artifacts and artifacts with `gates` write to `.json` instead of `.md`.
 - Custom artifact paths are allowed only under `artifacts/`.
 - Required artifacts must exist and be non-empty after the producing run, or the step fails.
 - Consuming steps receive artifact content under `## Chained Inputs` in the rendered prompt.
 
-Use `type: handoff` when one run must decide whether later sequential runs are safe to start. Handoff artifacts must be JSON objects with schema `ocmo-handoff/v1`. If a handoff gate fails, OCMO marks the run and work unit `blocked` and does not start later runs.
+Use a `handoff` artifact when one run must decide whether later sequential runs are safe to start. Handoff artifacts must be JSON objects with schema `ocmo-handoff/v1`. If a handoff gate fails, OCMO marks the run and work unit `blocked` and does not start later runs.
 
 ```yaml
 workUnits:
@@ -509,7 +509,6 @@ workUnits:
           agent: build
           produces:
             handoff:
-              type: handoff
               required: true
               gates:
                 decision: proceed

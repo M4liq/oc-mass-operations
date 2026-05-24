@@ -163,7 +163,6 @@ class ValidationTests(OcmoTestCase):
                     "id": "plan",
                     "produces": {
                         "handoff": {
-                            "type": "handoff",
                             "gates": {"decision": "proceed", "minConfidence": 0.9, "requireConditionsMet": True},
                         }
                     },
@@ -232,11 +231,10 @@ class ValidationTests(OcmoTestCase):
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": []}]}}, r"produces must be a mapping"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"bad name": {}}}]}}, r"simple artifact name"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"path": "../plan.md"}}}]}}, r"under artifacts/"),
-            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"type": "note"}}}]}}, r"type must be handoff"),
-            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"gates": {"decision": "proceed"}}}}]}}, r"gates requires type: handoff"),
-            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"type": "handoff", "gates": []}}}]}}, r"gates must be a mapping"),
-            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"type": "handoff", "gates": {"minConfidence": 2}}}}]}}, r"minConfidence"),
-            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"type": "handoff", "gates": {"requireConditionsMet": "yes"}}}}]}}, r"requireConditionsMet"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"type": "handoff"}}}]}}, r"type is not supported"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"gates": []}}}]}}, r"gates must be a mapping"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"gates": {"minConfidence": 2}}}}]}}, r"minConfidence"),
+            ({"runs": {"mode": "sequential", "steps": [{"id": "x", "produces": {"plan": {"gates": {"requireConditionsMet": "yes"}}}}]}}, r"requireConditionsMet"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "consumes": "plan.plan"}]}}, r"consumes must be a list"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "x", "consumes": ["plan.plan"]}]}}, r"earlier step"),
             ({"runs": {"mode": "sequential", "steps": [{"id": "plan", "produces": {"notes": {}}}, {"id": "build", "consumes": ["plan.plan"]}]}}, r"unknown artifact"),
@@ -449,7 +447,7 @@ class SelectionAndRenderingTests(OcmoTestCase):
         self.assertEqual(cli.validate_produces({"plan": None}, "field"), {"plan"})
         self.assertEqual(cli.produced_artifacts({}), {})
         self.assertEqual(cli.verify_required_artifacts(self.manifest_path, {"id": "1"}, {"id": "run", "produces": {"note": {"required": False}}}), {})
-        self.assertEqual(cli.produced_artifact_relative_path(self.manifest_path, {"id": "1"}, "plan", "handoff", {"type": "handoff"}), "artifacts/1/plan/handoff.json")
+        self.assertEqual(cli.produced_artifact_relative_path(self.manifest_path, {"id": "1"}, "plan", "handoff", {}), "artifacts/1/plan/handoff.json")
         rendered = cli.consumed_artifacts(
             self.manifest_path,
             {"id": "1"},
@@ -477,7 +475,7 @@ class SelectionAndRenderingTests(OcmoTestCase):
         verified = cli.verify_required_artifacts(
             self.manifest_path,
             {"id": "1"},
-            {"id": "plan", "produces": {"handoff": {"type": "handoff", "gates": {"decision": "proceed", "minConfidence": 0.9, "requireConditionsMet": True}}}},
+            {"id": "plan", "produces": {"handoff": {"gates": {"decision": "proceed", "minConfidence": 0.9, "requireConditionsMet": True}}}},
         )
 
         self.assertEqual(verified, {"handoff": "artifacts/1/plan/handoff.json"})
@@ -491,7 +489,7 @@ class SelectionAndRenderingTests(OcmoTestCase):
             cli.verify_required_artifacts(
                 self.manifest_path,
                 {"id": "1"},
-                {"id": "plan", "produces": {"handoff": {"type": "handoff", "gates": {"minConfidence": 0.9}}}},
+                {"id": "plan", "produces": {"handoff": {"gates": {"minConfidence": 0.9}}}},
             )
 
     def test_artifact_helpers_cover_defaults_and_errors(self) -> None:
@@ -717,7 +715,7 @@ class RunManifestTests(OcmoTestCase):
         manifest["workUnits"][0]["runs"] = {
             "mode": "sequential",
             "steps": [
-                {"id": "plan", "agent": "build", "produces": {"handoff": {"type": "handoff", "gates": {"decision": "proceed", "minConfidence": 0.9}}}},
+                {"id": "plan", "agent": "build", "produces": {"handoff": {"gates": {"decision": "proceed", "minConfidence": 0.9}}}},
                 {"id": "implement", "agent": "build", "consumes": ["plan.handoff"]},
             ],
         }
@@ -749,7 +747,7 @@ class RunManifestTests(OcmoTestCase):
         manifest["workUnits"][0]["runs"] = {
             "mode": "sequential",
             "steps": [
-                {"id": "plan", "agent": "build", "produces": {"handoff": {"type": "handoff", "gates": {"decision": "proceed", "minConfidence": 0.9}}}},
+                {"id": "plan", "agent": "build", "produces": {"handoff": {"gates": {"decision": "proceed", "minConfidence": 0.9}}}},
                 {"id": "implement", "agent": "build", "consumes": ["plan.handoff"]},
             ],
         }

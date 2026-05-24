@@ -581,11 +581,8 @@ def validate_produces(value: Any, field: str) -> set[str]:
             raise OcmoError(f"{field}.{artifact_key}.required must be a boolean")
         if "description" in config and not isinstance(config["description"], str):
             raise OcmoError(f"{field}.{artifact_key}.description must be a string")
-        artifact_type = config.get("type")
-        if artifact_type is not None and artifact_type != "handoff":
-            raise OcmoError(f"{field}.{artifact_key}.type must be handoff")
-        if "gates" in config and artifact_type != "handoff":
-            raise OcmoError(f"{field}.{artifact_key}.gates requires type: handoff")
+        if "type" in config:
+            raise OcmoError(f"{field}.{artifact_key}.type is not supported")
         validate_handoff_gates(config.get("gates"), f"{field}.{artifact_key}.gates")
         artifact_ids.add(artifact_key)
     return artifact_ids
@@ -642,6 +639,10 @@ def produced_artifacts(run: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return artifacts
 
 
+def is_handoff_artifact(artifact_id: str, config: dict[str, Any]) -> bool:
+    return artifact_id == "handoff" or "gates" in config
+
+
 def artifact_reference_map(manifest_path: Path, item: dict[str, Any], runs: list[dict[str, Any]]) -> dict[str, Path]:
     artifacts: dict[str, Path] = {}
     for run in runs:
@@ -661,7 +662,7 @@ def artifact_instructions(manifest_path: Path, item: dict[str, Any], run: dict[s
         required = config.get("required", True)
         lines.append(f"- {artifact_id}: {path}")
         lines.append(f"  Manifest-relative path: {relative_to_manifest(path, manifest_path)}")
-        if config.get("type") == "handoff":
+        if is_handoff_artifact(artifact_id, config):
             gates = config.get("gates") if isinstance(config.get("gates"), dict) else {}
             lines.append("  Type: handoff JSON")
             lines.append("  Schema: ocmo-handoff/v1")
@@ -676,7 +677,7 @@ def artifact_instructions(manifest_path: Path, item: dict[str, Any], run: dict[s
         lines.append(f"  Required: {'yes' if required else 'no'}")
     lines.append("")
     lines.append("Create parent directories if needed. Required artifacts must be non-empty.")
-    if any(config.get("type") == "handoff" for config in artifacts.values()):
+    if any(is_handoff_artifact(artifact_id, config) for artifact_id, config in artifacts.items()):
         lines.append('For handoff JSON, set decision to "block" when the next run should not proceed. Do not inflate confidence to satisfy a gate.')
     return "\n".join(lines)
 
@@ -854,7 +855,7 @@ def artifact_path(manifest_path: Path, item: dict[str, Any], run_id: str, artifa
 
 
 def default_artifact_path(manifest_path: Path, item: dict[str, Any], run_id: str, artifact_id: str, config: dict[str, Any]) -> Path:
-    extension = "json" if config.get("type") == "handoff" else "md"
+    extension = "json" if is_handoff_artifact(artifact_id, config) else "md"
     configured_path = config.get("path") or f"{ARTIFACT_ROOT}/{slugify(str(item.get('id', 'work-unit')))}/{slugify(run_id)}/{slugify(artifact_id)}.{extension}"
     return artifact_path(manifest_path, item, run_id, artifact_id, configured_path)
 
@@ -1481,7 +1482,7 @@ def verify_required_artifacts(manifest_path: Path, item: dict[str, Any], run: di
         if config.get("required", True) and (not path.exists() or not path.read_text(encoding="utf-8", errors="replace").strip()):
             raise OcmoError(f"required artifact was not written or is empty: {relative}")
         if path.exists():
-            if config.get("type") == "handoff":
+            if is_handoff_artifact(artifact_id, config):
                 verify_handoff_artifact(path, relative, config)
             verified[artifact_id] = relative
     return verified

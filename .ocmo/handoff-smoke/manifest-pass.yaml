@@ -26,7 +26,6 @@ workUnits:
           agent: build
           produces:
             handoff:
-              type: handoff
               required: true
               gates:
                 decision: proceed
