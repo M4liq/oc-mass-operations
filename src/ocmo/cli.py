@@ -1587,17 +1587,30 @@ def run_opencode_command(
                 on_start(process.pid)
             if on_session:
                 chunks = []
-                assert process.stdout is not None
-                for line in process.stdout:
-                    chunks.append(line)
-                    write_transcript(render_opencode_output_line(line))
-                    session_id = extract_session_id(line)
-                    if session_id:
-                        on_session(session_id)
-                    usage = extract_usage_delta(line)
-                    if usage and on_usage:
-                        on_usage(usage)
+                read_error: list[BaseException] = []
+
+                def read_stdout() -> None:
+                    try:
+                        assert process is not None
+                        assert process.stdout is not None
+                        for line in process.stdout:
+                            chunks.append(line)
+                            write_transcript(render_opencode_output_line(line))
+                            session_id = extract_session_id(line)
+                            if session_id:
+                                on_session(session_id)
+                            usage = extract_usage_delta(line)
+                            if usage and on_usage:
+                                on_usage(usage)
+                    except BaseException as exc:  # pragma: no cover - defensive; re-raised by caller
+                        read_error.append(exc)
+
+                reader = threading.Thread(target=read_stdout, daemon=True)
+                reader.start()
                 process.wait(timeout=run_timeout)
+                reader.join(timeout=5)
+                if read_error:
+                    raise read_error[0]
                 stdout = "".join(chunks)
             else:
                 stdout, _ = process.communicate(timeout=run_timeout)

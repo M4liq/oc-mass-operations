@@ -5,6 +5,7 @@ import io
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -739,6 +740,57 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("First chunk.Second chunk.", output)
         self.assertIn("[ocmo] exit code: 0", output)
         self.assertEqual(sessions, ["ses-stream", "ses-stream"])
+
+    def test_run_opencode_command_times_out_while_streaming_output(self) -> None:
+        output_path = self.root / "outputs" / "stream-timeout.txt"
+        first_line_written = threading.Event()
+        release_reader = threading.Event()
+
+        class BlockingStdout:
+            def __init__(self) -> None:
+                self.index = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self) -> str:
+                if self.index == 0:
+                    self.index += 1
+                    return '{"type":"text","sessionID":"ses-timeout","part":{"type":"text","text":"Before timeout."}}\n'
+                first_line_written.set()
+                release_reader.wait(timeout=2)
+                raise StopIteration
+
+        class TimeoutPopen:
+            pid = 4321
+            returncode = None
+
+            def __init__(self, command: list[str], **kwargs) -> None:
+                self.args = command
+                self.stdout = BlockingStdout()
+
+            def wait(self, timeout: int | None = None):
+                first_line_written.wait(timeout=2)
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+        sessions: list[str] = []
+        with mock.patch("ocmo.cli.subprocess.Popen", TimeoutPopen), mock.patch("ocmo.cli.terminate_process_tree") as terminate:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                cli.run_opencode_command(
+                    ["opencode", "run", "--format", "json", "prompt"],
+                    self.root,
+                    1,
+                    output_path,
+                    on_session=sessions.append,
+                )
+        release_reader.set()
+
+        output = output_path.read_text(encoding="utf-8")
+        self.assertIn("Before timeout.", output)
+        self.assertNotIn('"type":"text"', output)
+        self.assertIn("[ocmo] timed out after 1 seconds", output)
+        self.assertEqual(sessions, ["ses-timeout"])
+        terminate.assert_called_once_with(4321, force=True)
 
     def test_usage_parsing_ignores_non_step_events(self) -> None:
         self.assertIsNone(cli.extract_usage_delta("not json"))
