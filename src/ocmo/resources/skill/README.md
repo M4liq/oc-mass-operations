@@ -103,15 +103,17 @@ Pressing `Ctrl+C` during foreground `ocmo operation run` uses pause semantics: t
 ### `ocmo operation status`
 
 ```powershell
-ocmo operation status [manifest-or-directory] [--run-id <run-id>] [--all]
+ocmo operation status [manifest-or-directory] [--run-id <run-id>] [--all] [--interval <seconds>] [--once]
 ```
 
-Shows work unit/run status and detached run information.
+Continuously refreshes work unit/run status and detached run information until interrupted with `Ctrl+C`.
 
 - No argument lists active detached runs from the global registry when no manifest can be inferred.
 - `[manifest-or-directory]` shows status for one operation.
 - `--run-id <run-id>` resolves detached metadata and shows that run's operation status.
 - `--all` includes inactive detached run sessions.
+- `--interval <seconds>` changes the refresh cadence from the default `1` second.
+- `--once` prints a single snapshot and exits. Use it for scripts or logs.
 
 When `opencode run --format json` reports step usage, status shows operation token totals and a per-work-unit `Tokens` column formatted as `input/output`.
 

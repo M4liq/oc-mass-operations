@@ -219,7 +219,8 @@ Review `state.json` beside the manifest for durable execution status, including 
 | Preview execution | `ocmo operation run [manifest-or-directory] --select <selector> --dry-run` |
 | Execute operation foreground | `ocmo operation run [manifest-or-directory] --select <selector> --yes` |
 | Execute operation background | `ocmo operation run [manifest-or-directory] --select <selector> --detach` |
-| Show operation status | `ocmo operation status [manifest-or-directory]` |
+| Watch operation status | `ocmo operation status [manifest-or-directory]` |
+| Show operation status once | `ocmo operation status [manifest-or-directory] --once` |
 | List detached operation runs | `ocmo operation list [manifest-or-directory]` |
 | Pause a running operation | `ocmo operation pause [manifest-or-directory]` |
 | Resume a paused operation | `ocmo operation resume [manifest-or-directory] --yes` |
@@ -279,7 +280,15 @@ Useful options:
 
 If `policy.worktree: single` uses concurrency above `1`, `ocmo operation run` requires `--allow-shared-worktree-concurrency`. Use that only when selected work unit scopes are explicitly non-overlapping.
 
-Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata. `ocmo operation status` summarizes operation token usage and includes a compact per-work-unit `Tokens` column formatted as `input/output`.
+Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata. `ocmo operation status` continuously refreshes operation status until interrupted, summarizes operation token usage, and includes a compact per-work-unit `Tokens` column formatted as `input/output`.
+
+## Status
+
+```powershell
+ocmo operation status [manifest-or-directory] [--run-id <run-id>] [--all] [--interval <seconds>] [--once]
+```
+
+`ocmo operation status` watches by default: it reloads state and detached run metadata every second and keeps reporting until interrupted with `Ctrl+C`. Use `--interval <seconds>` to change the refresh cadence. Use `--once` for a single snapshot in scripts or logs.
 
 ## Workflows
 

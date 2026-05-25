@@ -974,8 +974,8 @@ class RunManifestTests(OcmoTestCase):
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=True), contextlib.redirect_stdout(stdout):
             self.assertEqual(cli.main(["operation", "list"]), 0)
-            self.assertEqual(cli.main(["operation", "status", "--run-id", "ocmo-active"]), 0)
-            self.assertEqual(cli.main(["operation", "status", str(self.manifest_path)]), 0)
+            self.assertEqual(cli.main(["operation", "status", "--once", "--run-id", "ocmo-active"]), 0)
+            self.assertEqual(cli.main(["operation", "status", "--once", str(self.manifest_path)]), 0)
 
         output = stdout.getvalue()
         self.assertIn("ocmo-active active", output)
@@ -1010,7 +1010,7 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=True), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["operation", "status", str(self.manifest_path)]), 0)
+            self.assertEqual(cli.main(["operation", "status", "--once", str(self.manifest_path)]), 0)
             self.assertEqual(cli.main(["operation", "list", "--run-id", "usage"]), 0)
 
         output = stdout.getvalue()
@@ -1031,7 +1031,7 @@ class RunManifestTests(OcmoTestCase):
 
         stderr = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stderr(stderr):
-            self.assertEqual(cli.main(["operation", "status", "--run-id", "missing"]), 2)
+            self.assertEqual(cli.main(["operation", "status", "--once", "--run-id", "missing"]), 2)
         self.assertIn("detached run not found", stderr.getvalue())
 
         stderr = io.StringIO()
@@ -1146,7 +1146,7 @@ class RunManifestTests(OcmoTestCase):
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["operation", "status", str(self.manifest_path)]), 0)
+            self.assertEqual(cli.main(["operation", "status", "--once", str(self.manifest_path)]), 0)
 
         output = stdout.getvalue()
         self.assertIn("OC Mass Operations: test-op", output)
@@ -1154,6 +1154,30 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("1          pending", output)
         self.assertRegex(output, r"2\s+pending")
         self.assertIn("First", output)
+
+    def test_operation_status_watches_until_interrupted(self) -> None:
+        self.write_manifest()
+        (self.root / "state.json").write_text(json.dumps({"updatedAt": "first", "workUnits": {"1": {"status": "running"}}}), encoding="utf-8")
+
+        slept = False
+
+        def sleep_once(_interval: float) -> None:
+            nonlocal slept
+            if not slept:
+                slept = True
+                (self.root / "state.json").write_text(json.dumps({"updatedAt": "second", "workUnits": {"1": {"status": "completed"}}}), encoding="utf-8")
+                return
+            raise KeyboardInterrupt
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.time.sleep", side_effect=sleep_once), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["operation", "status", "--interval", "0.1", str(self.manifest_path)]), 130)
+
+        output = stdout.getvalue()
+        self.assertIn("updated=first", output)
+        self.assertIn("updated=second", output)
+        self.assertIn("running=1", output)
+        self.assertIn("completed=1", output)
 
     def test_status_warns_when_detached_run_is_stale(self) -> None:
         self.write_manifest()
@@ -1243,7 +1267,7 @@ class RunManifestTests(OcmoTestCase):
         fallback.write_text(json.dumps({"runId": "fallback", "pid": 0, "startedAt": "then"}), encoding="utf-8")
         stdout = io.StringIO()
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["operation", "status", "--run-id", "fallback"]), 0)
+            self.assertEqual(cli.main(["operation", "status", "--once", "--run-id", "fallback"]), 0)
         self.assertIn("fallback inactive", stdout.getvalue())
 
         stdout = io.StringIO()

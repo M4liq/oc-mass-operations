@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
+import io
 import os
 from importlib import resources
 import json
@@ -133,6 +135,8 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     status_parser.add_argument("--run-id", help="Show one detached run session")
     status_parser.add_argument("--all", action="store_true", help="Include inactive detached run sessions")
+    status_parser.add_argument("--once", action="store_true", help="Print one status snapshot and exit")
+    status_parser.add_argument("--interval", type=float, default=1.0, help="Refresh interval in seconds for continuous status")
 
     list_parser = operation_subparsers.add_parser("list", help="List detached operation run sessions")
     list_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
@@ -2016,8 +2020,13 @@ def status_operation(args: argparse.Namespace) -> int:
         manifest_path = Path(manifest_value)
     else:
         manifest_path = infer_manifest_path(args.manifest)
-    print_operation_status(manifest_path, include_inactive=args.all, selected_record=record)
-    return 0
+    interval = getattr(args, "interval", 1.0)
+    if interval <= 0:
+        raise OcmoError("--interval must be greater than zero")
+    if args.once:
+        print_operation_status(manifest_path, include_inactive=args.all, selected_record=record)
+        return 0
+    return watch_operation_status(manifest_path, include_inactive=args.all, selected_record=record, interval=interval)
 
 
 def pause_operation(args: argparse.Namespace) -> int:
@@ -2587,6 +2596,48 @@ def print_manifest_detached_runs(manifest_path: Path, include_inactive: bool) ->
 
 
 def print_operation_status(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> None:
+    print(render_operation_status(manifest_path, include_inactive, selected_record))
+
+
+def render_operation_status(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> str:
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        print_operation_status_snapshot(manifest_path, include_inactive, selected_record)
+    return stdout.getvalue().rstrip("\n")
+
+
+def watch_operation_status(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float) -> int:
+    if sys.stdout.isatty():
+        try:
+            from rich.live import Live
+        except ImportError:
+            return watch_operation_status_plain(manifest_path, include_inactive, selected_record, interval, clear_screen=True)
+        try:
+            with Live(render_operation_status(manifest_path, include_inactive, selected_record), refresh_per_second=max(1, int(1 / interval)), transient=False) as live:
+                while True:
+                    time.sleep(interval)
+                    live.update(render_operation_status(manifest_path, include_inactive, selected_record))
+        except KeyboardInterrupt:
+            return 130
+    return watch_operation_status_plain(manifest_path, include_inactive, selected_record, interval, clear_screen=False)
+
+
+def watch_operation_status_plain(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float, clear_screen: bool) -> int:
+    first = True
+    try:
+        while True:
+            if clear_screen:
+                print("\033[H\033[J", end="")
+            elif not first:
+                print()
+            print(render_operation_status(manifest_path, include_inactive, selected_record), flush=True)
+            first = False
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 130
+
+
+def print_operation_status_snapshot(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> None:
     manifest = load_manifest(manifest_path)
     path = state_path(manifest, manifest_path)
     state = read_json_file(path) if path.exists() else {}
