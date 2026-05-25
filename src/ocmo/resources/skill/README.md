@@ -32,7 +32,7 @@ Inspect before acting.
 Prefer this workflow for existing operations:
 
 1. Inspect manifest and state.
-2. Run `ocmo operation validate <manifest>`.
+2. Run `ocmo operation validate [manifest-or-directory]`.
 3. Run `ocmo operation render [manifest-or-directory] --select <selector>` to inspect prompts.
 4. Run `ocmo operation run [manifest-or-directory] --select <selector> --dry-run` before real execution.
 5. Ask before starting long-running foreground or detached work unless explicitly requested.
@@ -62,10 +62,10 @@ Use `--read` for CSV exports, inventories, design notes, existing manifests, or 
 ### `ocmo operation validate`
 
 ```powershell
-ocmo operation validate <manifest>
+ocmo operation validate [manifest-or-directory]
 ```
 
-Validates manifest schema, paths, prompt templates, worktree settings, work unit run paths, and workspace assumptions.
+Validates manifest schema, paths, prompt templates, worktree settings, work unit run paths, and workspace assumptions. The argument can be a manifest file or an operation directory containing `manifest.yaml`; if omitted, OCMO uses `manifest.yaml` in the current directory or the single generated `.ocmo/*/manifest.yaml` when exactly one exists.
 
 ### `ocmo operation render`
 
@@ -78,7 +78,7 @@ Renders prompts for selected work units without running agents.
 - `--select <selector>`: overrides the manifest default selector.
 - `--all`: prints every rendered prompt instead of a compact preview.
 
-Use `render` to inspect exact prompt text before launching agents.
+Use `render` to inspect exact prompt text before launching agents. Interactive terminals use formatted preview panels; redirected output stays plain for piping or saving.
 
 ### `ocmo operation run`
 

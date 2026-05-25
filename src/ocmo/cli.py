@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Template
@@ -88,9 +88,16 @@ class PromptPreview:
     work_unit_id: str
     run_id: str
     text: str
+    command: str | None = None
+    details: list[tuple[str, str]] = field(default_factory=list)
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    suggestion = suggested_top_level_command(argv)
+    if suggestion:
+        print(suggestion, file=sys.stderr)
+        return 2
     parser = argparse.ArgumentParser(prog="ocmo", description="OC Mass Operations")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -114,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     validate_parser = operation_subparsers.add_parser("validate", help="Validate an operation manifest")
-    validate_parser.add_argument("manifest", type=Path)
+    validate_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory; defaults to manifest.yaml or a single .ocmo/*/manifest.yaml")
 
     render_parser = operation_subparsers.add_parser("render", help="Render prompts for selected work units")
     render_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory; defaults to manifest.yaml or a single .ocmo/*/manifest.yaml")
@@ -251,10 +258,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         if args.command == "operation" and args.operation_command == "validate":
-            manifest = load_manifest(args.manifest)
-            validate_manifest(manifest, args.manifest)
+            manifest_path = infer_manifest_path(args.manifest)
+            manifest = load_manifest(manifest_path)
+            validate_manifest(manifest, manifest_path)
             warn_shared_worktree_concurrency(manifest)
-            print(f"valid: {args.manifest}")
+            print(f"valid: {manifest_path}")
             return 0
         if args.command == "operation" and args.operation_command == "render":
             manifest_path = infer_manifest_path(args.manifest)
@@ -301,6 +309,30 @@ def main(argv: list[str] | None = None) -> int:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def suggested_top_level_command(argv: list[str]) -> str | None:
+    if not argv or argv[0].startswith("-"):
+        return None
+    command = argv[0]
+    suggestions = {
+        "status": "operation status",
+        "run": "operation run",
+        "render": "operation render",
+        "validate": "operation validate",
+        "list": "operation list",
+        "pause": "operation pause",
+        "resume": "operation resume",
+        "rerun": "operation rerun",
+        "kill": "operation kill",
+        "erase": "operation erase",
+    }
+    suggestion = suggestions.get(command)
+    if suggestion is None:
+        return None
+    suffix = " ".join(quote_arg(arg) for arg in argv[1:])
+    suffix = f" {suffix}" if suffix else ""
+    return f"ocmo: unknown command {command!r}. Try: ocmo {suggestion}{suffix}"
 
 
 def skill_command(args: argparse.Namespace) -> int:
@@ -1202,14 +1234,67 @@ def compact_prompt_previews(previews: list[PromptPreview], show_all: bool) -> li
 
 
 def print_prompt_previews(previews: list[PromptPreview], show_all: bool) -> None:
+    if use_rich_stdout():
+        print_rich_prompt_previews(previews, show_all)
+        return
     for preview in compact_prompt_previews(previews, show_all):
         if isinstance(preview, int):
             print(f"# ... {preview} prompt(s) omitted ...")
             print("\n" + "=" * 80 + "\n")
             continue
         print(f"# work unit {preview.work_unit_id} / run {preview.run_id}")
-        print(preview.text)
+        print(format_plain_prompt_preview(preview))
         print("\n" + "=" * 80 + "\n")
+
+
+def format_plain_prompt_preview(preview: PromptPreview) -> str:
+    if not preview.command and not preview.details:
+        return preview.text
+    lines = []
+    if preview.command:
+        lines.append(preview.command)
+    lines.extend(f"# {label}: {value}" for label, value in preview.details)
+    lines.append("")
+    lines.append("--- prompt ---")
+    lines.append("")
+    lines.append(preview.text)
+    return "\n".join(lines)
+
+
+def use_rich_stdout() -> bool:
+    if not sys.stdout.isatty():
+        return False
+    try:
+        import rich  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def print_rich_prompt_previews(previews: list[PromptPreview], show_all: bool) -> None:  # pragma: no cover
+    from rich.console import Console, Group
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    console = Console()
+    for preview in compact_prompt_previews(previews, show_all):
+        if isinstance(preview, int):
+            console.print(Panel(f"{preview} prompt(s) omitted; pass --all to print everything", title="Omitted", border_style="yellow"))
+            continue
+        renderables: list[Any] = []
+        if preview.command or preview.details:
+            table = Table.grid(padding=(0, 1))
+            table.add_column(style="bold cyan", no_wrap=True)
+            table.add_column()
+            if preview.command:
+                table.add_row("command", Text(preview.command, overflow="fold"))
+            for label, value in preview.details:
+                table.add_row(label, Text(value, overflow="fold"))
+            renderables.append(table)
+        renderables.append(Markdown(preview.text))
+        console.print(Panel(Group(*renderables), title=f"work unit {preview.work_unit_id} / run {preview.run_id}", border_style="cyan"))
 
 
 def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str, run_dir: Path | None = None, runner: dict[str, Any] | None = None) -> list[str]:
@@ -1851,17 +1936,17 @@ def run_manifest(options: RunOptions) -> int:
                 run_timeout = timeout_seconds if timeout_seconds is not None else runner.get("timeoutSeconds")
                 prompt_text = render_prompt(manifest, item, options.manifest_path, execution, run, runs)
                 command = build_command(manifest, options.manifest_path, prompt_text, run_dir, runner)
-                header = [format_command(command)]
+                details = []
                 if execution:
-                    header.append(f"# worktree: {execution['worktreePath']}")
-                    header.append(f"# branch: {execution['branchName']}")
+                    details.append(("worktree", str(execution["worktreePath"])))
+                    details.append(("branch", str(execution["branchName"])))
                 if run_timeout:
-                    header.append(f"# timeout: {run_timeout} seconds")
+                    details.append(("timeout", f"{run_timeout} seconds"))
                 for artifact_id, config in produced_artifacts(run).items():
-                    header.append(f"# produces: {artifact_id} -> {produced_artifact_relative_path(options.manifest_path, item, str(run['id']), artifact_id, config)}")
+                    details.append(("produces", f"{artifact_id} -> {produced_artifact_relative_path(options.manifest_path, item, str(run['id']), artifact_id, config)}"))
                 for reference in run.get("consumes") or []:
-                    header.append(f"# consumes: {reference}")
-                previews.append(PromptPreview(str(item["id"]), str(run["id"]), "\n".join(header) + "\n\n--- prompt ---\n\n" + prompt_text))
+                    details.append(("consumes", str(reference)))
+                previews.append(PromptPreview(str(item["id"]), str(run["id"]), prompt_text, format_command(command), details))
         print_prompt_previews(previews, options.preview_all)
         return 0
 
@@ -1956,7 +2041,7 @@ def start_detached_run(options: RunOptions, manifest: dict[str, Any], concurrenc
     print(f"detached: {run_id}")
     print(f"pid: {process.pid}")
     print(f"log: {relative_to_manifest(log_path, options.manifest_path)}")
-    print(f"status: ocmo status --run-id {run_id}")
+    print(f"status: ocmo operation status --run-id {run_id}")
     return 0
 
 

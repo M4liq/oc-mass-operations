@@ -1073,7 +1073,7 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(metadata["pid"], 12345)
         self.assertEqual(metadata["concurrency"], 2)
         self.assertEqual(metadata["timeoutSeconds"], 9)
-        self.assertIn("status: ocmo status --run-id ocmo-test", stdout.getvalue())
+        self.assertIn("status: ocmo operation status --run-id ocmo-test", stdout.getvalue())
 
     def test_list_shows_detached_runs_and_status_shows_operation_table(self) -> None:
         self.write_manifest()
@@ -2034,18 +2034,34 @@ class WorktreeTests(OcmoTestCase):
 class CliEntrypointTests(OcmoTestCase):
     def test_main_validate_and_render(self) -> None:
         self.write_manifest()
+        manifest_dir = self.root / "operation"
+        manifest_dir.mkdir()
+        (manifest_dir / "manifest.yaml").write_text(self.manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
         stdout = io.StringIO()
 
         with contextlib.redirect_stdout(stdout):
             validate_code = cli.main(["operation", "validate", str(self.manifest_path)])
         with contextlib.redirect_stdout(stdout):
+            validate_dir_code = cli.main(["operation", "validate", str(manifest_dir)])
+        with contextlib.redirect_stdout(stdout):
             render_code = cli.main(["operation", "render", str(self.manifest_path), "--select", "1"])
 
         self.assertEqual(validate_code, 0)
+        self.assertEqual(validate_dir_code, 0)
         self.assertEqual(render_code, 0)
         output = stdout.getvalue()
         self.assertIn("valid:", output)
+        self.assertIn(str(manifest_dir / "manifest.yaml"), output)
         self.assertIn("# work unit 1 / run default", output)
+
+    def test_main_suggests_operation_namespace_for_top_level_commands(self) -> None:
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            code = cli.main(["status", "--run-id", "ocmo-test"])
+
+        self.assertEqual(code, 2)
+        self.assertIn("Try: ocmo operation status --run-id ocmo-test", stderr.getvalue())
 
     def test_main_validate_and_render_warn_for_shared_single_worktree_concurrency(self) -> None:
         manifest = self.load()

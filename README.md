@@ -214,7 +214,7 @@ Review `state.json` beside the manifest for durable execution status, including 
 | Task | Command |
 | --- | --- |
 | Generate a manifest draft | `ocmo operation plan --from <prompt-file>` |
-| Validate generated operation | `ocmo operation validate <manifest>` |
+| Validate generated operation | `ocmo operation validate [manifest-or-directory]` |
 | Preview rendered prompts | `ocmo operation render [manifest-or-directory] --select <selector>` |
 | Preview execution | `ocmo operation run [manifest-or-directory] --select <selector> --dry-run` |
 | Execute operation foreground | `ocmo operation run [manifest-or-directory] --select <selector> --yes` |
@@ -262,7 +262,7 @@ ocmo operation render .ocmo/business-taxonomy-prompt --select 41-48
 ocmo operation run .ocmo/business-taxonomy-prompt --select uncompleted --dry-run
 ```
 
-When many prompts are selected, preview output is compact by default: first two prompts and the last prompt. Add `--all` to print every prompt.
+When many prompts are selected, preview output is compact by default: first two prompts and the last prompt. Add `--all` to print every prompt. Interactive terminals use formatted preview panels; redirected output stays plain for piping or saving.
 
 ## Running
 
