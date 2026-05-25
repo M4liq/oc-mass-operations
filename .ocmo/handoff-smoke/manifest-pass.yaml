@@ -16,7 +16,6 @@ state:
 workUnits:
   - id: BUG-PASS
     title: Passing handoff smoke
-    status: pending
     payload:
       mode: proceed
     runs:

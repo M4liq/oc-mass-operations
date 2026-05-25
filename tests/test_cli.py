@@ -50,13 +50,11 @@ state:
 workUnits:
   - id: "1"
     title: First
-    status: pending
     file: docs/a.md
     payload:
       name: Alpha
   - id: "2"
     title: Second
-    status: completed
     payload:
       name: Beta
 {extra}""",
@@ -85,7 +83,6 @@ state:
   path: .ocmo/state/planned-op.json
 workUnits:
   - id: ITEM-001
-    status: pending
     payload: {{}}
 """
 
@@ -214,6 +211,13 @@ class ValidationTests(OcmoTestCase):
                 with self.assertRaisesRegex(cli.OcmoError, message):
                     cli.validate_manifest(manifest, self.manifest_path)
 
+    def test_validation_rejects_work_unit_status(self) -> None:
+        manifest = self.load()
+        manifest["workUnits"][0]["status"] = "pending"
+
+        with self.assertRaisesRegex(cli.OcmoError, r"workUnits\[1\]\.status is not supported"):
+            cli.validate_manifest(manifest, self.manifest_path)
+
     def test_validation_rejects_more_invalid_run_shapes(self) -> None:
         cases = [
             ({"runs": []}, "runs must be a mapping"),
@@ -298,15 +302,22 @@ class ValidationTests(OcmoTestCase):
 class SelectionAndRenderingTests(OcmoTestCase):
     def test_select_workUnits_supports_pending_uncompleted_all_ids_and_ranges(self) -> None:
         manifest = self.load()
-        manifest["workUnits"].append({"id": "3", "status": "skipped"})
+        manifest["workUnits"].append({"id": "3"})
+        state = {"workUnits": {"2": {"status": "completed"}, "3": {"status": "skipped"}}}
 
-        self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "pending")], ["1"])
-        self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "uncompleted")], ["1"])
+        self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "pending", state)], ["1"])
+        self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "uncompleted", state)], ["1"])
         self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "all")], ["1", "2", "3"])
         self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "1,3")], ["1", "3"])
 
         numeric = {"workUnits": [{"id": "1"}, {"id": "2"}, {"id": "3"}]}
         self.assertEqual([item["id"] for item in cli.select_work_units(numeric, "1-2")], ["1", "2"])
+
+    def test_select_workUnits_treats_missing_state_as_pending(self) -> None:
+        manifest = {"workUnits": [{"id": "1"}, {"id": "2"}]}
+
+        self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "pending")], ["1", "2"])
+        self.assertEqual([item["id"] for item in cli.select_work_units(manifest, "uncompleted")], ["1", "2"])
 
     def test_select_workUnits_rejects_missing_and_descending_ranges(self) -> None:
         manifest = self.load()
@@ -879,9 +890,11 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("[ocmo] interrupted", before_start_output.read_text(encoding="utf-8"))
 
     def test_no_selected_workUnits_returns_zero(self) -> None:
-        manifest = self.load()
-        manifest["workUnits"][0]["status"] = "completed"
-        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        self.write_manifest()
+        (self.root / "state.json").write_text(
+            json.dumps({"workUnits": {"1": {"status": "completed"}, "2": {"status": "completed"}}}),
+            encoding="utf-8",
+        )
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
@@ -1137,9 +1150,9 @@ class RunManifestTests(OcmoTestCase):
 
         output = stdout.getvalue()
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=0 completed=1 failed=0 blocked=0 pending=1 paused=0 killed=0 tokens=- updated=-", output)
+        self.assertIn("selected=2 running=0 completed=0 failed=0 blocked=0 pending=2 paused=0 killed=0 tokens=- updated=-", output)
         self.assertIn("1          pending", output)
-        self.assertRegex(output, r"2\s+completed")
+        self.assertRegex(output, r"2\s+pending")
         self.assertIn("First", output)
 
     def test_status_warns_when_detached_run_is_stale(self) -> None:
@@ -1372,15 +1385,12 @@ class RunManifestTests(OcmoTestCase):
         manifest = self.load(
             """  - id: "3"
     title: Third
-    status: pending
     payload: {}
   - id: "4"
     title: Fourth
-    status: pending
     payload: {}
   - id: "5"
     title: Fifth
-    status: pending
     payload: {}
 """
         )
@@ -1852,7 +1862,7 @@ class CliEntrypointTests(OcmoTestCase):
     def test_main_render_compacts_many_prompts_unless_all_is_set(self) -> None:
         manifest = self.load()
         manifest["workUnits"] = [
-            {"id": f"ITEM-{index}", "status": "pending", "payload": {"name": f"Item {index}"}}
+            {"id": f"ITEM-{index}", "payload": {"name": f"Item {index}"}}
             for index in range(1, 6)
         ]
         self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
@@ -2630,7 +2640,6 @@ Generated template for $work_unit_id
         multi_run = cli.load_manifest_text(
             self.planned_manifest_text("prompts/default.md")
             + "  - id: ITEM-002\n"
-            + "    status: pending\n"
             + "    payload: {}\n"
             + "    runs:\n"
             + "      mode: sequential\n"
@@ -2755,6 +2764,8 @@ Generated template for $work_unit_id
         self.assertIn("schema: ocmo/v1", prompt)
         self.assertIn("Do not use apiVersion", prompt)
         self.assertIn("must be file paths, not inline YAML block text", prompt)
+        self.assertIn("Do not include workUnits[].status", prompt)
+        self.assertNotIn("status: pending", prompt)
         self.assertIn(f"operation.workspace must be exactly: {self.workspace}", prompt)
         self.assertIn(cli.MANIFEST_START, prompt)
         self.assertNotIn("kind: generic", prompt)
@@ -2892,7 +2903,6 @@ state:
   path: {(directory / (state_name or 'state.json')).as_posix()}
 workUnits:
   - id: "1"
-    status: pending
     payload: {{}}
 """,
             encoding="utf-8",

@@ -252,11 +252,11 @@ Workflow facts:
 
 ## Selection Rules
 
-General selectors match manifest work unit IDs or work unit status categories.
+General selectors match manifest work unit IDs or state-backed work unit status categories.
 
 - `all`: every work unit.
-- `pending`: work units whose manifest status is `pending`.
-- `uncompleted`: work units whose manifest status is not `completed`, `done`, or `skipped`.
+- `pending`: work units with no state status, or state status `pending`.
+- `uncompleted`: work units with no state status, or state status not `completed`, `done`, or `skipped`.
 - `WORK-001`: one exact work unit ID.
 - `WORK-001,WORK-002`: multiple exact work unit IDs.
 - `41-48`: numeric range matching IDs `41` through `48`.
@@ -269,6 +269,36 @@ Rerun-specific selectors include:
 - `timed-out` or `timed_out`: timed-out work.
 - `failed`: failed work.
 - `killed`: killed work.
+
+## Work Unit Statuses
+
+Work unit status is runtime state, not manifest data. `ocmo operation run` writes status under the manifest's configured `state.path`, usually `state.json` beside `manifest.yaml`. Do not add `workUnits[].status` to manifests; validation rejects it.
+
+Missing state is treated as `pending`. A new operation, deleted state file, or work unit with no `state.json` entry is selectable with `--select pending` and `--select uncompleted`.
+
+| Status | Meaning | Selector behavior |
+| --- | --- | --- |
+| `pending` | No run has started for the work unit, or state explicitly marks it pending. | Selected by `pending` and `uncompleted`. |
+| `running` | A run step is currently executing or was last recorded as active. | Selected by `uncompleted`. |
+| `completed` | Every run step for the work unit succeeded. | Treated as done; excluded from `uncompleted`. |
+| `done` | Manually accepted as done in state. | Treated as done; excluded from `uncompleted`. |
+| `skipped` | Manually skipped in state. | Treated as done; excluded from `uncompleted`. |
+| `failed` | A run failed before start, failed to start, or exited non-zero. | Selected by `uncompleted`; retryable. |
+| `timed_out` | A run exceeded `timeoutSeconds` and was terminated. | Selected by `uncompleted`; retryable. |
+| `blocked` | A handoff gate blocked later sequential run steps. | Selected by `uncompleted`; retryable. |
+| `cleanup_failed` | The work unit completed, but configured cleanup failed. | Selected by `uncompleted`; retryable. |
+| `worktree_failed` | Auto-worktree preparation, setup, or cleanup failed before the work could safely continue. | Selected by `uncompleted`; retryable. |
+| `setup_failed` | A setup command failed before agent work started. | Selected by `uncompleted`; retryable. |
+| `paused` | Work was stopped and has an opencode `sessionId`, so `ocmo operation resume` can continue it. | Selected by `uncompleted`; resumable, not selected by default `rerun --select retryable`. |
+| `paused_unresumable` | Work was stopped before a usable session id was captured. | Selected by `uncompleted`; retryable. |
+| `killed` | Work was explicitly terminated with `ocmo operation kill`. | Selected by `uncompleted`; retryable. |
+
+Status groups used by selectors:
+
+- Done statuses are `completed`, `done`, and `skipped`.
+- Failed statuses are `failed`, `cleanup_failed`, `worktree_failed`, and `setup_failed`.
+- `ocmo operation rerun --select retryable` selects failed statuses plus `blocked`, `paused_unresumable`, `timed_out`, and `killed`.
+- `ocmo operation resume` is only for `paused` work with persisted opencode session ids; use `rerun` for `paused_unresumable` and other retryable statuses.
 
 ## Manifest Reference
 
@@ -320,7 +350,6 @@ state:
 workUnits:
   - id: ITEM-001
     title: Example work unit
-    status: pending
     payload:
       targetName: Example
 ```
@@ -347,7 +376,7 @@ Manifest rules:
 - `prompt.skills` lists opencode skills required in rendered work unit prompts.
 - `state.path` is resolved relative to `manifest.yaml`.
 - Every work unit needs a unique `id`.
-- Work unit `status` is normally `pending`, `completed`, `done`, or `skipped` in the manifest.
+- Do not use `workUnits[].status`; work unit status is stored in `state.json`.
 - Work unit `payload` is task-specific and should contain the data needed by the prompt template.
 - Do not use `operation.kind` or `runner.mode`; OCMO rejects those fields.
 
@@ -359,7 +388,6 @@ Common fields:
 
 - `id`: stable unique identifier used by selectors, state, outputs, artifacts, and worktree branch names.
 - `title`: short human-readable label shown in rendered prompts and status output.
-- `status`: manifest-level starting status. Use `pending` for work that should run, or `completed`, `done`, or `skipped` for work that should be excluded by `uncompleted`.
 - `payload`: task-specific data consumed by the prompt template. OCMO treats this as schema-free YAML/JSON data.
 - `runs`: optional ordered run plan for multi-phase work inside one work unit.
 
@@ -369,14 +397,12 @@ Example:
 workUnits:
   - id: DOC-001
     title: Refresh README install instructions
-    status: pending
     payload:
       path: README.md
       section: Install From Git
 
   - id: DOC-002
     title: Refresh workflow guide
-    status: pending
     payload:
       path: docs/workflows.md
       section: Running workflows
@@ -384,7 +410,7 @@ workUnits:
 
 Good work units have clear boundaries. Prefer payloads that identify the exact target files, records, entities, or ranges the agent may touch. If two selected work units may edit the same files, use concurrency `1` or enable auto worktrees so parallel agents do not collide in one checkout.
 
-Selection uses work unit IDs and manifest statuses. For example, `--select DOC-001` runs one work unit, while `--select uncompleted` selects work units whose manifest status is not `completed`, `done`, or `skipped`. Runtime results are written to `state.json`; they do not rewrite manifest statuses automatically.
+Selection uses work unit IDs and state statuses. For example, `--select DOC-001` runs one work unit, while `--select uncompleted` selects work units whose state status is not `completed`, `done`, or `skipped`. Missing state is treated as `pending`.
 
 `queue.concurrency` is work-unit-level concurrency. If a work unit defines sequential `runs`, those run steps execute in order inside that one work unit and do not become independently queued work.
 
@@ -574,7 +600,7 @@ Generated operation layout usually looks like:
 <workspace>/.ocmo/<operation>/.ocmo/runs/<detached-run-id>.json
 ```
 
-Failed work units remain selectable through `uncompleted` unless you mark them completed or skipped in the manifest.
+Failed work units remain selectable through `uncompleted` until their state status is `completed`, `done`, or `skipped`.
 
 ## Planning Checklist
 

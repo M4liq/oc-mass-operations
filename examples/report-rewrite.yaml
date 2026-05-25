@@ -45,7 +45,6 @@ state:
 workUnits:
   - id: WORK-001
     title: ExampleReportOne
-    status: pending
     payload:
       workItemKey: WORK-001
       targetName: ExampleReportOne
@@ -54,7 +53,6 @@ workUnits:
       assignee: assignee-user
   - id: WORK-002
     title: ExampleReportTwo
-    status: pending
     payload:
       workItemKey: WORK-002
       targetName: ExampleReportTwo
@@ -63,7 +61,6 @@ workUnits:
       assignee: assignee-user
   - id: WORK-003
     title: ExampleReportThree
-    status: pending
     payload:
       workItemKey: WORK-003
       targetName: ExampleReportThree

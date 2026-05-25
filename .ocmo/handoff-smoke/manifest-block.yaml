@@ -16,7 +16,6 @@ state:
 workUnits:
   - id: BUG-BLOCK
     title: Blocked handoff smoke
-    status: pending
     payload:
       mode: block
     runs:

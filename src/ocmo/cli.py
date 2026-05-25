@@ -255,8 +255,10 @@ def main(argv: list[str] | None = None) -> int:
             manifest = load_manifest(manifest_path)
             validate_manifest(manifest, manifest_path)
             warn_shared_worktree_concurrency(manifest)
+            path = state_path(manifest, manifest_path)
+            existing_state = read_json_file(path) if path.exists() else {}
             previews = []
-            for item in select_work_units(manifest, args.select):
+            for item in select_work_units(manifest, args.select, existing_state):
                 runs = work_unit_runs(manifest, item)
                 for run in runs:
                     previews.append(PromptPreview(str(item["id"]), str(run["id"]), render_prompt(manifest, item, manifest_path, run=run, runs=runs)))
@@ -469,6 +471,8 @@ def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path, allo
         work_unit_id = work_unit.get("id")
         if work_unit_id is None:
             raise OcmoError(f"workUnits[{index}].id is required")
+        if "status" in work_unit:
+            raise OcmoError(f"workUnits[{index}].status is not supported; status is stored in state.json")
         work_unit_key = str(work_unit_id)
         if work_unit_key in seen:
             raise OcmoError(f"duplicate work unit id: {work_unit_key}")
@@ -868,16 +872,16 @@ def produced_artifact_relative_path(manifest_path: Path, item: dict[str, Any], r
     return relative_to_manifest(default_artifact_path(manifest_path, item, run_id, artifact_id, config), manifest_path)
 
 
-def select_work_units(manifest: dict[str, Any], selector: str | None) -> list[dict[str, Any]]:
+def select_work_units(manifest: dict[str, Any], selector: str | None, state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     work_units = manifest["workUnits"]
     selector = selector or manifest.get("selection", {}).get("default") or "uncompleted"
     selector = selector.strip()
     if selector == "all":
         return work_units
     if selector == "pending":
-        return [work_unit for work_unit in work_units if str(work_unit.get("status", "pending")).lower() == "pending"]
+        return [work_unit for work_unit in work_units if work_unit_state_status(work_unit, state) == "pending"]
     if selector == "uncompleted":
-        return [work_unit for work_unit in work_units if str(work_unit.get("status", "pending")).lower() not in DONE_STATUSES]
+        return [work_unit for work_unit in work_units if work_unit_state_status(work_unit, state) not in DONE_STATUSES]
 
     requested = expand_selector(selector)
     selected = [work_unit for work_unit in work_units if str(work_unit.get("id")) in requested]
@@ -885,6 +889,12 @@ def select_work_units(manifest: dict[str, Any], selector: str | None) -> list[di
     if missing:
         raise OcmoError(f"selection did not match manifest work unit ids: {', '.join(sorted(missing))}")
     return selected
+
+
+def work_unit_state_status(work_unit: dict[str, Any], state: dict[str, Any] | None) -> str:
+    item_states = state.get("workUnits") if isinstance(state, dict) and isinstance(state.get("workUnits"), dict) else {}
+    item_state = item_states.get(str(work_unit.get("id"))) if isinstance(item_states.get(str(work_unit.get("id"))), dict) else {}
+    return str(item_state.get("status") or "pending").lower()
 
 
 def select_rerun_work_units(manifest: dict[str, Any], state: dict[str, Any], selector: str | None) -> list[dict[str, Any]]:
@@ -902,7 +912,7 @@ def select_rerun_work_units(manifest: dict[str, Any], state: dict[str, Any], sel
     }
     statuses = status_sets.get(selector)
     if statuses is None:
-        return select_work_units(manifest, selector)
+        return select_work_units(manifest, selector, state)
     item_states = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
     selected = []
     for item in manifest["workUnits"]:
@@ -1748,7 +1758,7 @@ def run_manifest(options: RunOptions) -> int:
     elif options.rerun:
         selected = select_rerun_work_units(manifest, existing_state, options.select)
     else:
-        selected = select_work_units(manifest, options.select)
+        selected = select_work_units(manifest, options.select, existing_state)
     concurrency = options.concurrency if options.concurrency is not None else manifest.get("queue", {}).get("concurrency", 1)
     timeout_seconds = options.timeout_seconds
     auto_worktrees = auto_worktrees_config(manifest)
@@ -2733,7 +2743,7 @@ def operation_status_rows(manifest: dict[str, Any], state: dict[str, Any]) -> li
     for item_id in item_ids:
         item = manifest_items.get(item_id, {"id": item_id})
         item_state = item_states.get(item_id) if isinstance(item_states.get(item_id), dict) else {}
-        status = str(item_state.get("status") or item.get("status") or "pending")
+        status = str(item_state.get("status") or "pending")
         runs = item_state.get("runs") if isinstance(item_state.get("runs"), dict) else {}
         run_id, run_state = current_run_state(runs)
         total = int(item_state.get("runCount") or len(work_unit_runs(manifest, item)) or 1)
@@ -3807,6 +3817,7 @@ Rules:
 - You may use policy.worktree: single with queue.concurrency > 1 only when the request explicitly says work unit scopes are non-overlapping and safe to run in one shared workspace; the operator must run it with ocmo run --allow-shared-worktree-concurrency.
 - Use queue.autoWorktrees.enabled: true only when the user wants ocmo to create one git worktree per work unit.
 - Put task-specific fields under each work unit's payload.
+- Do not include workUnits[].status; runtime status is stored in state.json.
 - If one work unit needs multiple prompt phases, use workUnits[].runs.mode: sequential and put runs under workUnits[].runs.steps.
 - Use agent: build for every explicit top-level or per-run agent value.
 - Use per-run prompt.template values when different phases need different instructions.
@@ -3861,7 +3872,6 @@ state:
 workUnits:
   - id: ITEM-001
     title: Example work unit
-    status: pending
     payload: {{}}
 
 Read-only source files available to inspect:

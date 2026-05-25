@@ -41,7 +41,6 @@ state:
 workUnits:
   - id: WORK-001
     title: ExampleReportOne
-    status: pending
     payload:
       workItemKey: WORK-001
       targetName: ExampleReportOne
@@ -73,7 +72,6 @@ workUnits:
             - implement.implementation-notes
   - id: WORK-002
     title: ExampleReportTwo
-    status: pending
     payload:
       workItemKey: WORK-002
       targetName: ExampleReportTwo
