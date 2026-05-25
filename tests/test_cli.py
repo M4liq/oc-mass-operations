@@ -1471,9 +1471,90 @@ class RunManifestTests(OcmoTestCase):
         (generated_dir / "extra.txt").write_text("x", encoding="utf-8")
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force"]), 0)
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force", "--delete-definition"]), 0)
         self.assertFalse(generated_dir.exists())
         self.assertIn("erased:", stdout.getvalue())
+
+    def test_erase_keep_definition_removes_known_runtime_files_only(self) -> None:
+        self.write_manifest()
+        generated_dir = self.root / ".ocmo" / "runtime-only"
+        generated_dir.mkdir(parents=True)
+        generated_manifest = generated_dir / "manifest.yaml"
+        generated_manifest.write_text(
+            f"""schema: ocmo/v1
+operation:
+  id: runtime-only
+  workspace: {self.workspace.as_posix()}
+runner:
+  command: opencode
+queue:
+  concurrency: 1
+prompt:
+  template: prompt.md
+state:
+  path: state.json
+workUnits:
+  - id: one
+""",
+            encoding="utf-8",
+        )
+        (generated_dir / "prompt.md").write_text("prompt", encoding="utf-8")
+        (generated_dir / "notes.md").write_text("notes", encoding="utf-8")
+        (generated_dir / "state.json").write_text(json.dumps({"workUnits": {}}), encoding="utf-8")
+        (generated_dir / "outputs").mkdir()
+        (generated_dir / "outputs" / "one.txt").write_text("out", encoding="utf-8")
+        (generated_dir / "artifacts").mkdir()
+        (generated_dir / "artifacts" / "handoff.md").write_text("artifact", encoding="utf-8")
+        runs_dir = generated_dir / ".ocmo" / "runs"
+        runs_dir.mkdir(parents=True)
+        (runs_dir / "run.log").write_text("log", encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force", "--keep-definition"]), 0)
+
+        self.assertTrue(generated_manifest.exists())
+        self.assertTrue((generated_dir / "prompt.md").exists())
+        self.assertTrue((generated_dir / "notes.md").exists())
+        self.assertFalse((generated_dir / "state.json").exists())
+        self.assertFalse((generated_dir / "outputs").exists())
+        self.assertFalse((generated_dir / "artifacts").exists())
+        self.assertFalse(runs_dir.exists())
+        self.assertIn("erased runtime data:", stdout.getvalue())
+
+    def test_erase_interactive_can_keep_definition_files(self) -> None:
+        generated_dir = self.root / ".ocmo" / "keep-interactive"
+        generated_dir.mkdir(parents=True)
+        generated_manifest = generated_dir / "manifest.yaml"
+        generated_manifest.write_text(
+            f"""schema: ocmo/v1
+operation:
+  id: keep-interactive
+  workspace: {self.workspace.as_posix()}
+runner:
+  command: opencode
+queue:
+  concurrency: 1
+prompt:
+  template: prompt.md
+state:
+  path: state.json
+workUnits:
+  - id: one
+""",
+            encoding="utf-8",
+        )
+        (generated_dir / "prompt.md").write_text("prompt", encoding="utf-8")
+        (generated_dir / "state.json").write_text(json.dumps({"workUnits": {}}), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", side_effect=["yes", "no"]), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 0)
+
+        self.assertTrue(generated_manifest.exists())
+        self.assertTrue((generated_dir / "prompt.md").exists())
+        self.assertFalse((generated_dir / "state.json").exists())
+        self.assertIn("erased runtime data:", stdout.getvalue())
 
     def test_control_edge_branches_and_helpers(self) -> None:
         self.write_manifest()
@@ -1542,6 +1623,14 @@ class RunManifestTests(OcmoTestCase):
         with mock.patch("sys.stdin.isatty", return_value=False), contextlib.redirect_stderr(stderr):
             self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 2)
         self.assertIn("requires --force", stderr.getvalue())
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force"]), 2)
+        self.assertIn("requires --keep-definition or --delete-definition", stderr.getvalue())
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force", "--keep-definition", "--delete-definition"]), 2)
+        self.assertIn("only one of --delete-definition or --keep-definition", stderr.getvalue())
         stdout = io.StringIO()
         with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(stdout):
             self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 1)
@@ -1556,7 +1645,7 @@ class RunManifestTests(OcmoTestCase):
             cli.remove_detached_records(generated_manifest)
         with mock.patch("ocmo.cli.related_detached_records", return_value=[{"runId": 123}]):
             cli.remove_detached_records(generated_manifest)
-        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="yes"), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", side_effect=["yes", "yes"]), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 0)
         self.assertFalse(generated_dir.exists())
 

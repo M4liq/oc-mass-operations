@@ -226,7 +226,8 @@ Review `state.json` beside the manifest for durable execution status, including 
 | Resume a paused operation | `ocmo operation resume [manifest-or-directory] --yes` |
 | Fresh-rerun broken operation work | `ocmo operation rerun [manifest-or-directory] --select retryable --yes` |
 | Kill a running operation | `ocmo operation kill [manifest-or-directory] --force` |
-| Erase a generated operation | `ocmo operation erase .ocmo/<operation>/manifest.yaml --force` |
+| Erase operation runtime data | `ocmo operation erase .ocmo/<operation>/manifest.yaml --force --keep-definition` |
+| Erase a generated operation completely | `ocmo operation erase .ocmo/<operation>/manifest.yaml --force --delete-definition` |
 | Validate workflow | `ocmo workflow validate <workflow>` |
 | Execute workflow background | `ocmo workflow run <workflow> --detach` |
 | Show workflow status | `ocmo workflow status <workflow>` |
@@ -361,7 +362,7 @@ ocmo operation pause .ocmo/business-taxonomy-prompt
 ocmo operation resume .ocmo/business-taxonomy-prompt --yes
 ocmo operation rerun .ocmo/business-taxonomy-prompt --select retryable --yes
 ocmo operation kill .ocmo/business-taxonomy-prompt --force
-ocmo operation erase .ocmo/business-taxonomy-prompt --force
+ocmo operation erase .ocmo/business-taxonomy-prompt --force --keep-definition
 ```
 
 `pause` is stop-and-resume, not an operating-system suspend. It terminates the active detached supervisor and any tracked child `opencode run` processes, then marks running work units/runs as `paused` when their opencode `sessionId` is known. If a process had not emitted a session id yet, the run is marked `paused_unresumable`.
@@ -378,7 +379,7 @@ If an `opencode run` exceeds `timeoutSeconds`, ocmo terminates the child process
 
 `kill` terminates tracked processes and marks active work units/runs as `killed`, preserving the operation directory, state, outputs, logs, and artifacts for audit.
 
-`erase` runs the same termination step and then deletes the generated operation directory, such as `.ocmo/business-taxonomy-prompt/`. It requires `--force` when non-interactive and refuses manifests outside `.ocmo/<operation>/manifest.yaml`.
+`erase` runs the same termination step and removes operation runtime data. In interactive terminals it asks whether to also delete operation definition files, including the manifest and prompt templates. In non-interactive mode, `--force` must be paired with `--keep-definition` to delete only known runtime files (`state.json`, `outputs/`, `artifacts/`, and detached run metadata) or `--delete-definition` to delete the whole generated operation directory, such as `.ocmo/business-taxonomy-prompt/`. It refuses manifests outside `.ocmo/<operation>/manifest.yaml`.
 
 ## Selection Rules
 

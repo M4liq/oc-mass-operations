@@ -172,10 +172,12 @@ def main(argv: list[str] | None = None) -> int:
     kill_parser.add_argument("--run-id", help="Kill by detached run id")
     kill_parser.add_argument("--force", action="store_true", help="Skip confirmation")
 
-    erase_parser = operation_subparsers.add_parser("erase", help="Terminate and delete a generated operation directory")
+    erase_parser = operation_subparsers.add_parser("erase", help="Terminate and erase generated operation data")
     erase_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     erase_parser.add_argument("--run-id", help="Erase by detached run id")
     erase_parser.add_argument("--force", action="store_true", help="Required for non-interactive erase")
+    erase_parser.add_argument("--delete-definition", action="store_true", help="Delete manifest and prompt templates with runtime data")
+    erase_parser.add_argument("--keep-definition", action="store_true", help="Delete only known runtime data, preserving manifest and prompts")
 
     workflow_parser = subparsers.add_parser("workflow", help="Run operation manifests sequentially")
     workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_command", required=True)
@@ -2061,21 +2063,61 @@ def erase_operation(args: argparse.Namespace) -> int:
     if not is_generated_operation_manifest(manifest_path):
         raise OcmoError("erase only removes generated .ocmo/<operation>/manifest.yaml operation directories")
     manifest = load_manifest(manifest_path)
+    if args.delete_definition and args.keep_definition:
+        raise OcmoError("erase accepts only one of --delete-definition or --keep-definition")
+    delete_definition = args.delete_definition
+    if args.force and not (args.delete_definition or args.keep_definition):
+        raise OcmoError("erase --force requires --keep-definition or --delete-definition")
     if not args.force and sys.stdin.isatty():
-        answer = input(f"Erase generated operation directory {manifest_path.parent}? [y/N] ").strip().lower()
+        answer = input(f"Erase runtime data for generated operation {manifest_path.parent}? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled.")
             return 1
+        if not (args.delete_definition or args.keep_definition):
+            answer = input("Delete operation definition files too? This removes manifest and prompts. [y/N] ").strip().lower()
+            delete_definition = answer in {"y", "yes"}
     if not args.force and not sys.stdin.isatty():
         raise OcmoError("erase requires --force when not interactive")
     path = state_path(manifest, manifest_path)
     state = read_json_file(path) if path.exists() else {}
     stop_operation_processes(manifest_path, state, record)
     remove_detached_records(manifest_path)
-    erased = manifest_path.parent
-    shutil.rmtree(erased)
-    print(f"erased: {erased}")
+    if delete_definition:
+        erased = manifest_path.parent
+        shutil.rmtree(erased)
+        print(f"erased: {erased}")
+    else:
+        erase_operation_runtime_data(manifest, manifest_path)
+        print(f"erased runtime data: {manifest_path.parent}")
     return 0
+
+
+def erase_operation_runtime_data(manifest: dict[str, Any], manifest_path: Path) -> None:
+    operation_dir = manifest_path.parent.resolve()
+    runtime_paths = [
+        state_path(manifest, manifest_path),
+        manifest_path.parent / "outputs",
+        manifest_path.parent / ARTIFACT_ROOT,
+        detached_runs_dir(manifest_path),
+    ]
+    for path in runtime_paths:
+        erase_operation_runtime_path(path, operation_dir)
+
+
+def erase_operation_runtime_path(path: Path, operation_dir: Path) -> None:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return
+    if not resolved.is_relative_to(operation_dir) or resolved == operation_dir:
+        return
+    try:
+        if resolved.is_dir():
+            shutil.rmtree(resolved)
+        else:
+            resolved.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def resume_operation(args: argparse.Namespace) -> int:

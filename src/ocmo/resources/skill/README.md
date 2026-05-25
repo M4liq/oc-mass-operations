@@ -175,12 +175,15 @@ Terminates active tracked processes and marks active work `killed`, preserving o
 ### `ocmo operation erase`
 
 ```powershell
-ocmo operation erase [manifest-or-directory] [--run-id <run-id>] --force
+ocmo operation erase [manifest-or-directory] [--run-id <run-id>] [--force] [--keep-definition|--delete-definition]
 ```
 
-Terminates tracked processes and deletes a generated operation directory such as `.ocmo/<operation>/`.
+Terminates tracked processes and removes generated operation runtime data.
 
-- Requires `--force` when non-interactive.
+- Interactive erase asks whether to also delete operation definition files, including the manifest and prompt templates.
+- `--keep-definition` deletes only known runtime data: state, `outputs/`, `artifacts/`, and detached run metadata.
+- `--delete-definition` deletes the whole generated operation directory such as `.ocmo/<operation>/`.
+- Requires `--force` with either `--keep-definition` or `--delete-definition` when non-interactive.
 - Refuses manifests outside `.ocmo/<operation>/manifest.yaml`.
 - Use only when the user wants to remove operation files.
 
