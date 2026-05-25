@@ -662,6 +662,84 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(usage["steps"], 2)
         self.assertEqual(usage["cost"], 0.03)
 
+    def test_run_manifest_writes_readable_output_for_opencode_json(self) -> None:
+        manifest = self.load()
+        manifest["workUnits"] = [manifest["workUnits"][0]]
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        stdout = "\n".join(
+            [
+                '{"type":"step_start","sessionID":"ses-readable","part":{"type":"step-start"}}',
+                '{"type":"text","sessionID":"ses-readable","part":{"type":"text","text":"Readable answer."}}',
+                '{"type":"step_finish","sessionID":"ses-readable","part":{"type":"step-finish","tokens":{"total":7,"input":5,"output":2,"cache":{"read":0,"write":0}}}}',
+            ]
+        )
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, stdout)), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 0)
+        output = (self.root / "outputs" / "1__default.txt").read_text(encoding="utf-8")
+        self.assertIn("Readable answer.", output)
+        self.assertNotIn('"type":"text"', output)
+        self.assertNotIn('"type":"step_finish"', output)
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        run = state["workUnits"]["1"]["runs"]["default"]
+        self.assertEqual(run["sessionId"], "ses-readable")
+        self.assertEqual(run["usage"]["total"], 7)
+
+    def test_run_opencode_command_streams_readable_output_before_exit(self) -> None:
+        output_path = self.root / "outputs" / "stream.txt"
+        lines = [
+            '{"type":"text","sessionID":"ses-stream","part":{"type":"text","text":"First chunk."}}\n',
+            '{"type":"text","sessionID":"ses-stream","part":{"type":"text","text":"Second chunk."}}\n',
+        ]
+
+        class StreamingStdout:
+            def __init__(self) -> None:
+                self.index = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self) -> str:
+                if self.index == 1:
+                    current = output_path.read_text(encoding="utf-8")
+                    self_test.assertIn("First chunk.", current)
+                    self_test.assertNotIn('"type":"text"', current)
+                if self.index >= len(lines):
+                    raise StopIteration
+                line = lines[self.index]
+                self.index += 1
+                return line
+
+        class StreamingPopen:
+            pid = 1234
+            returncode = 0
+
+            def __init__(self, command: list[str], **kwargs) -> None:
+                self.args = command
+                self.stdout = StreamingStdout()
+
+            def wait(self, timeout: int | None = None):
+                return self.returncode
+
+        self_test = self
+        sessions: list[str] = []
+        with mock.patch("ocmo.cli.subprocess.Popen", StreamingPopen):
+            completed = cli.run_opencode_command(
+                ["opencode", "run", "--format", "json", "prompt"],
+                self.root,
+                None,
+                output_path,
+                on_session=sessions.append,
+            )
+
+        output = output_path.read_text(encoding="utf-8")
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("First chunk.Second chunk.", output)
+        self.assertIn("[ocmo] exit code: 0", output)
+        self.assertEqual(sessions, ["ses-stream", "ses-stream"])
+
     def test_usage_parsing_ignores_non_step_events(self) -> None:
         self.assertIsNone(cli.extract_usage_delta("not json"))
         self.assertIsNone(cli.extract_usage_delta("{"))

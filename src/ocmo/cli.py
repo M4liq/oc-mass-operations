@@ -1378,7 +1378,8 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
 
     def subprocess_output(self, item_id: str, run_id: str, completed: subprocess.CompletedProcess) -> None:
         text = "\n".join(part for part in [getattr(completed, "stdout", ""), getattr(completed, "stderr", "")] if part)
-        last_line = next((line.strip() for line in reversed(text.splitlines()) if line.strip()), "")
+        rendered = render_opencode_output_text(text)
+        last_line = next((line.strip() for line in reversed(rendered.splitlines()) if line.strip()), "")
         if last_line:
             with self.lock:
                 self.events.appendleft(f"{item_id}/{run_id}: {last_line[:120]}")
@@ -1553,6 +1554,24 @@ def run_opencode_command(
         output.write(f"$ {format_command(command)}\n\n")
         output.flush()
         process: subprocess.Popen[str] | None = None
+        transcript_needs_newline = False
+
+        def write_transcript(text: str) -> None:
+            nonlocal transcript_needs_newline
+            if not text:
+                return
+            output.write(text)
+            transcript_needs_newline = not text.endswith("\n")
+            output.flush()
+
+        def write_ocmo_line(text: str) -> None:
+            nonlocal transcript_needs_newline
+            if transcript_needs_newline:
+                output.write("\n")
+                transcript_needs_newline = False
+            output.write(text)
+            output.flush()
+
         try:
             process = subprocess.Popen(
                 command,
@@ -1571,6 +1590,7 @@ def run_opencode_command(
                 assert process.stdout is not None
                 for line in process.stdout:
                     chunks.append(line)
+                    write_transcript(render_opencode_output_line(line))
                     session_id = extract_session_id(line)
                     if session_id:
                         on_session(session_id)
@@ -1584,27 +1604,49 @@ def run_opencode_command(
                 if on_usage:
                     for usage in extract_usage_deltas(stdout or ""):
                         on_usage(usage)
+                for line in (stdout or "").splitlines(keepends=True):
+                    write_transcript(render_opencode_output_line(line))
         except subprocess.TimeoutExpired:
             if process is not None:
                 terminate_process_tree(process.pid, force=True)
-            output.write(f"\n[ocmo] timed out after {run_timeout} seconds\n")
-            output.flush()
+            write_ocmo_line(f"\n[ocmo] timed out after {run_timeout} seconds\n")
             raise
         except KeyboardInterrupt:
             if process is not None:
                 terminate_process_tree(process.pid, force=True)
-            output.write("\n[ocmo] interrupted\n")
-            output.flush()
+            write_ocmo_line("\n[ocmo] interrupted\n")
             raise
         except OSError as exc:
-            output.write(f"\n[ocmo] failed to start: {exc}\n")
-            output.flush()
+            write_ocmo_line(f"\n[ocmo] failed to start: {exc}\n")
             raise
         cleaned_stdout = strip_ansi(stdout or "")
-        output.write(cleaned_stdout)
-        output.write(f"\n[ocmo] exit code: {process.returncode}\n")
-        output.flush()
+        write_ocmo_line(f"\n[ocmo] exit code: {process.returncode}\n")
         return subprocess.CompletedProcess(command, int(process.returncode or 0), stdout=cleaned_stdout, stderr=None)
+
+
+def render_opencode_output_line(line: str) -> str:
+    stripped = strip_ansi(line).strip()
+    if not stripped.startswith("{"):
+        return strip_ansi(line)
+    try:
+        event = json.loads(stripped)
+    except json.JSONDecodeError:
+        return strip_ansi(line)
+    if not isinstance(event, dict):
+        return ""
+    part = event.get("part")
+    if isinstance(part, dict):
+        text = part.get("text")
+        if isinstance(text, str):
+            return text
+    message = event.get("message")
+    if isinstance(message, str):
+        return message + ("" if message.endswith("\n") else "\n")
+    return ""
+
+
+def render_opencode_output_text(output: str) -> str:
+    return "".join(render_opencode_output_line(line) for line in output.splitlines(keepends=True))
 
 
 def extract_session_id(output: str) -> str | None:
