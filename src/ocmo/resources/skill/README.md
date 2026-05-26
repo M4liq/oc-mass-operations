@@ -100,6 +100,8 @@ Runs selected work units.
 
 Very long rendered prompts are written under `prompt-inputs/` beside the manifest and attached to `opencode run` with `--file` to avoid OS command-line limits. Dry runs show the rendered prompt and note when file transport would be used.
 
+Changing a manifest or prompt template while an operation is running does not affect already-started agent processes. It can affect queued work units or later sequential run steps because prompts are rendered immediately before each run starts. Long-prompt transport writes the prompt input file before launching the agent, so edits after launch do not change that launched run.
+
 Pressing `Ctrl+C` during foreground `ocmo operation run` uses pause semantics: tracked child processes are terminated, active runs are marked `paused` or `paused_unresumable`, and the command exits `130`.
 
 ### `ocmo operation status`
