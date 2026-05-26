@@ -48,6 +48,7 @@ ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 OCMO_SKILL_NAME = "ocmo"
 OLD_OCMO_SKILL_NAMES = ("ocmo-plan-grill",)
 OCMO_SKILL_RESOURCE = "resources/skill"
+OCMO_COMMAND_RESOURCE = "resources/commands"
 
 
 class OcmoError(Exception):
@@ -145,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     status_parser.add_argument("--run-id", help="Show one detached run session")
     status_parser.add_argument("--all", action="store_true", help="Include inactive detached run sessions")
+    status_parser.add_argument("--active-or-latest", action="store_true", help="Show all active operations, or the latest inactive operation when none are active")
     status_parser.add_argument("--once", action="store_true", help="Print one status snapshot and exit")
     status_parser.add_argument("--interval", type=float, default=1.0, help="Refresh interval in seconds for continuous status")
 
@@ -354,6 +356,7 @@ def install_skill(force: bool = False) -> Path:
     if destination.exists():
         if installed_skill_matches(destination_dir, source_files):
             print(f"already installed: {destination}")
+            install_opencode_commands()
             remove_old_skill_installs(destination_dir.parent)
             return destination
         action = "updated"
@@ -365,9 +368,26 @@ def install_skill(force: bool = False) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source_path.read_bytes())
     print(f"{action}: {destination}")
+    install_opencode_commands()
     remove_old_skill_installs(destination_dir.parent)
     print("restart opencode to load the skill")
     return destination
+
+
+def install_opencode_commands() -> None:
+    source_dir = bundled_command_dir()
+    if not source_dir.exists():
+        return
+    destination_dir = opencode_commands_dir()
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    for source_path in sorted((path for path in source_dir.iterdir() if path.name.endswith(".md")), key=lambda path: path.name):
+        target = destination_dir / source_path.name
+        if target.exists() and target.read_bytes() == source_path.read_bytes():
+            print(f"already installed command: {target}")
+            continue
+        action = "updated" if target.exists() else "installed"
+        target.write_bytes(source_path.read_bytes())
+        print(f"{action} command: {target}")
 
 
 def bundled_skill_files(source_dir: Any) -> dict[Path, Any]:
@@ -415,6 +435,16 @@ def opencode_skill_path() -> Path:
     return skills_dir / OCMO_SKILL_NAME / "SKILL.md"
 
 
+def opencode_commands_dir() -> Path:
+    root = os.environ.get("OCMO_OPENCODE_COMMANDS_DIR")
+    if root:
+        return Path(root)
+    skills_root = os.environ.get("OCMO_OPENCODE_SKILLS_DIR")
+    if skills_root:
+        return Path(skills_root).parent / "commands"
+    return Path.home() / ".config" / "opencode" / "commands"
+
+
 def bundled_skill_path() -> Path:
     return bundled_skill_dir() / "SKILL.md"
 
@@ -436,6 +466,23 @@ def bundled_skill_dir() -> Path:
         if (candidate / "SKILL.md").exists():
             return candidate
     raise OcmoError("bundled skill directory not found; reinstall ocmo or install from the cloned repository")
+
+
+def bundled_command_dir() -> Path:
+    configured = os.environ.get("OCMO_COMMAND_SOURCE")
+    if configured:
+        path = Path(configured)
+        if path.is_dir():
+            return path
+        raise OcmoError(f"configured command source not found: {path}")
+    resource_root = resources.files(__package__).joinpath(OCMO_COMMAND_RESOURCE)
+    if resource_root.is_dir():
+        return resource_root
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "src" / "ocmo" / "resources" / "commands"
+        if candidate.exists():
+            return candidate
+    return Path("__missing_ocmo_commands__")
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -2208,6 +2255,8 @@ def list_runs(args: argparse.Namespace) -> int:
 
 
 def status_operation(args: argparse.Namespace) -> int:
+    if args.active_or_latest:
+        return print_active_or_latest_operation_statuses(include_inactive=args.all)
     record = None
     if args.run_id:
         path = find_detached_record(args.run_id)
@@ -2228,6 +2277,28 @@ def status_operation(args: argparse.Namespace) -> int:
         print_operation_status(manifest_path, include_inactive=args.all, selected_record=record)
         return 0
     return watch_operation_status(manifest_path, include_inactive=args.all, selected_record=record, interval=interval)
+
+
+def print_active_or_latest_operation_statuses(include_inactive: bool = False) -> int:
+    active_records = detached_records(include_inactive=False, kind="operation")
+    active = operation_status_targets(active_records, discovered_operation_records(include_inactive=False, detached=active_records))
+    targets = active
+    if not targets:
+        all_records = detached_records(include_inactive=True, kind="operation")
+        all_targets = operation_status_targets(all_records, discovered_operation_records(include_inactive=True, detached=all_records))
+        latest = latest_operation_status_target(all_targets)
+        if latest is not None:
+            targets = [latest]
+    if not targets:
+        print("No ocmo operations found.")
+        return 0
+    heading = "Active OCMO operation statuses" if active else "Latest OCMO operation status"
+    print(heading)
+    for index, target in enumerate(targets):
+        if index:
+            print()
+        print_operation_status(target["manifestPath"], include_inactive=include_inactive, selected_record=target.get("record"))
+    return 0
 
 
 def pause_operation(args: argparse.Namespace) -> int:
@@ -2884,7 +2955,7 @@ def print_operation_status_snapshot(manifest_path: Path, include_inactive: bool,
     print(
         f"selected={len(rows)} running={counts['running']} completed={counts['completed']} "
         f"failed={counts['failed']} blocked={counts['blocked']} pending={counts['pending']} paused={counts['paused']} "
-        f"killed={counts['killed']} {format_usage_summary(state_usage(state))} elapsed={operation_runtime(state)} updated={updated}"
+        f"killed={counts['killed']} {format_usage_summary(state_usage(state))} elapsed={operation_runtime(state)} stateUpdated={updated}"
     )
     if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
         print("warning: detached run is inactive but state contains running work units; run may be stale")
@@ -2910,7 +2981,7 @@ def print_workflow_status(workflow_path: Path, include_inactive: bool, selected_
     print(
         f"steps={len(rows)} running={counts['running']} completed={counts['completed']} "
         f"failed={counts['failed']} blocked={counts['blocked']} pending={counts['pending']} paused={counts['paused']} "
-        f"killed={counts['killed']} {format_usage_summary(workflow_usage(workflow, workflow_path))} updated={updated}"
+        f"killed={counts['killed']} {format_usage_summary(workflow_usage(workflow, workflow_path))} stateUpdated={updated}"
     )
     if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
         print("warning: detached workflow is inactive but state contains running steps; run may be stale")
@@ -3036,6 +3107,62 @@ def discovered_operation_records(include_inactive: bool, detached: list[dict[str
     return records
 
 
+def operation_status_targets(detached: list[dict[str, Any]], discovered: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    targets = []
+    seen: set[str] = set()
+    for record in detached:
+        manifest_value = record.get("manifestPath")
+        if not isinstance(manifest_value, str):
+            continue
+        manifest_path = Path(manifest_value)
+        key = str(manifest_path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append({"manifestPath": manifest_path, "record": record, "updatedAt": operation_target_updated_at(record)})
+    for record in discovered:
+        manifest_value = record.get("manifestPath")
+        if not isinstance(manifest_value, str):
+            continue
+        manifest_path = Path(manifest_value)
+        key = str(manifest_path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        state = record.get("state") if isinstance(record.get("state"), dict) else {}
+        targets.append({"manifestPath": manifest_path, "updatedAt": state.get("updatedAt")})
+    return targets
+
+
+def operation_target_updated_at(record: dict[str, Any]) -> Any:
+    state_path_value = record.get("statePath")
+    if isinstance(state_path_value, str):
+        path = Path(state_path_value)
+        if path.exists():
+            try:
+                state = read_json_file(path)
+            except (OSError, json.JSONDecodeError):
+                state = {}
+            if isinstance(state, dict) and state.get("updatedAt"):
+                return state.get("updatedAt")
+    return record.get("startedAt")
+
+
+def latest_operation_status_target(targets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not targets:
+        return None
+    return max(targets, key=lambda target: sortable_state_time(target.get("updatedAt")))
+
+
+def sortable_state_time(value: Any) -> tuple[int, str]:
+    if not isinstance(value, str) or not value:
+        return (0, "")
+    parsed = parse_state_datetime(value)
+    if parsed is not None:
+        return (1, parsed.isoformat())
+    return (0, value)
+
+
 def operation_state_is_active(state: dict[str, Any]) -> bool:
     work_units = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
     for item_state in work_units.values():
@@ -3061,7 +3188,7 @@ def print_operation_record(record: dict[str, Any]) -> None:
     print(
         f"{record.get('operationId', '<unknown>')} {status} kind=operation manifest={record.get('manifestPath', '-')} "
         f"state={record.get('statePath', '-')} running={counts['running']} completed={counts['completed']} "
-        f"failed={counts['failed']} pending={counts['pending']} elapsed={operation_runtime(state)} updated={state.get('updatedAt', '-')}"
+        f"failed={counts['failed']} pending={counts['pending']} elapsed={operation_runtime(state)} stateUpdated={state.get('updatedAt', '-')}"
     )
 
 
@@ -3261,7 +3388,7 @@ def print_state_summary(state: dict[str, Any]) -> None:
     print("workUnits: " + ", ".join(f"{status}={counts[status]}" for status in sorted(counts)))
     updated = state.get("updatedAt")
     if updated:
-        print(f"updated: {updated}")
+        print(f"stateUpdated: {updated}")
     print(format_usage_summary(state_usage(state)))
 
 
@@ -3277,7 +3404,7 @@ def print_workflow_state_summary(state: dict[str, Any]) -> None:
     print("steps: " + ", ".join(f"{status}={counts[status]}" for status in sorted(counts)))
     updated = state.get("updatedAt")
     if updated:
-        print(f"updated: {updated}")
+        print(f"stateUpdated: {updated}")
 
 
 def run_item(

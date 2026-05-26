@@ -72,9 +72,11 @@ Print the target install path with:
 ocmo skill path
 ```
 
-`ocmo skill install` updates the installed skill directory when the bundled skill or its handbook changes. It installs both `SKILL.md` and a version-matched `README.md` handbook, and it removes the old managed `ocmo-plan-grill` skill path during migration. Restart opencode after installing the skill. Running sessions keep using the already-loaded skill set.
+`ocmo skill install` updates the installed skill directory when the bundled skill or its handbook changes. It installs both `SKILL.md` and a version-matched `README.md` handbook, installs the `/ocmo-operation-statuses` slash command under `~/.config/opencode/commands/`, and removes the old managed `ocmo-plan-grill` skill path during migration. Restart opencode after installing the skill. Running sessions keep using the already-loaded skill and command set.
 
 Use `/ocmo` when you want an agent to inspect OCMO manifests, validate or render operations, explain command usage, inspect state and outputs, plan mass operations, or control running work with pause/resume/rerun/kill/erase.
+
+Use `/ocmo-operation-statuses` to ask an agent for a brief read-only summary of all active operation statuses, or the latest inactive operation when nothing is active.
 
 ## How It Works
 
@@ -287,12 +289,12 @@ Changing a manifest or prompt template while an operation is running does not af
 ## Status
 
 ```powershell
-ocmo operation status [manifest-or-directory] [--run-id <run-id>] [--all] [--interval <seconds>] [--once]
+ocmo operation status [manifest-or-directory] [--run-id <run-id>] [--active-or-latest] [--all] [--interval <seconds>] [--once]
 ```
 
-`ocmo operation status` watches by default: it reloads state and detached run metadata every second and keeps reporting until interrupted with `Ctrl+C`. Use `--interval <seconds>` to change the refresh cadence. Use `--once` for a single snapshot in scripts or logs.
+`ocmo operation status` watches by default: it reloads state and detached run metadata every second and keeps reporting until interrupted with `Ctrl+C`. Use `--interval <seconds>` to change the refresh cadence. Use `--once` for a single snapshot in scripts or logs. Use `--active-or-latest --once` for slash-command-friendly output covering all active discovered operations, or the latest inactive operation when none are active.
 
-The status summary includes `elapsed=<duration>` for the whole operation. The table separates cumulative work-unit time (`Work Time`) from the current or last agent run step time (`Agent Time`).
+The status summary includes `elapsed=<duration>` for the whole operation and `stateUpdated=<timestamp>` for the last time OCMO wrote operation state. `stateUpdated` is not the transcript output file modification time. The table separates cumulative work-unit time (`Work Time`) from the current or last agent run step time (`Agent Time`).
 
 ## Workflows
 

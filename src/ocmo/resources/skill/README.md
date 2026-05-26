@@ -107,7 +107,7 @@ Pressing `Ctrl+C` during foreground `ocmo operation run` uses pause semantics: t
 ### `ocmo operation status`
 
 ```powershell
-ocmo operation status [manifest-or-directory] [--run-id <run-id>] [--all] [--interval <seconds>] [--once]
+ocmo operation status [manifest-or-directory] [--run-id <run-id>] [--active-or-latest] [--all] [--interval <seconds>] [--once]
 ```
 
 Continuously refreshes work unit/run status and detached run information until interrupted with `Ctrl+C`.
@@ -115,11 +115,12 @@ Continuously refreshes work unit/run status and detached run information until i
 - No argument lists active detached runs from the global registry when no manifest can be inferred.
 - `[manifest-or-directory]` shows status for one operation.
 - `--run-id <run-id>` resolves detached metadata and shows that run's operation status.
+- `--active-or-latest`: prints read-only snapshots for all active discovered operations, or the latest inactive operation when none are active. This powers `/ocmo-operation-statuses`.
 - `--all` includes inactive detached run sessions.
 - `--interval <seconds>` changes the refresh cadence from the default `1` second.
 - `--once` prints a single snapshot and exits. Use it for scripts or logs.
 
-Status shows total operation elapsed time as `elapsed=<duration>`. The table separates cumulative work-unit `Work Time` from current or last run-step `Agent Time`. When `opencode run --format json` reports step usage, status also shows operation token totals and a per-work-unit `Tokens` column formatted as `input/output`.
+Status shows total operation elapsed time as `elapsed=<duration>` and the last OCMO state write as `stateUpdated=<timestamp>`. `stateUpdated` is not the transcript output file modification time. The table separates cumulative work-unit `Work Time` from current or last run-step `Agent Time`. When `opencode run --format json` reports step usage, status also shows operation token totals and a per-work-unit `Tokens` column formatted as `input/output`.
 
 ### `ocmo operation list`
 
@@ -198,11 +199,15 @@ ocmo skill install [--force]
 ocmo skill path
 ```
 
-- `install`: installs or updates the bundled `/ocmo` opencode skill and this handbook under `~/.config/opencode/skills/ocmo/`.
+- `install`: installs or updates the bundled `/ocmo` opencode skill and this handbook under `~/.config/opencode/skills/ocmo/`, and installs `/ocmo-operation-statuses` under `~/.config/opencode/commands/`.
 - `path`: prints the installed `SKILL.md` path.
 - `--force`: accepted for compatibility; install updates bundled skill files by default.
 
 Restart opencode after installing or updating the skill.
+
+### `/ocmo-operation-statuses`
+
+Installed by `ocmo skill install` as an opencode slash command. It runs `ocmo operation status --active-or-latest --once` and asks the agent to summarize running, failed, blocked, paused, killed, and pending work without starting or controlling operations.
 
 ## Manifest Inference
 

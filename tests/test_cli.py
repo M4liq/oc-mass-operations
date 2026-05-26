@@ -1173,7 +1173,7 @@ class RunManifestTests(OcmoTestCase):
         output = stdout.getvalue()
         self.assertIn("ocmo-active active", output)
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=1 completed=1 failed=0 blocked=0 pending=0 paused=0 killed=0 tokens=- elapsed=04:00 updated=now", output)
+        self.assertIn("selected=2 running=1 completed=1 failed=0 blocked=0 pending=0 paused=0 killed=0 tokens=- elapsed=04:00 stateUpdated=now", output)
         self.assertIn("Work Unit", output)
         self.assertIn("Progress", output)
         self.assertIn("Work Time", output)
@@ -1251,6 +1251,50 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("running-op active kind=operation", output)
         self.assertIn("completed-op inactive kind=operation", output)
         self.assertIn("elapsed=03:00", output)
+
+    def test_operation_status_active_or_latest_shows_active_else_latest(self) -> None:
+        active_dir = self.root / ".ocmo" / "active-op"
+        older_dir = self.root / ".ocmo" / "older-op"
+        latest_dir = self.root / ".ocmo" / "latest-op"
+        for path in (active_dir, older_dir, latest_dir):
+            path.mkdir(parents=True)
+        manifest = self.load()
+        manifest["state"]["path"] = "state.json"
+        manifest["operation"]["id"] = "active-op"
+        (active_dir / "manifest.yaml").write_text(yaml_dump(manifest), encoding="utf-8")
+        (active_dir / "state.json").write_text(json.dumps({"updatedAt": "2026-05-21T10:02:00+00:00", "workUnits": {"1": {"status": "running"}}}), encoding="utf-8")
+        manifest["operation"]["id"] = "older-op"
+        (older_dir / "manifest.yaml").write_text(yaml_dump(manifest), encoding="utf-8")
+        (older_dir / "state.json").write_text(json.dumps({"updatedAt": "2026-05-21T10:01:00+00:00", "workUnits": {"1": {"status": "completed"}}}), encoding="utf-8")
+        manifest["operation"]["id"] = "latest-op"
+        (latest_dir / "manifest.yaml").write_text(yaml_dump(manifest), encoding="utf-8")
+        (latest_dir / "state.json").write_text(json.dumps({"updatedAt": "2026-05-21T10:03:00+00:00", "workUnits": {"1": {"status": "completed"}}}), encoding="utf-8")
+
+        old_cwd = Path.cwd()
+        try:
+            import os as test_os
+
+            test_os.chdir(self.root)
+            registry = self.root / "registry"
+            registry.mkdir()
+            stdout = io.StringIO()
+            with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main(["operation", "status", "--active-or-latest", "--once"]), 0)
+            active_output = stdout.getvalue()
+            (active_dir / "state.json").write_text(json.dumps({"updatedAt": "2026-05-21T10:02:00+00:00", "workUnits": {"1": {"status": "completed"}}}), encoding="utf-8")
+            stdout = io.StringIO()
+            with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main(["operation", "status", "--active-or-latest", "--once"]), 0)
+            latest_output = stdout.getvalue()
+        finally:
+            test_os.chdir(old_cwd)
+
+        self.assertIn("Active OCMO operation statuses", active_output)
+        self.assertIn("OC Mass Operations: active-op", active_output)
+        self.assertNotIn("OC Mass Operations: latest-op", active_output)
+        self.assertIn("Latest OCMO operation status", latest_output)
+        self.assertIn("OC Mass Operations: latest-op", latest_output)
+        self.assertNotIn("OC Mass Operations: older-op", latest_output)
 
     def test_status_errors_for_missing_run_id_and_filters_inactive(self) -> None:
         registry = self.root / "registry"
@@ -1385,7 +1429,7 @@ class RunManifestTests(OcmoTestCase):
 
         output = stdout.getvalue()
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=0 completed=0 failed=0 blocked=0 pending=2 paused=0 killed=0 tokens=- elapsed=- updated=-", output)
+        self.assertIn("selected=2 running=0 completed=0 failed=0 blocked=0 pending=2 paused=0 killed=0 tokens=- elapsed=- stateUpdated=-", output)
         self.assertIn("1          pending", output)
         self.assertRegex(output, r"2\s+pending")
         self.assertIn("First", output)
@@ -1409,8 +1453,8 @@ class RunManifestTests(OcmoTestCase):
             self.assertEqual(cli.main(["operation", "status", "--interval", "0.1", str(self.manifest_path)]), 130)
 
         output = stdout.getvalue()
-        self.assertIn("updated=first", output)
-        self.assertIn("updated=second", output)
+        self.assertIn("stateUpdated=first", output)
+        self.assertIn("stateUpdated=second", output)
         self.assertIn("running=1", output)
         self.assertIn("completed=1", output)
 
@@ -1495,7 +1539,7 @@ class RunManifestTests(OcmoTestCase):
 
         output = stdout.getvalue()
         self.assertIn("manifest:", output)
-        self.assertIn("updated: later", output)
+        self.assertIn("stateUpdated: later", output)
         self.assertIn("detached runs:", output)
 
         fallback = registry / "fallback.json"
@@ -2367,11 +2411,16 @@ class CliEntrypointTests(OcmoTestCase):
         source.mkdir()
         (source / "SKILL.md").write_text("skill text\n", encoding="utf-8")
         (source / "README.md").write_text("handbook text\n", encoding="utf-8")
+        command_source = self.root / "source-commands"
+        command_source.mkdir()
+        (command_source / "ocmo-operation-statuses.md").write_text("command text\n", encoding="utf-8")
         skills_dir = self.root / "skills-dir"
+        commands_dir = self.root / "commands-dir"
         destination = skills_dir / "ocmo" / "SKILL.md"
         handbook = skills_dir / "ocmo" / "README.md"
+        command_destination = commands_dir / "ocmo-operation-statuses.md"
         stdout = io.StringIO()
-        env = {"OCMO_SKILL_SOURCE": str(source), "OCMO_OPENCODE_SKILLS_DIR": str(skills_dir)}
+        env = {"OCMO_SKILL_SOURCE": str(source), "OCMO_COMMAND_SOURCE": str(command_source), "OCMO_OPENCODE_SKILLS_DIR": str(skills_dir), "OCMO_OPENCODE_COMMANDS_DIR": str(commands_dir)}
 
         with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
             first_code = cli.main(["skill", "install"])
@@ -2381,9 +2430,12 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertEqual(second_code, 0)
         self.assertEqual(destination.read_text(encoding="utf-8"), "skill text\n")
         self.assertEqual(handbook.read_text(encoding="utf-8"), "handbook text\n")
+        self.assertEqual(command_destination.read_text(encoding="utf-8"), "command text\n")
         output = stdout.getvalue()
         self.assertIn("installed:", output)
+        self.assertIn("installed command:", output)
         self.assertIn("already installed:", output)
+        self.assertIn("already installed command:", output)
         self.assertIn("restart opencode", output)
 
     def test_skill_install_updates_different_existing_file(self) -> None:

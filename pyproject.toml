@@ -20,7 +20,7 @@ ocmo = "ocmo.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ocmo = ["resources/skill/*"]
+ocmo = ["resources/skill/*", "resources/commands/*"]
 
 [tool.coverage.run]
 branch = true
