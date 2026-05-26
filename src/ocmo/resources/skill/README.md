@@ -98,6 +98,8 @@ Runs selected work units.
 - `--detach`: starts a background `ocmo operation run` with `--yes` and `--ui plain`, writes detached metadata/logs under `.ocmo/runs/`, writes a global registry entry, returns a run ID, and exits.
 - `--allow-shared-worktree-concurrency`: allows concurrency above `1` when `policy.worktree: single`. Use only when selected work unit scopes are explicitly non-overlapping.
 
+Very long rendered prompts are written under `prompt-inputs/` beside the manifest and attached to `opencode run` with `--file` to avoid OS command-line limits. Dry runs show the rendered prompt and note when file transport would be used.
+
 Pressing `Ctrl+C` during foreground `ocmo operation run` uses pause semantics: tracked child processes are terminated, active runs are marked `paused` or `paused_unresumable`, and the command exits `130`.
 
 ### `ocmo operation status`
@@ -115,7 +117,7 @@ Continuously refreshes work unit/run status and detached run information until i
 - `--interval <seconds>` changes the refresh cadence from the default `1` second.
 - `--once` prints a single snapshot and exits. Use it for scripts or logs.
 
-When `opencode run --format json` reports step usage, status shows operation token totals and a per-work-unit `Tokens` column formatted as `input/output`.
+Status shows total operation elapsed time as `elapsed=<duration>`. The table separates cumulative work-unit `Work Time` from current or last run-step `Agent Time`. When `opencode run --format json` reports step usage, status also shows operation token totals and a per-work-unit `Tokens` column formatted as `input/output`.
 
 ### `ocmo operation list`
 
@@ -123,7 +125,7 @@ When `opencode run --format json` reports step usage, status shows operation tok
 ocmo operation list [manifest-or-directory] [--run-id <run-id>] [--all]
 ```
 
-Lists detached operation run sessions. Use `--all` to include inactive sessions. `ocmo operation list --run-id <run-id>` includes a state summary with token totals when usage is available.
+Lists detached operation run sessions and discovered generated `.ocmo/*/manifest.yaml` operation states. Foreground operations appear when their state file shows active work. Use `--all` to include inactive detached sessions and inactive discovered operation states. `ocmo operation list --run-id <run-id>` includes a state summary with token totals when usage is available.
 
 ### `ocmo operation pause`
 
@@ -175,17 +177,17 @@ Terminates active tracked processes and marks active work `killed`, preserving o
 ### `ocmo operation erase`
 
 ```powershell
-ocmo operation erase [manifest-or-directory] [--run-id <run-id>] [--force] [--keep-definition|--delete-definition]
+ocmo operation erase [manifest-or-directory] [--run-id <run-id>] [--force]
 ```
 
-Terminates tracked processes and removes generated operation runtime data.
+Terminates tracked processes and removes generated operation runtime data only.
 
-- Interactive erase asks whether to also delete operation definition files, including the manifest and prompt templates.
-- `--keep-definition` deletes only known runtime data: state, `outputs/`, `artifacts/`, and detached run metadata.
-- `--delete-definition` deletes the whole generated operation directory such as `.ocmo/<operation>/`.
-- Requires `--force` with either `--keep-definition` or `--delete-definition` when non-interactive.
+- Removes known runtime data: state, `outputs/`, `artifacts/`, `prompt-inputs/`, and detached run metadata.
+- Never deletes operation definition files such as `manifest.yaml`, prompt templates, or notes.
+- Delete operation definition files manually if they are no longer needed.
+- Requires `--force` when non-interactive.
 - Refuses manifests outside `.ocmo/<operation>/manifest.yaml`.
-- Use only when the user wants to remove operation files.
+- Use only when the user wants to remove generated runtime files.
 
 ### `ocmo skill`
 

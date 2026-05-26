@@ -41,6 +41,9 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:
 PLAN_AGENT = "build"
 RUN_AGENT = "build"
 ARTIFACT_ROOT = "artifacts"
+PROMPT_INPUT_ROOT = "prompt-inputs"
+PROMPT_ARG_MAX_CHARS = 24_000
+PROMPT_FILE_MESSAGE = "Read the attached prompt file and follow its instructions exactly."
 ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 OCMO_SKILL_NAME = "ocmo"
 OLD_OCMO_SKILL_NAMES = ("ocmo-plan-grill",)
@@ -179,12 +182,10 @@ def main(argv: list[str] | None = None) -> int:
     kill_parser.add_argument("--run-id", help="Kill by detached run id")
     kill_parser.add_argument("--force", action="store_true", help="Skip confirmation")
 
-    erase_parser = operation_subparsers.add_parser("erase", help="Terminate and erase generated operation data")
+    erase_parser = operation_subparsers.add_parser("erase", help="Terminate and erase generated operation runtime data")
     erase_parser.add_argument("manifest", nargs="?", type=Path, help="Manifest path or directory")
     erase_parser.add_argument("--run-id", help="Erase by detached run id")
     erase_parser.add_argument("--force", action="store_true", help="Required for non-interactive erase")
-    erase_parser.add_argument("--delete-definition", action="store_true", help="Delete manifest and prompt templates with runtime data")
-    erase_parser.add_argument("--keep-definition", action="store_true", help="Delete only known runtime data, preserving manifest and prompts")
 
     workflow_parser = subparsers.add_parser("workflow", help="Run operation manifests sequentially")
     workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_command", required=True)
@@ -1297,7 +1298,14 @@ def print_rich_prompt_previews(previews: list[PromptPreview], show_all: bool) ->
         console.print(Panel(Group(*renderables), title=f"work unit {preview.work_unit_id} / run {preview.run_id}", border_style="cyan"))
 
 
-def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str, run_dir: Path | None = None, runner: dict[str, Any] | None = None) -> list[str]:
+def build_command(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    prompt_text: str,
+    run_dir: Path | None = None,
+    runner: dict[str, Any] | None = None,
+    prompt_file: Path | None = None,
+) -> list[str]:
     operation = manifest["operation"]
     runner = runner or manifest["runner"]
     command = [runner.get("command", "opencode"), "run"]
@@ -1312,14 +1320,58 @@ def build_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: st
     if runner.get("dangerouslySkipPermissions"):
         command.append("--dangerously-skip-permissions")
     command += ["--format", "json"]
+    if prompt_file is not None:
+        command += ["--file", str(prompt_file)]
+        prompt_text = PROMPT_FILE_MESSAGE
     command += ["--dir", str(run_dir or resolve_manifest_path(manifest_path, operation["workspace"])), prompt_text]
     return command
 
 
-def build_resume_command(manifest: dict[str, Any], manifest_path: Path, prompt_text: str, session_id: str, run_dir: Path | None = None, runner: dict[str, Any] | None = None) -> list[str]:
-    command = build_command(manifest, manifest_path, prompt_text, run_dir, runner)
+def build_resume_command(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    prompt_text: str,
+    session_id: str,
+    run_dir: Path | None = None,
+    runner: dict[str, Any] | None = None,
+    prompt_file: Path | None = None,
+) -> list[str]:
+    command = build_command(manifest, manifest_path, prompt_text, run_dir, runner, prompt_file)
     command[2:2] = ["--session", session_id]
     return command
+
+
+def command_line_length(command: list[str]) -> int:
+    return sum(len(part) for part in command) + max(len(command) - 1, 0)
+
+
+def should_use_prompt_file(command: list[str]) -> bool:
+    return command_line_length(command) > PROMPT_ARG_MAX_CHARS
+
+
+def prompt_input_path(manifest_path: Path, item_id: str, run_id: str) -> Path:
+    return (manifest_path.parent / PROMPT_INPUT_ROOT / slugify(item_id) / f"{slugify(run_id)}.md").resolve()
+
+
+def write_prompt_input(path: Path, prompt_text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(prompt_text, encoding="utf-8")
+    return path
+
+
+def build_transport_command(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    prompt_text: str,
+    prompt_file: Path,
+    run_dir: Path | None = None,
+    runner: dict[str, Any] | None = None,
+) -> tuple[list[str], Path | None]:
+    command = build_command(manifest, manifest_path, prompt_text, run_dir, runner)
+    if not should_use_prompt_file(command):
+        return command, None
+    written_prompt_file = write_prompt_input(prompt_file, prompt_text)
+    return build_command(manifest, manifest_path, prompt_text, run_dir, runner, written_prompt_file), written_prompt_file
 
 
 class PlainRunReporter:
@@ -1937,6 +1989,10 @@ def run_manifest(options: RunOptions) -> int:
                 prompt_text = render_prompt(manifest, item, options.manifest_path, execution, run, runs)
                 command = build_command(manifest, options.manifest_path, prompt_text, run_dir, runner)
                 details = []
+                if should_use_prompt_file(command):
+                    prompt_file = prompt_input_path(options.manifest_path, str(item["id"]), str(run["id"]))
+                    command = build_command(manifest, options.manifest_path, prompt_text, run_dir, runner, prompt_file)
+                    details.append(("prompt transport", f"file when executed -> {relative_to_manifest(prompt_file, options.manifest_path)}"))
                 if execution:
                     details.append(("worktree", str(execution["worktreePath"])))
                     details.append(("branch", str(execution["branchName"])))
@@ -2139,12 +2195,15 @@ def list_runs(args: argparse.Namespace) -> int:
         print_manifest_detached_runs(infer_manifest_path(args.manifest), include_inactive=args.all)
         return 0
     records = detached_records(include_inactive=args.all, kind="operation")
-    if not records:
+    operations = discovered_operation_records(include_inactive=args.all, detached=records)
+    if not records and not operations:
         qualifier = "" if args.all else " active"
-        print(f"No{qualifier} detached ocmo runs.")
+        print(f"No{qualifier} ocmo operations.")
         return 0
     for record in records:
         print_detached_record(record, details=False)
+    for operation in operations:
+        print_operation_record(operation)
     return 0
 
 
@@ -2203,32 +2262,19 @@ def erase_operation(args: argparse.Namespace) -> int:
     if not is_generated_operation_manifest(manifest_path):
         raise OcmoError("erase only removes generated .ocmo/<operation>/manifest.yaml operation directories")
     manifest = load_manifest(manifest_path)
-    if args.delete_definition and args.keep_definition:
-        raise OcmoError("erase accepts only one of --delete-definition or --keep-definition")
-    delete_definition = args.delete_definition
-    if args.force and not (args.delete_definition or args.keep_definition):
-        raise OcmoError("erase --force requires --keep-definition or --delete-definition")
     if not args.force and sys.stdin.isatty():
         answer = input(f"Erase runtime data for generated operation {manifest_path.parent}? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled.")
             return 1
-        if not (args.delete_definition or args.keep_definition):
-            answer = input("Delete operation definition files too? This removes manifest and prompts. [y/N] ").strip().lower()
-            delete_definition = answer in {"y", "yes"}
     if not args.force and not sys.stdin.isatty():
         raise OcmoError("erase requires --force when not interactive")
     path = state_path(manifest, manifest_path)
     state = read_json_file(path) if path.exists() else {}
     stop_operation_processes(manifest_path, state, record)
     remove_detached_records(manifest_path)
-    if delete_definition:
-        erased = manifest_path.parent
-        shutil.rmtree(erased)
-        print(f"erased: {erased}")
-    else:
-        erase_operation_runtime_data(manifest, manifest_path)
-        print(f"erased runtime data: {manifest_path.parent}")
+    erase_operation_runtime_data(manifest, manifest_path)
+    print(f"erased runtime data: {manifest_path.parent}")
     return 0
 
 
@@ -2238,6 +2284,7 @@ def erase_operation_runtime_data(manifest: dict[str, Any], manifest_path: Path) 
         state_path(manifest, manifest_path),
         manifest_path.parent / "outputs",
         manifest_path.parent / ARTIFACT_ROOT,
+        manifest_path.parent / PROMPT_INPUT_ROOT,
         detached_runs_dir(manifest_path),
     ]
     for path in runtime_paths:
@@ -2837,7 +2884,7 @@ def print_operation_status_snapshot(manifest_path: Path, include_inactive: bool,
     print(
         f"selected={len(rows)} running={counts['running']} completed={counts['completed']} "
         f"failed={counts['failed']} blocked={counts['blocked']} pending={counts['pending']} paused={counts['paused']} "
-        f"killed={counts['killed']} {format_usage_summary(state_usage(state))} updated={updated}"
+        f"killed={counts['killed']} {format_usage_summary(state_usage(state))} elapsed={operation_runtime(state)} updated={updated}"
     )
     if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
         print("warning: detached run is inactive but state contains running work units; run may be stale")
@@ -2964,6 +3011,69 @@ def related_detached_records(manifest_path: Path, include_inactive: bool) -> lis
     return related
 
 
+def discovered_operation_records(include_inactive: bool, detached: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    detached_paths = {
+        str(Path(manifest_path).resolve())
+        for manifest_path in (record.get("manifestPath") for record in detached or [])
+        if isinstance(manifest_path, str)
+    }
+    records = []
+    for manifest_path in sorted((Path.cwd() / ".ocmo").glob("*/manifest.yaml")):
+        try:
+            resolved = str(manifest_path.resolve())
+            if resolved in detached_paths:
+                continue
+            manifest = load_manifest(manifest_path)
+            path = state_path(manifest, manifest_path)
+            if not path.exists():
+                continue
+            state = read_json_file(path)
+        except (OSError, json.JSONDecodeError, OcmoError):
+            continue
+        active = operation_state_is_active(state)
+        if include_inactive or active:
+            records.append({"manifestPath": str(manifest_path), "statePath": str(path), "operationId": manifest["operation"]["id"], "active": active, "state": state})
+    return records
+
+
+def operation_state_is_active(state: dict[str, Any]) -> bool:
+    work_units = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
+    for item_state in work_units.values():
+        if not isinstance(item_state, dict):
+            continue
+        if state_status_is_active(item_state.get("status")):
+            return True
+        runs = item_state.get("runs") if isinstance(item_state.get("runs"), dict) else {}
+        if any(isinstance(run_state, dict) and state_status_is_active(run_state.get("status")) for run_state in runs.values()):
+            return True
+    control = state.get("control") if isinstance(state.get("control"), dict) else {}
+    return state_status_is_active(state.get("status")) or state_status_is_active(control.get("status"))
+
+
+def state_status_is_active(status: Any) -> bool:
+    return str(status) in {"running", "creating_worktree", "worktree_ready", "setup", "setup_completed", "cleanup"}
+
+
+def print_operation_record(record: dict[str, Any]) -> None:
+    status = "active" if record.get("active") else "inactive"
+    state = record.get("state") if isinstance(record.get("state"), dict) else {}
+    counts = operation_status_counts(operation_state_rows(state))
+    print(
+        f"{record.get('operationId', '<unknown>')} {status} kind=operation manifest={record.get('manifestPath', '-')} "
+        f"state={record.get('statePath', '-')} running={counts['running']} completed={counts['completed']} "
+        f"failed={counts['failed']} pending={counts['pending']} elapsed={operation_runtime(state)} updated={state.get('updatedAt', '-')}"
+    )
+
+
+def operation_state_rows(state: dict[str, Any]) -> list[dict[str, str]]:
+    work_units = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
+    rows = []
+    for item_id, item_state in work_units.items():
+        status = str(item_state.get("status", "unknown")) if isinstance(item_state, dict) else "unknown"
+        rows.append({"item": str(item_id), "status": status})
+    return rows
+
+
 def operation_status_rows(manifest: dict[str, Any], state: dict[str, Any]) -> list[dict[str, str]]:
     item_states = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
     manifest_items = {str(item["id"]): item for item in manifest.get("workUnits", []) if isinstance(item, dict) and "id" in item}
@@ -2988,7 +3098,8 @@ def operation_status_rows(manifest: dict[str, Any], state: dict[str, Any]) -> li
                 "status": status,
                 "step": run_id or "-",
                 "progress": progress,
-                "runtime": persisted_item_runtime(item_state, now),
+                "workTime": persisted_item_runtime(item_state, now),
+                "agentTime": persisted_run_runtime(run_state, now),
                 "tokens": format_usage_cell(item_usage(item_state)),
                 "detail": status_detail(item, item_state, run_state),
             }
@@ -3016,6 +3127,42 @@ def persisted_item_runtime(item_state: dict[str, Any], now: datetime) -> str:
         return "-"
     ended = parse_state_datetime(item_state.get("completedAt")) or now
     return format_duration((ended - started).total_seconds())
+
+
+def persisted_run_runtime(run_state: dict[str, Any], now: datetime) -> str:
+    started = parse_state_datetime(run_state.get("startedAt"))
+    if started is None:
+        return "-"
+    ended = parse_state_datetime(run_state.get("completedAt")) or now
+    return format_duration((ended - started).total_seconds())
+
+
+def operation_runtime(state: dict[str, Any]) -> str:
+    now = datetime.now(timezone.utc)
+    started = parse_state_datetime(state.get("startedAt")) or earliest_state_started_at(state)
+    if started is None:
+        return "-"
+    ended = parse_state_datetime(state.get("completedAt")) or now
+    return format_duration((ended - started).total_seconds())
+
+
+def earliest_state_started_at(state: dict[str, Any]) -> datetime | None:
+    starts: list[datetime] = []
+    work_units = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
+    for item_state in work_units.values():
+        if not isinstance(item_state, dict):
+            continue
+        started = parse_state_datetime(item_state.get("startedAt"))
+        if started is not None:
+            starts.append(started)
+        runs = item_state.get("runs") if isinstance(item_state.get("runs"), dict) else {}
+        for run_state in runs.values():
+            if not isinstance(run_state, dict):
+                continue
+            started = parse_state_datetime(run_state.get("startedAt"))
+            if started is not None:
+                starts.append(started)
+    return min(starts) if starts else None
 
 
 def parse_state_datetime(value: Any) -> datetime | None:
@@ -3069,8 +3216,8 @@ def operation_status_counts(rows: list[dict[str, str]]) -> dict[str, int]:
 
 
 def print_status_table(rows: list[dict[str, str]]) -> None:
-    headers = ["Work Unit", "Status", "Step", "Progress", "Runtime", "Tokens", "Detail"]
-    keys = ["item", "status", "step", "progress", "runtime", "tokens", "detail"]
+    headers = ["Work Unit", "Status", "Step", "Progress", "Work Time", "Agent Time", "Tokens", "Detail"]
+    keys = ["item", "status", "step", "progress", "workTime", "agentTime", "tokens", "detail"]
     widths = [len(header) for header in headers]
     for row in rows:
         for index, key in enumerate(keys):
@@ -3190,6 +3337,7 @@ def run_item(
                 continue
         run_timeout = timeout_seconds if timeout_seconds is not None else runner.get("timeoutSeconds")
         try:
+            prompt_file: Path | None = None
             if use_session_resume:
                 session_id = previous_run_state.get("sessionId")
                 if not isinstance(session_id, str) or not session_id:
@@ -3198,7 +3346,7 @@ def run_item(
                 command = build_resume_command(manifest, manifest_path, prompt_text, session_id, run_dir, runner)
             else:
                 prompt_text = render_prompt(manifest, item, manifest_path, execution, run, runs)
-                command = build_command(manifest, manifest_path, prompt_text, run_dir, runner)
+                command, prompt_file = build_transport_command(manifest, manifest_path, prompt_text, prompt_input_path(manifest_path, item_id, run_id), run_dir, runner)
         except (OSError, OcmoError) as exc:
             state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
             state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
@@ -3216,6 +3364,8 @@ def run_item(
                 for artifact_id, config in produced_artifacts(run).items()
             },
         }
+        if prompt_file is not None:
+            running_run_state["promptPath"] = relative_to_manifest(prompt_file, manifest_path)
         if resume:
             running_run_state["sessionId"] = previous_run_state.get("sessionId")
             running_run_state["resumedAt"] = utc_now()
@@ -3520,11 +3670,14 @@ class StateStore:
     def ensure_operation(self, manifest: dict[str, Any]) -> None:
         with self.lock:
             data = self._read()
+            now = utc_now()
             data.setdefault("schema", "ocmo-state/v1")
             data.setdefault("operationId", manifest["operation"]["id"])
+            data.setdefault("startedAt", now)
             data.setdefault("workUnits", {})
-            data["control"] = {"status": "running", "updatedAt": utc_now()}
-            data["updatedAt"] = utc_now()
+            data.pop("completedAt", None)
+            data["control"] = {"status": "running", "updatedAt": now}
+            data["updatedAt"] = now
             self._write(data)
 
     def mark(self, item_id: str, status: str, patch: dict[str, Any]) -> None:
@@ -3593,8 +3746,10 @@ class StateStore:
         with self.lock:
             data = self._read()
             now = utc_now()
-            if status == "completed":
+            if status in DONE_STATUSES or (status in TERMINAL_STATUSES and status not in PAUSED_STATUSES):
                 data["completedAt"] = now
+            else:
+                data.pop("completedAt", None)
             data.setdefault("control", {}).update({"status": status, "updatedAt": now})
             data["updatedAt"] = now
             self._write(data)
@@ -3776,6 +3931,9 @@ def plan_manifest(args: argparse.Namespace) -> int:
             reporter.attempt(attempt, max_attempts)
             prompt = planning_prompt if feedback is None else build_planning_feedback_prompt(planning_prompt, previous_output, feedback, interactive)
             command = build_plan_command(args, prompt, workspace, interactive)
+            if should_use_prompt_file(command):
+                prompt_file = write_prompt_input(plan_prompt_input_path(out_path, attempt), prompt)
+                command = build_plan_command(args, prompt, workspace, interactive, prompt_file)
             returncode, output, error_output = run_plan_command(command, interactive)
             if returncode != 0:
                 print(output, end="")
@@ -3893,7 +4051,11 @@ def plan_artifact_dir(args: argparse.Namespace, workspace: Path, out_path: Path)
     return workspace / ".ocmo" / args.from_file.stem
 
 
-def build_plan_command(args: argparse.Namespace, prompt: str, workspace: Path, interactive: bool = False) -> list[str]:
+def plan_prompt_input_path(out_path: Path, attempt: int) -> Path:
+    return (out_path.parent / PROMPT_INPUT_ROOT / f"planning-attempt-{attempt}.md").resolve()
+
+
+def build_plan_command(args: argparse.Namespace, prompt: str, workspace: Path, interactive: bool = False, prompt_file: Path | None = None) -> list[str]:
     command = ["opencode", "run", "--agent", PLAN_AGENT]
     if args.model:
         command += ["--model", args.model]
@@ -3902,6 +4064,9 @@ def build_plan_command(args: argparse.Namespace, prompt: str, workspace: Path, i
     command += ["--dir", str(workspace)]
     for read_file in args.read_files:
         command += ["--file", str(read_file)]
+    if prompt_file is not None:
+        command += ["--file", str(prompt_file)]
+        prompt = PROMPT_FILE_MESSAGE
     command.append(prompt)
     return command
 

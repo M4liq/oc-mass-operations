@@ -576,6 +576,23 @@ class SelectionAndRenderingTests(OcmoTestCase):
         self.assertNotIn("prompt with spaces", formatted)
         self.assertIn("<prompt>", formatted)
 
+    def test_build_command_can_use_prompt_file_transport(self) -> None:
+        manifest = self.load()
+        prompt_file = self.root / "prompt-input.md"
+
+        command = cli.build_command(manifest, self.manifest_path, "long prompt", prompt_file=prompt_file)
+
+        self.assertIn("--file", command)
+        self.assertIn(str(prompt_file), command)
+        self.assertEqual(command[-1], cli.PROMPT_FILE_MESSAGE)
+        self.assertNotIn("long prompt", cli.format_command(command))
+
+    def test_prompt_input_path_is_absolute_for_relative_manifest(self) -> None:
+        path = cli.prompt_input_path(Path(".ocmo/op/manifest.yaml"), "ITEM-1", "default")
+
+        self.assertTrue(path.is_absolute())
+        self.assertTrue(str(path).endswith(str(Path(".ocmo/op/prompt-inputs/ITEM-1/default.md"))))
+
 
 class RunManifestTests(OcmoTestCase):
     def test_dry_run_prints_each_sequential_run_without_state_or_subprocess(self) -> None:
@@ -662,6 +679,50 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(usage["cacheRead"], 70)
         self.assertEqual(usage["steps"], 2)
         self.assertEqual(usage["cost"], 0.03)
+
+    def test_run_manifest_uses_prompt_file_for_long_prompt(self) -> None:
+        long_text = "x" * (cli.PROMPT_ARG_MAX_CHARS + 1)
+        self.prompt.write_text(long_text, encoding="utf-8")
+        manifest = self.load()
+        manifest["workUnits"] = [manifest["workUnits"][0]]
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        captured: dict[str, list[str]] = {}
+
+        def fake_popen(command: list[str], **kwargs):
+            captured["command"] = command
+            return FakePopen(command, 0, "ok")
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 0)
+        command = captured["command"]
+        self.assertIn("--file", command)
+        prompt_path = Path(command[command.index("--file") + 1])
+        self.assertEqual(command[-1], cli.PROMPT_FILE_MESSAGE)
+        self.assertEqual(prompt_path.read_text(encoding="utf-8"), long_text)
+        self.assertNotIn(long_text, command)
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        run_state = state["workUnits"]["1"]["runs"]["default"]
+        self.assertEqual(run_state["promptPath"], "prompt-inputs/1/default.md")
+
+    def test_run_manifest_dry_run_previews_long_prompt_file_transport(self) -> None:
+        long_text = "x" * (cli.PROMPT_ARG_MAX_CHARS + 1)
+        self.prompt.write_text(long_text, encoding="utf-8")
+        manifest = self.load()
+        manifest["workUnits"] = [manifest["workUnits"][0]]
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, True, False))
+
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertIn("# prompt transport: file when executed -> prompt-inputs/1/default.md", output)
+        self.assertIn("--file", output)
+        self.assertIn(long_text, output)
+        self.assertFalse((self.root / "prompt-inputs").exists())
 
     def test_run_manifest_writes_readable_output_for_opencode_json(self) -> None:
         manifest = self.load()
@@ -1079,10 +1140,12 @@ class RunManifestTests(OcmoTestCase):
         self.write_manifest()
         registry = self.root / "registry"
         state = {
+            "startedAt": "2026-05-21T09:59:00+00:00",
+            "completedAt": "2026-05-21T10:03:00+00:00",
             "updatedAt": "now",
             "workUnits": {
-                "1": {"status": "running", "startedAt": "2026-05-21T10:00:00+00:00", "runCount": 1, "runs": {"default": {"status": "running", "outputPath": "outputs/1__default.txt"}}},
-                "2": {"status": "completed", "startedAt": "2026-05-21T10:00:00+00:00", "completedAt": "2026-05-21T10:02:03+00:00", "runCount": 1, "runs": {"default": {"status": "completed", "outputPath": "outputs/2__default.txt"}}},
+                "1": {"status": "running", "startedAt": "2026-05-21T10:00:00+00:00", "runCount": 1, "runs": {"default": {"status": "running", "startedAt": "2026-05-21T10:01:00+00:00", "outputPath": "outputs/1__default.txt"}}},
+                "2": {"status": "completed", "startedAt": "2026-05-21T10:00:00+00:00", "completedAt": "2026-05-21T10:02:03+00:00", "runCount": 1, "runs": {"default": {"status": "completed", "startedAt": "2026-05-21T10:00:10+00:00", "completedAt": "2026-05-21T10:02:00+00:00", "outputPath": "outputs/2__default.txt"}}},
             },
         }
         (self.root / "state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -1110,13 +1173,16 @@ class RunManifestTests(OcmoTestCase):
         output = stdout.getvalue()
         self.assertIn("ocmo-active active", output)
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=1 completed=1 failed=0 blocked=0 pending=0 paused=0 killed=0 tokens=- updated=now", output)
+        self.assertIn("selected=2 running=1 completed=1 failed=0 blocked=0 pending=0 paused=0 killed=0 tokens=- elapsed=04:00 updated=now", output)
         self.assertIn("Work Unit", output)
         self.assertIn("Progress", output)
+        self.assertIn("Work Time", output)
+        self.assertIn("Agent Time", output)
         self.assertIn("Tokens", output)
         self.assertRegex(output, r"1\s+running")
         self.assertIn("outputs/1__default.txt", output)
         self.assertIn("02:03", output)
+        self.assertIn("01:50", output)
 
     def test_status_and_list_details_show_token_usage(self) -> None:
         self.write_manifest()
@@ -1147,6 +1213,45 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("tokens=1.5k in=400 out=100 cache=1.0k", output)
         self.assertIn("400/100", output)
 
+    def test_operation_list_discovers_state_backed_generated_operations(self) -> None:
+        running_dir = self.root / ".ocmo" / "running-op"
+        completed_dir = self.root / ".ocmo" / "completed-op"
+        running_dir.mkdir(parents=True)
+        completed_dir.mkdir(parents=True)
+        manifest = self.load()
+        manifest["state"]["path"] = "state.json"
+        manifest["operation"]["id"] = "running-op"
+        (running_dir / "manifest.yaml").write_text(yaml_dump(manifest), encoding="utf-8")
+        (running_dir / "state.json").write_text(
+            json.dumps({"startedAt": "2026-05-21T10:00:00+00:00", "updatedAt": "2026-05-21T10:01:00+00:00", "workUnits": {"1": {"status": "running", "runs": {"default": {"status": "running"}}}}}),
+            encoding="utf-8",
+        )
+        manifest["operation"]["id"] = "completed-op"
+        (completed_dir / "manifest.yaml").write_text(yaml_dump(manifest), encoding="utf-8")
+        (completed_dir / "state.json").write_text(
+            json.dumps({"startedAt": "2026-05-21T10:00:00+00:00", "completedAt": "2026-05-21T10:03:00+00:00", "updatedAt": "2026-05-21T10:03:00+00:00", "workUnits": {"1": {"status": "completed"}}}),
+            encoding="utf-8",
+        )
+
+        old_cwd = Path.cwd()
+        try:
+            import os as test_os
+
+            test_os.chdir(self.root)
+            registry = self.root / "registry"
+            registry.mkdir()
+            stdout = io.StringIO()
+            with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main(["operation", "list"]), 0)
+                self.assertEqual(cli.main(["operation", "list", "--all"]), 0)
+        finally:
+            test_os.chdir(old_cwd)
+
+        output = stdout.getvalue()
+        self.assertIn("running-op active kind=operation", output)
+        self.assertIn("completed-op inactive kind=operation", output)
+        self.assertIn("elapsed=03:00", output)
+
     def test_status_errors_for_missing_run_id_and_filters_inactive(self) -> None:
         registry = self.root / "registry"
         registry.mkdir()
@@ -1156,7 +1261,7 @@ class RunManifestTests(OcmoTestCase):
         with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.process_is_alive", return_value=False), contextlib.redirect_stdout(stdout):
             self.assertEqual(cli.main(["operation", "list"]), 0)
             self.assertEqual(cli.main(["operation", "list", "--all"]), 0)
-        self.assertIn("No active detached ocmo runs.", stdout.getvalue())
+        self.assertIn("No active ocmo operations.", stdout.getvalue())
         self.assertIn("inactive inactive", stdout.getvalue())
 
         stderr = io.StringIO()
@@ -1280,7 +1385,7 @@ class RunManifestTests(OcmoTestCase):
 
         output = stdout.getvalue()
         self.assertIn("OC Mass Operations: test-op", output)
-        self.assertIn("selected=2 running=0 completed=0 failed=0 blocked=0 pending=2 paused=0 killed=0 tokens=- updated=-", output)
+        self.assertIn("selected=2 running=0 completed=0 failed=0 blocked=0 pending=2 paused=0 killed=0 tokens=- elapsed=- updated=-", output)
         self.assertIn("1          pending", output)
         self.assertRegex(output, r"2\s+pending")
         self.assertIn("First", output)
@@ -1587,7 +1692,7 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("--select", captured["command"])
         self.assertIn("timed-out", captured["command"])
 
-    def test_erase_requires_generated_operation_and_removes_directory(self) -> None:
+    def test_erase_requires_generated_operation_and_preserves_definition_files(self) -> None:
         self.write_manifest()
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -1597,15 +1702,38 @@ class RunManifestTests(OcmoTestCase):
         generated_dir = self.root / ".ocmo" / "generated"
         generated_dir.mkdir(parents=True)
         generated_manifest = generated_dir / "manifest.yaml"
-        generated_manifest.write_text(self.manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+        generated_manifest.write_text(
+            f"""schema: ocmo/v1
+operation:
+  id: generated
+  workspace: {self.workspace.as_posix()}
+runner:
+  command: opencode
+queue:
+  concurrency: 1
+prompt:
+  template: prompt.md
+state:
+  path: state.json
+workUnits:
+  - id: one
+""",
+            encoding="utf-8",
+        )
+        (generated_dir / "prompt.md").write_text("prompt", encoding="utf-8")
+        (generated_dir / "state.json").write_text(json.dumps({"workUnits": {}}), encoding="utf-8")
         (generated_dir / "extra.txt").write_text("x", encoding="utf-8")
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force", "--delete-definition"]), 0)
-        self.assertFalse(generated_dir.exists())
-        self.assertIn("erased:", stdout.getvalue())
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force"]), 0)
+        self.assertTrue(generated_dir.exists())
+        self.assertTrue(generated_manifest.exists())
+        self.assertTrue((generated_dir / "prompt.md").exists())
+        self.assertTrue((generated_dir / "extra.txt").exists())
+        self.assertFalse((generated_dir / "state.json").exists())
+        self.assertIn("erased runtime data:", stdout.getvalue())
 
-    def test_erase_keep_definition_removes_known_runtime_files_only(self) -> None:
+    def test_erase_removes_known_runtime_files_only(self) -> None:
         self.write_manifest()
         generated_dir = self.root / ".ocmo" / "runtime-only"
         generated_dir.mkdir(parents=True)
@@ -1635,13 +1763,15 @@ workUnits:
         (generated_dir / "outputs" / "one.txt").write_text("out", encoding="utf-8")
         (generated_dir / "artifacts").mkdir()
         (generated_dir / "artifacts" / "handoff.md").write_text("artifact", encoding="utf-8")
+        (generated_dir / "prompt-inputs").mkdir()
+        (generated_dir / "prompt-inputs" / "one.md").write_text("prompt input", encoding="utf-8")
         runs_dir = generated_dir / ".ocmo" / "runs"
         runs_dir.mkdir(parents=True)
         (runs_dir / "run.log").write_text("log", encoding="utf-8")
 
         stdout = io.StringIO()
         with mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force", "--keep-definition"]), 0)
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force"]), 0)
 
         self.assertTrue(generated_manifest.exists())
         self.assertTrue((generated_dir / "prompt.md").exists())
@@ -1649,10 +1779,11 @@ workUnits:
         self.assertFalse((generated_dir / "state.json").exists())
         self.assertFalse((generated_dir / "outputs").exists())
         self.assertFalse((generated_dir / "artifacts").exists())
+        self.assertFalse((generated_dir / "prompt-inputs").exists())
         self.assertFalse(runs_dir.exists())
         self.assertIn("erased runtime data:", stdout.getvalue())
 
-    def test_erase_interactive_can_keep_definition_files(self) -> None:
+    def test_erase_interactive_preserves_definition_files(self) -> None:
         generated_dir = self.root / ".ocmo" / "keep-interactive"
         generated_dir.mkdir(parents=True)
         generated_manifest = generated_dir / "manifest.yaml"
@@ -1678,7 +1809,7 @@ workUnits:
         (generated_dir / "state.json").write_text(json.dumps({"workUnits": {}}), encoding="utf-8")
 
         stdout = io.StringIO()
-        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", side_effect=["yes", "no"]), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(stdout):
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="yes"), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(stdout):
             self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 0)
 
         self.assertTrue(generated_manifest.exists())
@@ -1754,13 +1885,15 @@ workUnits:
             self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 2)
         self.assertIn("requires --force", stderr.getvalue())
         stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force"]), 2)
-        self.assertIn("requires --keep-definition or --delete-definition", stderr.getvalue())
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as keep_definition_exit:
+            cli.main(["operation", "erase", str(generated_manifest), "--force", "--keep-definition"])
+        self.assertEqual(keep_definition_exit.exception.code, 2)
+        self.assertIn("unrecognized arguments: --keep-definition", stderr.getvalue())
         stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force", "--keep-definition", "--delete-definition"]), 2)
-        self.assertIn("only one of --delete-definition or --keep-definition", stderr.getvalue())
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as delete_definition_exit:
+            cli.main(["operation", "erase", str(generated_manifest), "--force", "--delete-definition"])
+        self.assertEqual(delete_definition_exit.exception.code, 2)
+        self.assertIn("unrecognized arguments: --delete-definition", stderr.getvalue())
         stdout = io.StringIO()
         with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(stdout):
             self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 1)
@@ -1775,9 +1908,10 @@ workUnits:
             cli.remove_detached_records(generated_manifest)
         with mock.patch("ocmo.cli.related_detached_records", return_value=[{"runId": 123}]):
             cli.remove_detached_records(generated_manifest)
-        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", side_effect=["yes", "yes"]), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="yes"), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["operation", "erase", str(generated_manifest)]), 0)
-        self.assertFalse(generated_dir.exists())
+        self.assertTrue(generated_dir.exists())
+        self.assertTrue(generated_manifest.exists())
 
         self.assertEqual(cli.select_paused_work_units({"workUnits": ["bad", {"id": "1"}, {"id": "2"}]}, {"workUnits": {"1": "bad", "2": {"runs": {"default": {"status": "completed"}}}}}), [])
 
@@ -2799,6 +2933,28 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         self.assertIn("Validation error", calls[1][-1])
         self.assertIn("manifest schema must be ocmo/v1", calls[1][-1])
         self.assertEqual(out.read_text(encoding="utf-8"), self.planned_manifest_text())
+
+    def test_plan_manifest_uses_prompt_file_for_long_prompt(self) -> None:
+        prompt = self.root / "request-long.txt"
+        prompt.write_text("x" * (cli.PROMPT_ARG_MAX_CHARS + 1), encoding="utf-8")
+        out = self.root / "planned.yaml"
+        captured: dict[str, list[str]] = {}
+
+        def fake_plan_run(command, **kwargs):
+            captured["command"] = command
+            return subprocess.CompletedProcess(command, 0, stdout=self.planned_manifest_text(), stderr="")
+
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_plan_run), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.plan_manifest(mock.Mock(from_file=prompt, read_files=[], out=out, model=None, agent="plan", dry_run=False, max_attempts=1, workspace=self.workspace, interactive=False))
+
+        self.assertEqual(code, 0)
+        command = captured["command"]
+        self.assertIn("--file", command)
+        prompt_path = Path(command[command.index("--file") + 1])
+        self.assertEqual(command[-1], cli.PROMPT_FILE_MESSAGE)
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("Convert this mass-operation request", prompt_text)
+        self.assertIn("x" * 100, prompt_text)
 
     def test_plan_manifest_uses_workspace_for_dir_and_prompt(self) -> None:
         prompt = self.root / "request.txt"

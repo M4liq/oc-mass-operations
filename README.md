@@ -99,7 +99,7 @@ Core concepts:
 - Work unit: one independently schedulable unit of work within an operation.
 - Workflow: one sequential orchestration of multiple operation manifests.
 - Manifest: generated plan describing work units, prompts, queue settings, and state path.
-- Prompt template: text rendered once per selected work unit/run and passed to `opencode run`.
+- Prompt template: text rendered once per selected work unit/run and passed to `opencode run`; very long prompts are written to runtime prompt-input files and attached with `--file` to avoid OS command-line limits.
 - Selection: work unit filter such as `uncompleted`, `all`, `ITEM-001`, or `1-10`.
 - State file: durable JSON state written by `ocmo operation run` or `ocmo workflow run` for status, resume, and audit.
 
@@ -221,13 +221,12 @@ Review `state.json` beside the manifest for durable execution status, including 
 | Execute operation background | `ocmo operation run [manifest-or-directory] --select <selector> --detach` |
 | Watch operation status | `ocmo operation status [manifest-or-directory]` |
 | Show operation status once | `ocmo operation status [manifest-or-directory] --once` |
-| List detached operation runs | `ocmo operation list [manifest-or-directory]` |
+| List operation runs and discovered operation states | `ocmo operation list [manifest-or-directory]` |
 | Pause a running operation | `ocmo operation pause [manifest-or-directory]` |
 | Resume a paused operation | `ocmo operation resume [manifest-or-directory] --yes` |
 | Fresh-rerun broken operation work | `ocmo operation rerun [manifest-or-directory] --select retryable --yes` |
 | Kill a running operation | `ocmo operation kill [manifest-or-directory] --force` |
-| Erase operation runtime data | `ocmo operation erase .ocmo/<operation>/manifest.yaml --force --keep-definition` |
-| Erase a generated operation completely | `ocmo operation erase .ocmo/<operation>/manifest.yaml --force --delete-definition` |
+| Erase operation runtime data | `ocmo operation erase .ocmo/<operation>/manifest.yaml --force` |
 | Validate workflow | `ocmo workflow validate <workflow>` |
 | Execute workflow background | `ocmo workflow run <workflow> --detach` |
 | Show workflow status | `ocmo workflow status <workflow>` |
@@ -281,7 +280,7 @@ Useful options:
 
 If `policy.worktree: single` uses concurrency above `1`, `ocmo operation run` requires `--allow-shared-worktree-concurrency`. Use that only when selected work unit scopes are explicitly non-overlapping.
 
-Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata. `ocmo operation status` continuously refreshes operation status until interrupted, summarizes operation token usage, and includes a compact per-work-unit `Tokens` column formatted as `input/output`.
+Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata. `ocmo operation status` continuously refreshes operation status until interrupted, summarizes operation token usage and total operation elapsed time, and includes compact per-work-unit `Work Time`, `Agent Time`, and `Tokens` columns. `Tokens` is formatted as `input/output`.
 
 ## Status
 
@@ -290,6 +289,8 @@ ocmo operation status [manifest-or-directory] [--run-id <run-id>] [--all] [--int
 ```
 
 `ocmo operation status` watches by default: it reloads state and detached run metadata every second and keeps reporting until interrupted with `Ctrl+C`. Use `--interval <seconds>` to change the refresh cadence. Use `--once` for a single snapshot in scripts or logs.
+
+The status summary includes `elapsed=<duration>` for the whole operation. The table separates cumulative work-unit time (`Work Time`) from the current or last agent run step time (`Agent Time`).
 
 ## Workflows
 
@@ -339,7 +340,7 @@ Workflow `--select` selects workflow steps, not work units. Referenced operation
 ocmo operation run .ocmo/business-taxonomy-prompt --select uncompleted --detach
 ```
 
-Detached metadata and logs are written under `.ocmo/runs/` beside the manifest or workflow. `ocmo` also writes a global registry entry so list/status commands can find active runs even when you are not in the manifest or workflow directory.
+Detached metadata and logs are written under `.ocmo/runs/` beside the manifest or workflow. `ocmo` also writes a global registry entry so list/status commands can find active runs even when you are not in the manifest or workflow directory. `ocmo operation list` also discovers generated `.ocmo/*/manifest.yaml` operations with state files, so foreground operations appear even when they were not started with `--detach`.
 
 ```powershell
 ocmo operation list --all
@@ -351,7 +352,7 @@ ocmo workflow status --run-id <run-id>
 
 Set `OCMO_RUN_REGISTRY` to override the global registry location.
 
-Use `ocmo operation status --run-id <run-id>` or `ocmo workflow status --run-id <run-id>` to inspect detached runs. Operation list details include token totals when usage is available.
+Use `ocmo operation status --run-id <run-id>` or `ocmo workflow status --run-id <run-id>` to inspect detached runs. Operation list details include token totals when usage is available, and `ocmo operation list --all` includes inactive detached sessions and inactive discovered operation states.
 
 ## Operation Control
 
@@ -362,7 +363,7 @@ ocmo operation pause .ocmo/business-taxonomy-prompt
 ocmo operation resume .ocmo/business-taxonomy-prompt --yes
 ocmo operation rerun .ocmo/business-taxonomy-prompt --select retryable --yes
 ocmo operation kill .ocmo/business-taxonomy-prompt --force
-ocmo operation erase .ocmo/business-taxonomy-prompt --force --keep-definition
+ocmo operation erase .ocmo/business-taxonomy-prompt --force
 ```
 
 `pause` is stop-and-resume, not an operating-system suspend. It terminates the active detached supervisor and any tracked child `opencode run` processes, then marks running work units/runs as `paused` when their opencode `sessionId` is known. If a process had not emitted a session id yet, the run is marked `paused_unresumable`.
@@ -379,7 +380,7 @@ If an `opencode run` exceeds `timeoutSeconds`, ocmo terminates the child process
 
 `kill` terminates tracked processes and marks active work units/runs as `killed`, preserving the operation directory, state, outputs, logs, and artifacts for audit.
 
-`erase` runs the same termination step and removes operation runtime data. In interactive terminals it asks whether to also delete operation definition files, including the manifest and prompt templates. In non-interactive mode, `--force` must be paired with `--keep-definition` to delete only known runtime files (`state.json`, `outputs/`, `artifacts/`, and detached run metadata) or `--delete-definition` to delete the whole generated operation directory, such as `.ocmo/business-taxonomy-prompt/`. It refuses manifests outside `.ocmo/<operation>/manifest.yaml`.
+`erase` runs the same termination step and removes only operation runtime data (`state.json`, `outputs/`, `artifacts/`, `prompt-inputs/`, and detached run metadata). It never deletes operation definition files such as `manifest.yaml`, prompt templates, or notes; delete those manually if they are no longer needed. In non-interactive mode, use `--force`. It refuses manifests outside `.ocmo/<operation>/manifest.yaml`.
 
 ## Selection Rules
 
