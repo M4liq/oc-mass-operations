@@ -123,6 +123,7 @@ runner:
   command: opencode
   agent: build
   model: openai/gpt-5.5
+  reasoningEffort: high
   timeoutSeconds: 14400
 
 selection:
@@ -468,7 +469,8 @@ Manifest rules:
 - `operation.workspace` is the target repository or directory where `opencode run` executes.
 - `runner.command` is normally `opencode`.
 - `runner.agent` is normally `build`; explicit run-step `agent` values must also be `build`.
-- `runner.model` is optional and is passed to `opencode` when set.
+- `runner.model` is optional and is passed to `opencode` when set. Use the `provider/model` form, where `provider` is one of `opencode`, `github-copilot`, `openai`, or `anthropic` (e.g. `github-copilot/claude-sonnet`, `openai/gpt-5.5`, `opencode/big-pickle`). A bare model id is also accepted and lets `opencode` resolve the default provider.
+- `runner.reasoningEffort` is optional and forwards to `opencode --variant`; allowed values are `minimal`, `low`, `medium`, `high`. Per-run step overrides are supported.
 - `runner.attach` is an optional `opencode serve` URL.
 - `runner.timeoutSeconds` controls the per-run timeout unless overridden from the CLI.
 - `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` when true.

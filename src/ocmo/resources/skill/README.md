@@ -269,8 +269,8 @@ Workflow facts:
 - Workflow state records orchestration status; operation state remains authoritative for work units, runs, sessions, outputs, artifacts, and token usage.
 - `ocmo workflow rerun` defaults to retryable workflow steps, then delegates work unit selection to each referenced operation.
 - `ocmo workflow pause` and `ocmo workflow kill` delegate to the active operation step and preserve operation files.
-- `ocmo workflow status` watches by default (Rich `Live` UI when stdout is a TTY); add `--once` for one snapshot, `--interval <s>` to change refresh cadence, and `--active-or-latest` to show all active workflows or the latest inactive one. The bundled `/ocmo-workflow-statuses` slash command wraps that view.
-- `ocmo workflow list` surfaces discovered `.ocmo/*/workflow.yaml` workflows alongside detached runs; pass `--all` for inactive ones.
+- `ocmo workflow status` watches by default (Rich `Live` UI when stdout is a TTY); add `--once` for one snapshot, `--interval <s>` to change refresh cadence, and `--active-or-latest` to show all active workflows or the latest inactive one. When at least one step is running, the output ends with a `details:` block listing `ocmo operation status <manifest-path> --once` commands (one per running step) so you can drill into the running operation from any working directory. The bundled `/ocmo-workflow-statuses` slash command wraps that view.
+- `ocmo workflow list` surfaces discovered `.ocmo/*/workflow.yaml` workflows alongside detached runs; pass `--all` for inactive ones. Each discovered workflow row is followed by a `steps:` line mapping each workflow step id to its underlying operation id (e.g. `steps: build->build-op, verify->verify-op`).
 
 ## Selection Rules
 

@@ -45,6 +45,8 @@ PROMPT_INPUT_ROOT = "prompt-inputs"
 PROMPT_ARG_MAX_CHARS = 24_000
 PROMPT_FILE_MESSAGE = "Read the attached prompt file and follow its instructions exactly."
 ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+KNOWN_MODEL_PROVIDERS = ("opencode", "github-copilot", "openai", "anthropic")
+REASONING_EFFORT_VALUES = ("minimal", "low", "medium", "high")
 OCMO_SKILL_NAME = "ocmo"
 OLD_OCMO_SKILL_NAMES = ("ocmo-plan-grill",)
 OCMO_SKILL_RESOURCE = "resources/skill"
@@ -138,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--out", type=Path, help="Manifest output path; defaults to <workspace>/.ocmo/<prompt-stem>/manifest.yaml")
     plan_parser.add_argument("--workspace", type=Path, help="Target workspace for planning; defaults to the current directory")
     plan_parser.add_argument("--model", help="opencode model")
+    plan_parser.add_argument("--reasoning-effort", dest="reasoning_effort", choices=list(REASONING_EFFORT_VALUES), help="Reasoning effort (minimal|low|medium|high) passed to opencode --variant")
     plan_parser.add_argument("--max-attempts", type=int, default=3, help="Maximum planner correction attempts")
     plan_parser.add_argument("--interactive", action="store_true", help="Allow the planner to ask terminal questions before returning marked YAML")
     plan_parser.add_argument("--dry-run", action="store_true", help="Print the planning prompt only")
@@ -532,6 +535,8 @@ def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path, allo
     runner = require_mapping(manifest, "runner")
     require_string(runner, "command")
     validate_build_agent(runner.get("agent"), "runner.agent")
+    validate_model_value(runner.get("model"), "runner.model")
+    validate_reasoning_effort(runner.get("reasoningEffort"), "runner.reasoningEffort")
     if "mode" in runner:
         raise OcmoError("runner.mode is no longer supported; ocmo always uses opencode run")
     timeout_seconds = runner.get("timeoutSeconds")
@@ -601,6 +606,8 @@ def validate_work_unit_runs(manifest: dict[str, Any], work_unit: dict[str, Any],
         if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or timeout_seconds < 1):
             raise OcmoError(f"workUnits[{work_unit_index}].runs.steps[{step_index}].timeoutSeconds must be a positive integer")
         validate_build_agent(step.get("agent"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].agent")
+        validate_model_value(step.get("model"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].model")
+        validate_reasoning_effort(step.get("reasoningEffort"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].reasoningEffort")
         prompt = step.get("prompt")
         if prompt is not None:
             if not isinstance(prompt, dict):
@@ -637,6 +644,31 @@ def validate_build_agent(value: Any, field: str) -> None:
         raise OcmoError(f"{field} must be build")
     if value.strip() != RUN_AGENT:
         raise OcmoError(f"{field} must be build")
+
+
+def validate_model_value(value: Any, field: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not value.strip():
+        raise OcmoError(f"{field} must be a non-empty string in the form provider/model")
+    text = value.strip()
+    if "/" not in text:
+        # Allow bare model id (opencode resolves the default provider).
+        return
+    provider, _, model_id = text.partition("/")
+    if not provider or not model_id:
+        raise OcmoError(f"{field} must be in the form provider/model")
+    if provider not in KNOWN_MODEL_PROVIDERS:
+        known = ", ".join(KNOWN_MODEL_PROVIDERS)
+        raise OcmoError(f"{field} provider '{provider}' is not supported (known: {known})")
+
+
+def validate_reasoning_effort(value: Any, field: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or value not in REASONING_EFFORT_VALUES:
+        allowed = ", ".join(REASONING_EFFORT_VALUES)
+        raise OcmoError(f"{field} must be one of: {allowed}")
 
 
 def validate_artifact_name(value: Any, field: str) -> None:
@@ -1203,6 +1235,7 @@ def render_prompt(
         "run_id": str(run.get("id", "")),
         "run_agent": str(runner.get("agent", "")),
         "run_model": str(runner.get("model", "")),
+        "run_reasoning_effort": str(runner.get("reasoningEffort", "")),
         "run_index": str(run.get("index", "")),
         "run_count": str(len(runs)),
         "run_mode": str(run.get("mode", "sequential")),
@@ -1363,6 +1396,8 @@ def build_command(
         command += ["--agent", str(runner["agent"])]
     if runner.get("model"):
         command += ["--model", str(runner["model"])]
+    if runner.get("reasoningEffort"):
+        command += ["--variant", str(runner["reasoningEffort"])]
     if runner.get("attach"):
         command += ["--attach", str(runner["attach"])]
     if runner.get("title"):
@@ -3063,6 +3098,11 @@ def print_workflow_status_snapshot(workflow_path: Path, include_inactive: bool, 
     if any(row["status"] == "running" for row in rows) and related and not any(process_is_alive(record.get("pid")) for record in related if record):
         print("warning: detached workflow is inactive but state contains running steps; run may be stale")
     print_workflow_status_table(rows)
+    running_rows = [row for row in rows if row.get("status") == "running" and row.get("manifestPath")]
+    if running_rows:
+        print("details:")
+        for row in running_rows:
+            print(f"  ocmo operation status {row['manifestPath']} --once    # step {row['item']}")
 
 
 def workflow_status_rows(workflow: dict[str, Any], workflow_path: Path, state: dict[str, Any]) -> list[dict[str, str]]:
@@ -3076,9 +3116,11 @@ def workflow_status_rows(workflow: dict[str, Any], workflow_path: Path, state: d
         item_progress = "-"
         tokens = "-"
         detail = str(step.get("description") or "-")
+        manifest_path_str = ""
         if manifest_path.exists():
             manifest = load_manifest(manifest_path)
             operation = str(manifest["operation"]["id"])
+            manifest_path_str = str(manifest_path.resolve())
             op_state_path = state_path(manifest, manifest_path)
             op_state = read_json_file(op_state_path) if op_state_path.exists() else {}
             op_rows = operation_status_rows(manifest, op_state)
@@ -3089,7 +3131,7 @@ def workflow_status_rows(workflow: dict[str, Any], workflow_path: Path, state: d
         status = str(step_state.get("status") or step.get("status") or "pending")
         if step_state.get("error"):
             detail = str(step_state["error"])
-        rows.append({"item": step_id, "status": status, "step": operation, "progress": item_progress, "runtime": persisted_item_runtime(step_state, datetime.now(timezone.utc)), "tokens": tokens, "detail": detail})
+        rows.append({"item": step_id, "status": status, "step": operation, "progress": item_progress, "runtime": persisted_item_runtime(step_state, datetime.now(timezone.utc)), "tokens": tokens, "detail": detail, "manifestPath": manifest_path_str})
     return rows
 
 
@@ -3359,6 +3401,22 @@ def print_workflow_record(record: dict[str, Any]) -> None:
         f"state={record.get('statePath', '-')} running={counts['running']} completed={counts['completed']} "
         f"failed={counts['failed']} pending={counts['pending']} stateUpdated={state.get('updatedAt', '-')}"
     )
+    if workflow is not None:
+        mappings = []
+        for step in workflow.get("steps", []):
+            step_id = str(step.get("id", ""))
+            manifest_path = workflow_step_manifest_path(Path(workflow_path_value), step)
+            if not manifest_path.exists():
+                continue
+            try:
+                step_manifest = load_manifest(manifest_path)
+            except OcmoError:
+                continue
+            op_id = step_manifest.get("operation", {}).get("id") if isinstance(step_manifest.get("operation"), dict) else None
+            if step_id and op_id:
+                mappings.append(f"{step_id}->{op_id}")
+        if mappings:
+            print(f"  steps: {', '.join(mappings)}")
 
 
 def print_operation_record(record: dict[str, Any]) -> None:
@@ -3535,11 +3593,32 @@ def print_status_table(rows: list[dict[str, str]]) -> None:
         print("  ".join(row[key].ljust(widths[index]) for index, key in enumerate(keys)))
 
 
+def detached_record_operation_id(record: dict[str, Any]) -> str | None:
+    manifest_value = record.get("manifestPath")
+    if not isinstance(manifest_value, str):
+        return None
+    manifest_path = Path(manifest_value)
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = load_manifest(manifest_path)
+    except OcmoError:
+        return None
+    op = manifest.get("operation") if isinstance(manifest.get("operation"), dict) else None
+    op_id = op.get("id") if op else None
+    return str(op_id) if op_id else None
+
+
 def print_detached_record(record: dict[str, Any], details: bool, prefix: str = "") -> None:
     pid = record.get("pid")
     status = "active" if process_is_alive(pid) else "inactive"
     kind = record.get("kind", "operation")
-    print(f"{prefix}{record.get('runId', '<unknown>')} {status} kind={kind} pid={pid} started={record.get('startedAt', '-')}")
+    extra = ""
+    if kind == "operation":
+        op_id = detached_record_operation_id(record)
+        if op_id:
+            extra = f" operation={op_id}"
+    print(f"{prefix}{record.get('runId', '<unknown>')} {status} kind={kind}{extra} pid={pid} started={record.get('startedAt', '-')}")
     if not details:
         return
     if kind == "workflow":
@@ -4272,6 +4351,8 @@ class PlainPlanReporter:
 
     def __enter__(self) -> "PlainPlanReporter":
         print(f"ocmo: planning with agent={PLAN_AGENT} model={self.args.model or '<opencode-default>'}", file=sys.stderr)
+        if getattr(self.args, "reasoning_effort", None):
+            print(f"ocmo: planning reasoning-effort={self.args.reasoning_effort}", file=sys.stderr)
         print(f"ocmo: planning workspace={self.workspace}", file=sys.stderr)
         print(f"ocmo: planning output={self.out_path}", file=sys.stderr)
         return self
@@ -4325,7 +4406,9 @@ class RichPlanReporter(PlainPlanReporter):  # pragma: no cover
     def status_text(self, phase: str) -> str:
         elapsed = format_duration(time.monotonic() - self.started)
         model = self.args.model or "<opencode-default>"
-        return f"ocmo plan {phase} | agent={PLAN_AGENT} model={model} elapsed={elapsed} output={self.out_path}"
+        effort = getattr(self.args, "reasoning_effort", None)
+        effort_suffix = f" effort={effort}" if effort else ""
+        return f"ocmo plan {phase} | agent={PLAN_AGENT} model={model}{effort_suffix} elapsed={elapsed} output={self.out_path}"
 
 
 def make_plan_reporter(args: argparse.Namespace, workspace: Path, out_path: Path, interactive: bool) -> PlainPlanReporter:
@@ -4366,6 +4449,8 @@ def build_plan_command(args: argparse.Namespace, prompt: str, workspace: Path, i
     command = ["opencode", "run", "--agent", PLAN_AGENT]
     if args.model:
         command += ["--model", args.model]
+    if getattr(args, "reasoning_effort", None):
+        command += ["--variant", str(args.reasoning_effort)]
     if interactive:
         command.append("--interactive")
     command += ["--dir", str(workspace)]
@@ -4556,6 +4641,7 @@ runner:
   command: opencode
   agent: build
   model: null
+  reasoningEffort: null
   attach: null
   timeoutSeconds: 14400
   dangerouslySkipPermissions: false

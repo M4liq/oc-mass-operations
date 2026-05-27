@@ -593,6 +593,66 @@ class SelectionAndRenderingTests(OcmoTestCase):
         self.assertTrue(path.is_absolute())
         self.assertTrue(str(path).endswith(str(Path(".ocmo/op/prompt-inputs/ITEM-1/default.md"))))
 
+    def test_build_command_passes_known_provider_model_and_variant(self) -> None:
+        manifest = self.load()
+        command = cli.build_command(
+            manifest,
+            self.manifest_path,
+            "prompt",
+            runner={
+                "command": "opencode",
+                "model": "github-copilot/claude-sonnet",
+                "reasoningEffort": "high",
+            },
+        )
+
+        self.assertIn("--model", command)
+        self.assertEqual(command[command.index("--model") + 1], "github-copilot/claude-sonnet")
+        self.assertIn("--variant", command)
+        self.assertEqual(command[command.index("--variant") + 1], "high")
+
+    def test_build_command_omits_variant_when_effort_unset(self) -> None:
+        manifest = self.load()
+        command = cli.build_command(
+            manifest,
+            self.manifest_path,
+            "prompt",
+            runner={"command": "opencode", "model": "openai/gpt-5.5"},
+        )
+        self.assertNotIn("--variant", command)
+
+    def test_validate_manifest_rejects_unknown_provider(self) -> None:
+        manifest = self.load()
+        manifest["runner"]["model"] = "bogus/foo"
+        with self.assertRaisesRegex(cli.OcmoError, "provider 'bogus' is not supported"):
+            cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_validate_manifest_accepts_known_providers(self) -> None:
+        for model in ("opencode/zen", "github-copilot/claude-sonnet", "openai/gpt-5.5", "anthropic/claude-sonnet-4"):
+            manifest = self.load()
+            manifest["runner"]["model"] = model
+            cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_validate_manifest_rejects_invalid_reasoning_effort(self) -> None:
+        manifest = self.load()
+        manifest["runner"]["reasoningEffort"] = "extreme"
+        with self.assertRaisesRegex(cli.OcmoError, "reasoningEffort must be one of"):
+            cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_validate_manifest_accepts_valid_reasoning_effort(self) -> None:
+        for effort in cli.REASONING_EFFORT_VALUES:
+            manifest = self.load()
+            manifest["runner"]["reasoningEffort"] = effort
+            cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_per_run_step_can_override_reasoning_effort(self) -> None:
+        manifest = self.load()
+        manifest["runner"]["reasoningEffort"] = "low"
+        runner = cli.effective_runner(manifest, {"id": "step", "reasoningEffort": "high"})
+        self.assertEqual(runner["reasoningEffort"], "high")
+        command = cli.build_command(manifest, self.manifest_path, "p", runner=runner)
+        self.assertEqual(command[command.index("--variant") + 1], "high")
+
 
 class RunManifestTests(OcmoTestCase):
     def test_dry_run_prints_each_sequential_run_without_state_or_subprocess(self) -> None:
@@ -3597,6 +3657,84 @@ steps:
         self.assertIn("OCMO Workflow: test-workflow", output)
         self.assertIn("tokens=15", output)
         self.assertIn("first", output)
+
+    def test_workflow_status_includes_per_step_operation_hints(self) -> None:
+        workflow, first, _ = self.write_workflow()
+        (self.root / "workflow-state.json").write_text(
+            json.dumps({"steps": {"first": {"status": "running"}}}),
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "status", str(workflow), "--once"]), 0)
+
+        output = stdout.getvalue()
+        self.assertIn("details:", output)
+        self.assertIn(str(first.resolve()), output)
+        self.assertIn("--once    # step first", output)
+        self.assertNotIn("# step second", output)
+
+    def test_workflow_status_omits_hint_when_no_steps_running(self) -> None:
+        workflow, _, _ = self.write_workflow()
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "status", str(workflow), "--once"]), 0)
+
+        self.assertNotIn("details:", stdout.getvalue())
+
+    def test_print_detached_record_appends_operation_id_for_operation_kind(self) -> None:
+        manifest_path = self.write_operation_manifest("alpha-op")
+        record = {
+            "schema": "ocmo-detached-run/v1",
+            "kind": "operation",
+            "runId": "op-run-1",
+            "pid": 0,
+            "startedAt": "then",
+            "manifestPath": str(manifest_path),
+        }
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            cli.print_detached_record(record, details=False)
+
+        output = stdout.getvalue()
+        self.assertIn("kind=operation operation=alpha-op", output)
+
+    def test_print_detached_record_workflow_kind_has_no_operation_field(self) -> None:
+        record = {
+            "schema": "ocmo-detached-run/v1",
+            "kind": "workflow",
+            "runId": "wf-run-1",
+            "pid": 0,
+            "startedAt": "then",
+            "workflowPath": str(self.root / "workflow.yaml"),
+        }
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            cli.print_detached_record(record, details=False)
+
+        self.assertNotIn("operation=", stdout.getvalue())
+
+    def test_workflow_list_emits_step_to_operation_mapping(self) -> None:
+        workflow, _, _ = self.write_workflow()
+        record = {
+            "manifestPath": None,
+            "workflowPath": str(workflow),
+            "workflowId": "test-workflow",
+            "active": False,
+            "state": {"steps": {"first": {"status": "completed"}}, "updatedAt": "then"},
+            "statePath": str(self.root / "workflow-state.json"),
+        }
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            cli.print_workflow_record(record)
+
+        output = stdout.getvalue()
+        self.assertIn("steps: first->first, second->second", output)
 
     def test_workflow_detach_writes_kind_aware_record(self) -> None:
         workflow, _, _ = self.write_workflow()
