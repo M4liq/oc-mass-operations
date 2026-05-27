@@ -3927,6 +3927,174 @@ steps:
         self.assertIn("discovered-wf active kind=workflow", output)
         self.assertIn("stateUpdated=2026-05-21T10:00:00+00:00", output)
 
+    def write_generated_operation_manifest(self, name: str) -> Path:
+        generated_dir = self.root / ".ocmo" / name
+        generated_dir.mkdir(parents=True, exist_ok=True)
+        prompt = generated_dir / "prompt.md"
+        prompt.write_text("Item $work_unit_id", encoding="utf-8")
+        manifest = generated_dir / "manifest.yaml"
+        manifest.write_text(
+            f"""schema: ocmo/v1
+operation:
+  id: {name}
+  workspace: {self.workspace.as_posix()}
+runner:
+  command: opencode
+queue:
+  concurrency: 1
+prompt:
+  template: {prompt.as_posix()}
+state:
+  path: {(generated_dir / 'state.json').as_posix()}
+workUnits:
+  - id: "1"
+""",
+            encoding="utf-8",
+        )
+        return manifest
+
+    def write_generated_workflow(self) -> tuple[Path, Path, Path]:
+        first = self.write_generated_operation_manifest("first")
+        second = self.write_generated_operation_manifest("second")
+        workflow = self.root / "workflow.yaml"
+        workflow.write_text(
+            f"""schema: ocmo-workflow/v1
+workflow:
+  id: erase-wf
+state:
+  path: workflow-state.json
+steps:
+  - id: first
+    manifest: {first.as_posix()}
+  - id: second
+    manifest: {second.as_posix()}
+""",
+            encoding="utf-8",
+        )
+        return workflow, first, second
+
+    def seed_operation_runtime(self, manifest_path: Path) -> dict[str, Path]:
+        directory = manifest_path.parent
+        state_file = directory / "state.json"
+        outputs = directory / "outputs"
+        artifacts = directory / "artifacts"
+        prompt_inputs = directory / "prompt-inputs"
+        runs_dir = directory / ".ocmo" / "runs"
+        state_file.write_text(json.dumps({"workUnits": {}}), encoding="utf-8")
+        outputs.mkdir(exist_ok=True)
+        (outputs / "1.txt").write_text("out", encoding="utf-8")
+        artifacts.mkdir(exist_ok=True)
+        (artifacts / "handoff.md").write_text("artifact", encoding="utf-8")
+        prompt_inputs.mkdir(exist_ok=True)
+        (prompt_inputs / "1.md").write_text("prompt input", encoding="utf-8")
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        (runs_dir / "run.log").write_text("log", encoding="utf-8")
+        return {"state": state_file, "outputs": outputs, "artifacts": artifacts, "prompt_inputs": prompt_inputs, "runs": runs_dir}
+
+    def test_workflow_erase_wipes_all_operation_runtime(self) -> None:
+        workflow, first, second = self.write_generated_workflow()
+        first_paths = self.seed_operation_runtime(first)
+        second_paths = self.seed_operation_runtime(second)
+        workflow_state = self.root / "workflow-state.json"
+        workflow_state.write_text(json.dumps({"steps": {"first": {"status": "completed"}}}), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.stop_operation_processes"), mock.patch("ocmo.cli.stop_workflow_processes"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "erase", str(workflow), "--force"]), 0)
+
+        for paths in (first_paths, second_paths):
+            self.assertFalse(paths["state"].exists())
+            self.assertFalse(paths["outputs"].exists())
+            self.assertFalse(paths["artifacts"].exists())
+            self.assertFalse(paths["prompt_inputs"].exists())
+            self.assertFalse(paths["runs"].exists())
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+        self.assertTrue((first.parent / "prompt.md").exists())
+        self.assertTrue((second.parent / "prompt.md").exists())
+        self.assertFalse(workflow_state.exists())
+        output = stdout.getvalue()
+        self.assertIn("erased 2 operation(s)", output)
+        self.assertIn("cleared workflow state", output)
+
+    def test_workflow_erase_requires_force_when_non_interactive(self) -> None:
+        workflow, _, _ = self.write_generated_workflow()
+        stderr = io.StringIO()
+        with mock.patch("sys.stdin.isatty", return_value=False), contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["workflow", "erase", str(workflow)]), 2)
+        self.assertIn("erase requires --force", stderr.getvalue())
+
+    def test_workflow_erase_skips_non_generated_manifest(self) -> None:
+        first = self.write_generated_operation_manifest("first")
+        second = self.write_operation_manifest("hand-authored")
+        workflow = self.root / "workflow.yaml"
+        workflow.write_text(
+            f"""schema: ocmo-workflow/v1
+workflow:
+  id: mixed-wf
+state:
+  path: workflow-state.json
+steps:
+  - id: first
+    manifest: {first.as_posix()}
+  - id: second
+    manifest: {second.as_posix()}
+""",
+            encoding="utf-8",
+        )
+        first_paths = self.seed_operation_runtime(first)
+        hand_state = second.parent / "state.json"
+        hand_state.write_text(json.dumps({"workUnits": {}}), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.stop_operation_processes"), mock.patch("ocmo.cli.stop_workflow_processes"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "erase", str(workflow), "--force"]), 0)
+
+        self.assertFalse(first_paths["state"].exists())
+        self.assertTrue(hand_state.exists())
+        output = stdout.getvalue()
+        self.assertIn("erased 1 operation(s)", output)
+        self.assertIn("skipped 1 non-generated", output)
+
+    def test_workflow_erase_keep_workflow_state_flag(self) -> None:
+        workflow, first, _ = self.write_generated_workflow()
+        self.seed_operation_runtime(first)
+        workflow_state = self.root / "workflow-state.json"
+        workflow_state.write_text(json.dumps({"steps": {"first": {"status": "completed"}}}), encoding="utf-8")
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.stop_operation_processes"), mock.patch("ocmo.cli.stop_workflow_processes"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "erase", str(workflow), "--force", "--keep-workflow-state"]), 0)
+
+        self.assertTrue(workflow_state.exists())
+        self.assertNotIn("cleared workflow state", stdout.getvalue())
+
+    def test_workflow_erase_missing_manifest_is_reported(self) -> None:
+        workflow = self.root / "workflow.yaml"
+        first = self.write_generated_operation_manifest("first")
+        missing = self.root / "missing.yaml"
+        workflow.write_text(
+            f"""schema: ocmo-workflow/v1
+workflow:
+  id: missing-wf
+state:
+  path: workflow-state.json
+steps:
+  - id: first
+    manifest: {first.as_posix()}
+  - id: gone
+    manifest: {missing.as_posix()}
+""",
+            encoding="utf-8",
+        )
+        self.seed_operation_runtime(first)
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.stop_operation_processes"), mock.patch("ocmo.cli.stop_workflow_processes"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "erase", str(workflow), "--force"]), 0)
+        output = stdout.getvalue()
+        self.assertIn("skipped 1 missing", output)
+        self.assertIn("erased 1 operation(s)", output)
+
 
 def yaml_dump(data: dict) -> str:
     import yaml

@@ -242,6 +242,11 @@ def main(argv: list[str] | None = None) -> int:
     workflow_kill_parser.add_argument("--run-id", help="Kill by detached run id")
     workflow_kill_parser.add_argument("--force", action="store_true", help="Skip confirmation")
 
+    workflow_erase_parser = workflow_subparsers.add_parser("erase", help="Terminate and erase generated operation runtime data for every workflow step")
+    workflow_erase_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory; defaults to workflow.yaml")
+    workflow_erase_parser.add_argument("--force", action="store_true", help="Required for non-interactive erase")
+    workflow_erase_parser.add_argument("--keep-workflow-state", action="store_true", help="Erase per-step operations only; keep workflow state and detached records")
+
     skill_parser = subparsers.add_parser("skill", help="Manage the bundled OCMO opencode skill")
     skill_subparsers = skill_parser.add_subparsers(dest="skill_command", required=True)
     skill_install_parser = skill_subparsers.add_parser("install", help="Install the bundled opencode planning skill")
@@ -2463,6 +2468,8 @@ def workflow_command(args: argparse.Namespace) -> int:
         return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, False, args.yes, args.ui, args.detach, False, True))
     if command == "kill":
         return kill_workflow(args)
+    if command == "erase":
+        return erase_workflow(args)
     return 1  # pragma: no cover
 
 
@@ -2715,6 +2722,75 @@ def kill_workflow(args: argparse.Namespace) -> int:
     stop_workflow_processes(workflow_path, record, "killed")
     print(f"killed: {workflow['workflow']['id']} ({changed} step(s))")
     return 0
+
+
+def erase_workflow(args: argparse.Namespace) -> int:
+    workflow_path = infer_workflow_path(args.workflow)
+    workflow = load_workflow(workflow_path)
+    if workflow.get("schema") != "ocmo-workflow/v1":
+        raise OcmoError("workflow schema must be ocmo-workflow/v1")
+    metadata = require_mapping(workflow, "workflow")
+    require_string(metadata, "id")
+    steps = workflow.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise OcmoError("steps must be a non-empty list")
+    if not args.force and sys.stdin.isatty():
+        answer = input(f"Erase runtime data for workflow {workflow['workflow']['id']} ({len(steps)} step(s))? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("Cancelled.")
+            return 1
+    if not args.force and not sys.stdin.isatty():
+        raise OcmoError("erase requires --force when not interactive")
+    stop_workflow_processes(workflow_path, None, "killed")
+    erased = 0
+    skipped_missing = 0
+    skipped_non_generated = 0
+    for step in steps:
+        step_id = str(step["id"])
+        manifest_path = workflow_step_manifest_path(workflow_path, step)
+        if not manifest_path.exists():
+            print(f"skip {step_id}: manifest not found ({manifest_path})")
+            skipped_missing += 1
+            continue
+        if not is_generated_operation_manifest(manifest_path):
+            print(f"skip {step_id}: not a generated .ocmo/<operation>/manifest.yaml ({manifest_path})")
+            skipped_non_generated += 1
+            continue
+        manifest = load_manifest(manifest_path)
+        op_state_path = state_path(manifest, manifest_path)
+        op_state = read_json_file(op_state_path) if op_state_path.exists() else {}
+        stop_operation_processes(manifest_path, op_state)
+        remove_detached_records(manifest_path)
+        erase_operation_runtime_data(manifest, manifest_path)
+        print(f"erased {step_id}: {manifest_path.parent}")
+        erased += 1
+    if not args.keep_workflow_state:
+        remove_workflow_detached_records(workflow_path)
+        state_file = workflow_state_path(workflow, workflow_path)
+        try:
+            state_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"cleared workflow state: {state_file}")
+    summary = f"erased {erased} operation(s)"
+    if skipped_missing:
+        summary += f"; skipped {skipped_missing} missing"
+    if skipped_non_generated:
+        summary += f"; skipped {skipped_non_generated} non-generated"
+    print(summary)
+    return 0
+
+
+def remove_workflow_detached_records(workflow_path: Path) -> None:
+    for record in related_workflow_detached_records(workflow_path, include_inactive=True):
+        run_id = record.get("runId")
+        if not isinstance(run_id, str):
+            continue
+        for path in (global_detached_run_path(run_id), workflow_detached_runs_dir(workflow_path) / f"{run_id}.json"):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def pause_workflow_path(workflow_path: Path, record: dict[str, Any] | None = None) -> int:

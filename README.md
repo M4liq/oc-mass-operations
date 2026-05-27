@@ -235,6 +235,7 @@ Review `state.json` beside the manifest for durable execution status, including 
 | Watch workflow status | `ocmo workflow status <workflow>` |
 | Show workflow status once | `ocmo workflow status <workflow> --once` |
 | List workflow runs and discovered workflow states | `ocmo workflow list` |
+| Erase all workflow operation runtime | `ocmo workflow erase <workflow> --force` |
 
 ## Planning
 

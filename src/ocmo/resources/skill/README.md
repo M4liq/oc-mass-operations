@@ -260,6 +260,7 @@ ocmo workflow pause workflow.yaml
 ocmo workflow resume workflow.yaml --detach
 ocmo workflow rerun workflow.yaml --detach
 ocmo workflow kill workflow.yaml --force
+ocmo workflow erase workflow.yaml --force
 ```
 
 Workflow facts:
