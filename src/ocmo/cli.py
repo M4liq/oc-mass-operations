@@ -2372,6 +2372,8 @@ def kill_operation(args: argparse.Namespace) -> int:
 
 
 def erase_operation(args: argparse.Namespace) -> int:
+    if args.run_id and args.manifest:
+        raise OcmoError("pass either a manifest or --run-id, not both")
     manifest_path, record = control_manifest_and_record(args)
     if not is_generated_operation_manifest(manifest_path):
         raise OcmoError("erase only removes generated .ocmo/<operation>/manifest.yaml operation directories")
@@ -2726,6 +2728,10 @@ def kill_workflow(args: argparse.Namespace) -> int:
 
 def erase_workflow(args: argparse.Namespace) -> int:
     workflow_path = infer_workflow_path(args.workflow)
+    return erase_workflow_path(workflow_path, args.force, args.keep_workflow_state)
+
+
+def erase_workflow_path(workflow_path: Path, force: bool, keep_workflow_state: bool) -> int:
     workflow = load_workflow(workflow_path)
     if workflow.get("schema") != "ocmo-workflow/v1":
         raise OcmoError("workflow schema must be ocmo-workflow/v1")
@@ -2734,12 +2740,12 @@ def erase_workflow(args: argparse.Namespace) -> int:
     steps = workflow.get("steps")
     if not isinstance(steps, list) or not steps:
         raise OcmoError("steps must be a non-empty list")
-    if not args.force and sys.stdin.isatty():
+    if not force and sys.stdin.isatty():
         answer = input(f"Erase runtime data for workflow {workflow['workflow']['id']} ({len(steps)} step(s))? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled.")
             return 1
-    if not args.force and not sys.stdin.isatty():
+    if not force and not sys.stdin.isatty():
         raise OcmoError("erase requires --force when not interactive")
     stop_workflow_processes(workflow_path, None, "killed")
     erased = 0
@@ -2764,7 +2770,7 @@ def erase_workflow(args: argparse.Namespace) -> int:
         erase_operation_runtime_data(manifest, manifest_path)
         print(f"erased {step_id}: {manifest_path.parent}")
         erased += 1
-    if not args.keep_workflow_state:
+    if not keep_workflow_state:
         remove_workflow_detached_records(workflow_path)
         state_file = workflow_state_path(workflow, workflow_path)
         try:
@@ -3015,9 +3021,36 @@ def detached_records(include_inactive: bool, kind: str | None = None) -> list[di
         record_kind = record.get("kind", "operation")
         if kind is not None and record_kind != kind:
             continue
+        if detached_record_is_erased(record):
+            continue
         if include_inactive or process_is_alive(record.get("pid")):
             records.append(record)
     return records
+
+
+def detached_record_is_erased(record: dict[str, Any]) -> bool:
+    if process_is_alive(record.get("pid")):
+        return False
+    state_path_value = record.get("statePath")
+    if isinstance(state_path_value, str) and Path(state_path_value).exists():
+        return False
+    if record.get("kind") == "workflow":
+        workflow_path_value = record.get("workflowPath")
+        if not isinstance(workflow_path_value, str):
+            return isinstance(state_path_value, str)
+        if not Path(workflow_path_value).exists():
+            return True
+        if isinstance(state_path_value, str):
+            return True
+        return False
+    manifest_path_value = record.get("manifestPath")
+    if not isinstance(manifest_path_value, str):
+        return isinstance(state_path_value, str)
+    if not Path(manifest_path_value).exists():
+        return True
+    if isinstance(state_path_value, str):
+        return True
+    return False
 
 
 def print_manifest_detached_runs(manifest_path: Path, include_inactive: bool) -> None:

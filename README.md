@@ -362,7 +362,7 @@ ocmo workflow status --run-id <run-id>
 
 Set `OCMO_RUN_REGISTRY` to override the global registry location.
 
-Use `ocmo operation status --run-id <run-id>` or `ocmo workflow status --run-id <run-id>` to inspect detached runs. Operation list details include token totals when usage is available, and `ocmo operation list --all` includes inactive detached sessions and inactive discovered operation states. `ocmo workflow list --all` does the same for workflows.
+Use `ocmo operation status --run-id <run-id>` or `ocmo workflow status --run-id <run-id>` to inspect detached runs. Operation list details include token totals when usage is available, and `ocmo operation list --all` includes inactive detached sessions and inactive discovered operation states. `ocmo workflow list --all` does the same for workflows. Erased operations and workflows are removed from list output, including `--all` output.
 
 By default `ocmo operation status` and `ocmo workflow status` watch state with a live-refreshing snapshot (Rich `Live` UI when stdout is a TTY, plain redraw otherwise). Add `--once` to print one snapshot and exit, and `--interval <seconds>` to change the refresh cadence. `--active-or-latest` shows every active operation or workflow, falling back to the most-recent inactive entry when nothing is active; the bundled `/ocmo-operation-statuses` and `/ocmo-workflow-statuses` slash commands wrap that view for use inside `opencode`.
 

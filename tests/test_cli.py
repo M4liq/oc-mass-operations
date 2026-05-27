@@ -1312,6 +1312,40 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("completed-op inactive kind=operation", output)
         self.assertIn("elapsed=03:00", output)
 
+    def test_erased_operation_is_hidden_from_list_all(self) -> None:
+        generated_dir = self.root / ".ocmo" / "erased-op"
+        generated_dir.mkdir(parents=True)
+        manifest = self.load()
+        manifest["state"]["path"] = "state.json"
+        manifest["operation"]["id"] = "erased-op"
+        generated_manifest = generated_dir / "manifest.yaml"
+        generated_manifest.write_text(yaml_dump(manifest), encoding="utf-8")
+        state_file = generated_dir / "state.json"
+        state_file.write_text(json.dumps({"updatedAt": "now", "workUnits": {"1": {"status": "completed"}}}), encoding="utf-8")
+        registry = self.root / "registry"
+        registry.mkdir()
+        (registry / "erased-run.json").write_text(
+            json.dumps({"runId": "erased-run", "pid": 0, "manifestPath": str(generated_manifest), "statePath": str(state_file)}),
+            encoding="utf-8",
+        )
+
+        old_cwd = Path.cwd()
+        try:
+            import os as test_os
+
+            test_os.chdir(self.root)
+            stdout = io.StringIO()
+            with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main(["operation", "list", "--all"]), 0)
+                self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force"]), 0)
+                self.assertEqual(cli.main(["operation", "list", "--all"]), 0)
+        finally:
+            test_os.chdir(old_cwd)
+
+        output = stdout.getvalue()
+        self.assertEqual(output.count("erased-run inactive"), 1)
+        self.assertNotIn("erased-run inactive", output.split("erased runtime data:")[-1])
+
     def test_operation_status_active_or_latest_shows_active_else_latest(self) -> None:
         active_dir = self.root / ".ocmo" / "active-op"
         older_dir = self.root / ".ocmo" / "older-op"
@@ -4016,6 +4050,49 @@ steps:
         output = stdout.getvalue()
         self.assertIn("erased 2 operation(s)", output)
         self.assertIn("cleared workflow state", output)
+
+    def test_workflow_erase_hides_erased_workflow_from_list_all(self) -> None:
+        workflow_dir = self.root / ".ocmo" / "erased-wf"
+        workflow_dir.mkdir(parents=True)
+        manifest = self.write_generated_operation_manifest("erased-wf-op")
+        workflow = workflow_dir / "workflow.yaml"
+        workflow.write_text(
+            f"""schema: ocmo-workflow/v1
+workflow:
+  id: erased-wf
+state:
+  path: state.json
+steps:
+  - id: only
+    manifest: {manifest.as_posix()}
+""",
+            encoding="utf-8",
+        )
+        state_file = workflow_dir / "state.json"
+        state_file.write_text(json.dumps({"steps": {"only": {"status": "completed"}}}), encoding="utf-8")
+        registry = self.root / "registry"
+        registry.mkdir()
+        (registry / "erased-wf-run.json").write_text(
+            json.dumps({"kind": "workflow", "runId": "erased-wf-run", "pid": 0, "workflowPath": str(workflow), "statePath": str(state_file)}),
+            encoding="utf-8",
+        )
+
+        old_cwd = Path.cwd()
+        try:
+            import os as test_os
+
+            test_os.chdir(self.root)
+            stdout = io.StringIO()
+            with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.stop_operation_processes"), mock.patch("ocmo.cli.stop_workflow_processes"), contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main(["workflow", "list", "--all"]), 0)
+                self.assertEqual(cli.main(["workflow", "erase", str(workflow), "--force"]), 0)
+                self.assertEqual(cli.main(["workflow", "list", "--all"]), 0)
+        finally:
+            test_os.chdir(old_cwd)
+
+        output = stdout.getvalue()
+        self.assertEqual(output.count("erased-wf-run inactive"), 1)
+        self.assertNotIn("erased-wf-run inactive", output.split("cleared workflow state:")[-1])
 
     def test_workflow_erase_requires_force_when_non_interactive(self) -> None:
         workflow, _, _ = self.write_generated_workflow()
