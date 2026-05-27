@@ -72,11 +72,11 @@ Print the target install path with:
 ocmo skill path
 ```
 
-`ocmo skill install` updates the installed skill directory when the bundled skill or its handbook changes. It installs both `SKILL.md` and a version-matched `README.md` handbook, installs the `/ocmo-operation-statuses` slash command under `~/.config/opencode/commands/`, and removes the old managed `ocmo-plan-grill` skill path during migration. Restart opencode after installing the skill. Running sessions keep using the already-loaded skill and command set.
+`ocmo skill install` updates the installed skill directory when the bundled skill or its handbook changes. It installs both `SKILL.md` and a version-matched `README.md` handbook, installs the `/ocmo-operation-statuses` and `/ocmo-workflow-statuses` slash commands under `~/.config/opencode/commands/`, and removes the old managed `ocmo-plan-grill` skill path during migration. Restart opencode after installing the skill. Running sessions keep using the already-loaded skill and command set.
 
 Use `/ocmo` when you want an agent to inspect OCMO manifests, validate or render operations, explain command usage, inspect state and outputs, plan mass operations, or control running work with pause/resume/rerun/kill/erase.
 
-Use `/ocmo-operation-statuses` to ask an agent for a brief read-only summary of all active operation statuses, or the latest inactive operation when nothing is active.
+Use `/ocmo-operation-statuses` to ask an agent for a brief read-only summary of all active operation statuses, or the latest inactive operation when nothing is active. Use `/ocmo-workflow-statuses` for the same read-only view across workflows.
 
 ## How It Works
 
@@ -231,7 +231,9 @@ Review `state.json` beside the manifest for durable execution status, including 
 | Erase operation runtime data | `ocmo operation erase .ocmo/<operation>/manifest.yaml --force` |
 | Validate workflow | `ocmo workflow validate <workflow>` |
 | Execute workflow background | `ocmo workflow run <workflow> --detach` |
-| Show workflow status | `ocmo workflow status <workflow>` |
+| Watch workflow status | `ocmo workflow status <workflow>` |
+| Show workflow status once | `ocmo workflow status <workflow> --once` |
+| List workflow runs and discovered workflow states | `ocmo workflow list` |
 
 ## Planning
 
@@ -327,6 +329,8 @@ ocmo workflow validate workflow.yaml
 ocmo workflow run workflow.yaml --dry-run
 ocmo workflow run workflow.yaml --detach
 ocmo workflow status workflow.yaml
+ocmo workflow status workflow.yaml --once
+ocmo workflow status --active-or-latest --once
 ocmo workflow list --all
 ocmo workflow pause workflow.yaml
 ocmo workflow resume workflow.yaml --detach
@@ -344,7 +348,7 @@ Workflow `--select` selects workflow steps, not work units. Referenced operation
 ocmo operation run .ocmo/business-taxonomy-prompt --select uncompleted --detach
 ```
 
-Detached metadata and logs are written under `.ocmo/runs/` beside the manifest or workflow. `ocmo` also writes a global registry entry so list/status commands can find active runs even when you are not in the manifest or workflow directory. `ocmo operation list` also discovers generated `.ocmo/*/manifest.yaml` operations with state files, so foreground operations appear even when they were not started with `--detach`.
+Detached metadata and logs are written under `.ocmo/runs/` beside the manifest or workflow. `ocmo` also writes a global registry entry so list/status commands can find active runs even when you are not in the manifest or workflow directory. `ocmo operation list` also discovers generated `.ocmo/*/manifest.yaml` operations with state files, so foreground operations appear even when they were not started with `--detach`. `ocmo workflow list` discovers `.ocmo/*/workflow.yaml` workflows the same way.
 
 ```powershell
 ocmo operation list --all
@@ -356,7 +360,9 @@ ocmo workflow status --run-id <run-id>
 
 Set `OCMO_RUN_REGISTRY` to override the global registry location.
 
-Use `ocmo operation status --run-id <run-id>` or `ocmo workflow status --run-id <run-id>` to inspect detached runs. Operation list details include token totals when usage is available, and `ocmo operation list --all` includes inactive detached sessions and inactive discovered operation states.
+Use `ocmo operation status --run-id <run-id>` or `ocmo workflow status --run-id <run-id>` to inspect detached runs. Operation list details include token totals when usage is available, and `ocmo operation list --all` includes inactive detached sessions and inactive discovered operation states. `ocmo workflow list --all` does the same for workflows.
+
+By default `ocmo operation status` and `ocmo workflow status` watch state with a live-refreshing snapshot (Rich `Live` UI when stdout is a TTY, plain redraw otherwise). Add `--once` to print one snapshot and exit, and `--interval <seconds>` to change the refresh cadence. `--active-or-latest` shows every active operation or workflow, falling back to the most-recent inactive entry when nothing is active; the bundled `/ocmo-operation-statuses` and `/ocmo-workflow-statuses` slash commands wrap that view for use inside `opencode`.
 
 ## Operation Control
 

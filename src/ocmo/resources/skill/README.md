@@ -199,7 +199,7 @@ ocmo skill install [--force]
 ocmo skill path
 ```
 
-- `install`: installs or updates the bundled `/ocmo` opencode skill and this handbook under `~/.config/opencode/skills/ocmo/`, and installs `/ocmo-operation-statuses` under `~/.config/opencode/commands/`.
+- `install`: installs or updates the bundled `/ocmo` opencode skill and this handbook under `~/.config/opencode/skills/ocmo/`, and installs `/ocmo-operation-statuses` and `/ocmo-workflow-statuses` under `~/.config/opencode/commands/`.
 - `path`: prints the installed `SKILL.md` path.
 - `--force`: accepted for compatibility; install updates bundled skill files by default.
 
@@ -208,6 +208,10 @@ Restart opencode after installing or updating the skill.
 ### `/ocmo-operation-statuses`
 
 Installed by `ocmo skill install` as an opencode slash command. It runs `ocmo operation status --active-or-latest --once` and asks the agent to summarize running, failed, blocked, paused, killed, and pending work without starting or controlling operations.
+
+### `/ocmo-workflow-statuses`
+
+Installed by `ocmo skill install` as an opencode slash command. It runs `ocmo workflow status --active-or-latest --once` and asks the agent to summarize workflow steps the same way, without starting or controlling workflows.
 
 ## Manifest Inference
 
@@ -249,6 +253,8 @@ ocmo workflow validate workflow.yaml
 ocmo workflow run workflow.yaml --dry-run
 ocmo workflow run workflow.yaml --detach
 ocmo workflow status workflow.yaml
+ocmo workflow status workflow.yaml --once
+ocmo workflow status --active-or-latest --once
 ocmo workflow list --all
 ocmo workflow pause workflow.yaml
 ocmo workflow resume workflow.yaml --detach
@@ -263,6 +269,8 @@ Workflow facts:
 - Workflow state records orchestration status; operation state remains authoritative for work units, runs, sessions, outputs, artifacts, and token usage.
 - `ocmo workflow rerun` defaults to retryable workflow steps, then delegates work unit selection to each referenced operation.
 - `ocmo workflow pause` and `ocmo workflow kill` delegate to the active operation step and preserve operation files.
+- `ocmo workflow status` watches by default (Rich `Live` UI when stdout is a TTY); add `--once` for one snapshot, `--interval <s>` to change refresh cadence, and `--active-or-latest` to show all active workflows or the latest inactive one. The bundled `/ocmo-workflow-statuses` slash command wraps that view.
+- `ocmo workflow list` surfaces discovered `.ocmo/*/workflow.yaml` workflows alongside detached runs; pass `--all` for inactive ones.
 
 ## Selection Rules
 

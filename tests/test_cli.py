@@ -3591,7 +3591,7 @@ steps:
         stdout = io.StringIO()
 
         with contextlib.redirect_stdout(stdout):
-            self.assertEqual(cli.main(["workflow", "status", str(workflow)]), 0)
+            self.assertEqual(cli.main(["workflow", "status", str(workflow), "--once"]), 0)
 
         output = stdout.getvalue()
         self.assertIn("OCMO Workflow: test-workflow", output)
@@ -3643,6 +3643,151 @@ steps:
         self.assertNotIn("op inactive", output)
         self.assertIn("workflow:", output)
         self.assertIn("steps: completed=1", output)
+
+    def test_workflow_status_interval_must_be_positive(self) -> None:
+        workflow, _, _ = self.write_workflow()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(cli.main(["workflow", "status", str(workflow), "--interval", "0"]), 2)
+
+        self.assertIn("--interval must be greater than zero", stderr.getvalue())
+
+    def test_workflow_status_watches_until_interrupted(self) -> None:
+        workflow, _, _ = self.write_workflow()
+        (self.root / "workflow-state.json").write_text(
+            json.dumps({"updatedAt": "first", "steps": {"first": {"status": "running"}}}),
+            encoding="utf-8",
+        )
+
+        slept = False
+
+        def sleep_once(_interval: float) -> None:
+            nonlocal slept
+            if not slept:
+                slept = True
+                (self.root / "workflow-state.json").write_text(
+                    json.dumps({"updatedAt": "second", "steps": {"first": {"status": "completed"}}}),
+                    encoding="utf-8",
+                )
+                return
+            raise KeyboardInterrupt
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.time.sleep", side_effect=sleep_once), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "status", str(workflow), "--interval", "0.1"]), 130)
+
+        output = stdout.getvalue()
+        self.assertIn("stateUpdated=first", output)
+        self.assertIn("stateUpdated=second", output)
+        self.assertIn("running=1", output)
+
+    def test_workflow_status_active_or_latest_shows_active_else_latest(self) -> None:
+        active_dir = self.root / ".ocmo" / "active-wf"
+        latest_dir = self.root / ".ocmo" / "latest-wf"
+        older_dir = self.root / ".ocmo" / "older-wf"
+        for directory in (active_dir, older_dir, latest_dir):
+            directory.mkdir(parents=True)
+
+        def write_pair(directory: Path, workflow_id: str, updated: str, step_status: str) -> None:
+            manifest = self.write_operation_manifest(directory.name + "-op", state_name="state.json")
+            (directory / "workflow.yaml").write_text(
+                f"""schema: ocmo-workflow/v1
+workflow:
+  id: {workflow_id}
+state:
+  path: state.json
+steps:
+  - id: only
+    manifest: {manifest.as_posix()}
+""",
+                encoding="utf-8",
+            )
+            (directory / "state.json").write_text(
+                json.dumps({"updatedAt": updated, "steps": {"only": {"status": step_status}}}),
+                encoding="utf-8",
+            )
+
+        write_pair(active_dir, "active-wf", "2026-05-21T10:02:00+00:00", "running")
+        write_pair(older_dir, "older-wf", "2026-05-21T10:01:00+00:00", "completed")
+        write_pair(latest_dir, "latest-wf", "2026-05-21T10:03:00+00:00", "completed")
+
+        old_cwd = Path.cwd()
+        try:
+            import os as test_os
+
+            test_os.chdir(self.root)
+            registry = self.root / "registry"
+            registry.mkdir()
+            stdout = io.StringIO()
+            with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main(["workflow", "status", "--active-or-latest", "--once"]), 0)
+            active_output = stdout.getvalue()
+
+            (active_dir / "state.json").write_text(
+                json.dumps({"updatedAt": "2026-05-21T10:02:00+00:00", "steps": {"only": {"status": "completed"}}}),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main(["workflow", "status", "--active-or-latest", "--once"]), 0)
+            latest_output = stdout.getvalue()
+
+            for directory in (active_dir, older_dir, latest_dir):
+                (directory / "state.json").unlink()
+            stdout = io.StringIO()
+            with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main(["workflow", "status", "--active-or-latest", "--once"]), 0)
+            empty_output = stdout.getvalue()
+        finally:
+            test_os.chdir(old_cwd)
+
+        self.assertIn("Active OCMO workflow statuses", active_output)
+        self.assertIn("OCMO Workflow: active-wf", active_output)
+        self.assertNotIn("OCMO Workflow: latest-wf", active_output)
+        self.assertIn("Latest OCMO workflow status", latest_output)
+        self.assertIn("OCMO Workflow: latest-wf", latest_output)
+        self.assertNotIn("OCMO Workflow: older-wf", latest_output)
+        self.assertIn("No ocmo workflows found.", empty_output)
+
+    def test_workflow_list_surfaces_discovered_workflows(self) -> None:
+        workflow_dir = self.root / ".ocmo" / "discovered-wf"
+        workflow_dir.mkdir(parents=True)
+        manifest = self.write_operation_manifest("discovered-wf-op", state_name="state.json")
+        (workflow_dir / "workflow.yaml").write_text(
+            f"""schema: ocmo-workflow/v1
+workflow:
+  id: discovered-wf
+state:
+  path: state.json
+steps:
+  - id: only
+    manifest: {manifest.as_posix()}
+""",
+            encoding="utf-8",
+        )
+        (workflow_dir / "state.json").write_text(
+            json.dumps({"updatedAt": "2026-05-21T10:00:00+00:00", "steps": {"only": {"status": "running"}}}),
+            encoding="utf-8",
+        )
+
+        old_cwd = Path.cwd()
+        try:
+            import os as test_os
+
+            test_os.chdir(self.root)
+            registry = self.root / "registry"
+            registry.mkdir()
+            stdout = io.StringIO()
+            with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main(["workflow", "list"]), 0)
+                self.assertEqual(cli.main(["workflow", "list", "--all"]), 0)
+        finally:
+            test_os.chdir(old_cwd)
+
+        output = stdout.getvalue()
+        self.assertIn("discovered-wf active kind=workflow", output)
+        self.assertIn("stateUpdated=2026-05-21T10:00:00+00:00", output)
 
 
 def yaml_dump(data: dict) -> str:

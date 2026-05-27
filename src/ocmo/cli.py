@@ -207,6 +207,9 @@ def main(argv: list[str] | None = None) -> int:
     workflow_status_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory")
     workflow_status_parser.add_argument("--run-id", help="Show one detached workflow run session")
     workflow_status_parser.add_argument("--all", action="store_true", help="Include inactive detached workflow sessions")
+    workflow_status_parser.add_argument("--active-or-latest", action="store_true", help="Show all active workflows, or the latest inactive workflow when none are active")
+    workflow_status_parser.add_argument("--once", action="store_true", help="Print one status snapshot and exit")
+    workflow_status_parser.add_argument("--interval", type=float, default=1.0, help="Refresh interval in seconds for continuous status")
 
     workflow_list_parser = workflow_subparsers.add_parser("list", help="List detached workflow run sessions")
     workflow_list_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory")
@@ -2583,6 +2586,8 @@ def detached_workflow_run_id() -> str:
 
 
 def status_workflow(args: argparse.Namespace) -> int:
+    if args.active_or_latest:
+        return print_active_or_latest_workflow_statuses(include_inactive=args.all)
     record = None
     if args.run_id:
         path = find_detached_record(args.run_id)
@@ -2598,7 +2603,34 @@ def status_workflow(args: argparse.Namespace) -> int:
         workflow_path = Path(workflow_value)
     else:
         workflow_path = infer_workflow_path(args.workflow)
-    print_workflow_status(workflow_path, args.all, record)
+    interval = getattr(args, "interval", 1.0)
+    if interval <= 0:
+        raise OcmoError("--interval must be greater than zero")
+    if args.once:
+        print_workflow_status(workflow_path, include_inactive=args.all, selected_record=record)
+        return 0
+    return watch_workflow_status(workflow_path, include_inactive=args.all, selected_record=record, interval=interval)
+
+
+def print_active_or_latest_workflow_statuses(include_inactive: bool = False) -> int:
+    active_records = detached_records(include_inactive=False, kind="workflow")
+    active = workflow_status_targets(active_records, discovered_workflow_records(include_inactive=False, detached=active_records))
+    targets = active
+    if not targets:
+        all_records = detached_records(include_inactive=True, kind="workflow")
+        all_targets = workflow_status_targets(all_records, discovered_workflow_records(include_inactive=True, detached=all_records))
+        latest = latest_workflow_status_target(all_targets)
+        if latest is not None:
+            targets = [latest]
+    if not targets:
+        print("No ocmo workflows found.")
+        return 0
+    heading = "Active OCMO workflow statuses" if active else "Latest OCMO workflow status"
+    print(heading)
+    for index, target in enumerate(targets):
+        if index:
+            print()
+        print_workflow_status(target["workflowPath"], include_inactive=include_inactive, selected_record=target.get("record"))
     return 0
 
 
@@ -2616,12 +2648,15 @@ def list_workflow_runs(args: argparse.Namespace) -> int:
         print_workflow_detached_runs(infer_workflow_path(args.workflow), include_inactive=args.all)
         return 0
     records = detached_records(include_inactive=args.all, kind="workflow")
-    if not records:
+    workflows = discovered_workflow_records(include_inactive=args.all, detached=records)
+    if not records and not workflows:
         qualifier = "" if args.all else " active"
-        print(f"No{qualifier} detached ocmo workflow runs.")
+        print(f"No{qualifier} ocmo workflows.")
         return 0
     for record in records:
         print_detached_record(record, details=False)
+    for workflow in workflows:
+        print_workflow_record(workflow)
     return 0
 
 
@@ -2963,6 +2998,48 @@ def print_operation_status_snapshot(manifest_path: Path, include_inactive: bool,
 
 
 def print_workflow_status(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> None:
+    print(render_workflow_status(workflow_path, include_inactive, selected_record))
+
+
+def render_workflow_status(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> str:
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        print_workflow_status_snapshot(workflow_path, include_inactive, selected_record)
+    return stdout.getvalue().rstrip("\n")
+
+
+def watch_workflow_status(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float) -> int:
+    if sys.stdout.isatty():
+        try:
+            from rich.live import Live
+        except ImportError:
+            return watch_workflow_status_plain(workflow_path, include_inactive, selected_record, interval, clear_screen=True)
+        try:
+            with Live(render_workflow_status(workflow_path, include_inactive, selected_record), refresh_per_second=max(1, int(1 / interval)), transient=False) as live:
+                while True:
+                    time.sleep(interval)
+                    live.update(render_workflow_status(workflow_path, include_inactive, selected_record))
+        except KeyboardInterrupt:
+            return 130
+    return watch_workflow_status_plain(workflow_path, include_inactive, selected_record, interval, clear_screen=False)
+
+
+def watch_workflow_status_plain(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float, clear_screen: bool) -> int:
+    first = True
+    try:
+        while True:
+            if clear_screen:
+                print("\033[H\033[J", end="")
+            elif not first:
+                print()
+            print(render_workflow_status(workflow_path, include_inactive, selected_record), flush=True)
+            first = False
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 130
+
+
+def print_workflow_status_snapshot(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> None:
     workflow = load_workflow(workflow_path)
     validate_workflow(workflow, workflow_path)
     path = workflow_state_path(workflow, workflow_path)
@@ -3179,6 +3256,109 @@ def operation_state_is_active(state: dict[str, Any]) -> bool:
 
 def state_status_is_active(status: Any) -> bool:
     return str(status) in {"running", "creating_worktree", "worktree_ready", "setup", "setup_completed", "cleanup"}
+
+
+def discovered_workflow_records(include_inactive: bool, detached: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    detached_paths = {
+        str(Path(workflow_path).resolve())
+        for workflow_path in (record.get("workflowPath") for record in detached or [])
+        if isinstance(workflow_path, str)
+    }
+    records = []
+    for workflow_path in sorted((Path.cwd() / ".ocmo").glob("*/workflow.yaml")):
+        try:
+            resolved = str(workflow_path.resolve())
+            if resolved in detached_paths:
+                continue
+            workflow = load_workflow(workflow_path)
+            path = workflow_state_path(workflow, workflow_path)
+            if not path.exists():
+                continue
+            state = read_json_file(path)
+        except (OSError, json.JSONDecodeError, OcmoError):
+            continue
+        active = workflow_state_is_active(state)
+        if include_inactive or active:
+            records.append({"workflowPath": str(workflow_path), "statePath": str(path), "workflowId": workflow["workflow"]["id"], "active": active, "state": state, "workflow": workflow})
+    return records
+
+
+def workflow_state_is_active(state: dict[str, Any]) -> bool:
+    steps = state.get("steps") if isinstance(state.get("steps"), dict) else {}
+    for step_state in steps.values():
+        if isinstance(step_state, dict) and state_status_is_active(step_state.get("status")):
+            return True
+    control = state.get("control") if isinstance(state.get("control"), dict) else {}
+    return state_status_is_active(state.get("status")) or state_status_is_active(control.get("status"))
+
+
+def workflow_status_targets(detached: list[dict[str, Any]], discovered: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    targets = []
+    seen: set[str] = set()
+    for record in detached:
+        workflow_value = record.get("workflowPath")
+        if not isinstance(workflow_value, str):
+            continue
+        workflow_path = Path(workflow_value)
+        key = str(workflow_path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append({"workflowPath": workflow_path, "record": record, "updatedAt": workflow_target_updated_at(record)})
+    for record in discovered:
+        workflow_value = record.get("workflowPath")
+        if not isinstance(workflow_value, str):
+            continue
+        workflow_path = Path(workflow_value)
+        key = str(workflow_path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        state = record.get("state") if isinstance(record.get("state"), dict) else {}
+        targets.append({"workflowPath": workflow_path, "updatedAt": state.get("updatedAt")})
+    return targets
+
+
+def workflow_target_updated_at(record: dict[str, Any]) -> Any:
+    state_path_value = record.get("statePath")
+    if isinstance(state_path_value, str):
+        path = Path(state_path_value)
+        if path.exists():
+            try:
+                state = read_json_file(path)
+            except (OSError, json.JSONDecodeError):
+                state = {}
+            if isinstance(state, dict) and state.get("updatedAt"):
+                return state.get("updatedAt")
+    return record.get("startedAt")
+
+
+def latest_workflow_status_target(targets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not targets:
+        return None
+    return max(targets, key=lambda target: sortable_state_time(target.get("updatedAt")))
+
+
+def print_workflow_record(record: dict[str, Any]) -> None:
+    status = "active" if record.get("active") else "inactive"
+    state = record.get("state") if isinstance(record.get("state"), dict) else {}
+    workflow = record.get("workflow") if isinstance(record.get("workflow"), dict) else None
+    workflow_path_value = record.get("workflowPath", "-")
+    if workflow is None and isinstance(workflow_path_value, str):
+        try:
+            workflow = load_workflow(Path(workflow_path_value))
+        except OcmoError:
+            workflow = None
+    if workflow is not None:
+        rows = workflow_status_rows(workflow, Path(workflow_path_value), state)
+    else:
+        rows = [{"item": str(step_id), "status": str(step_state.get("status", "unknown")) if isinstance(step_state, dict) else "unknown"} for step_id, step_state in (state.get("steps") or {}).items()]
+    counts = operation_status_counts(rows)
+    print(
+        f"{record.get('workflowId', '<unknown>')} {status} kind=workflow workflow={workflow_path_value} "
+        f"state={record.get('statePath', '-')} running={counts['running']} completed={counts['completed']} "
+        f"failed={counts['failed']} pending={counts['pending']} stateUpdated={state.get('updatedAt', '-')}"
+    )
 
 
 def print_operation_record(record: dict[str, Any]) -> None:
