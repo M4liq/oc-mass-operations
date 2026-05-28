@@ -3816,21 +3816,21 @@ steps:
         self.assertIn("valid:", stdout.getvalue())
         self.assertIn(str(manifest), stdout.getvalue())
 
-    def test_workflow_rejects_operation_overrides(self) -> None:
-        for extra in ("defaults:\n  operationSelect: uncompleted\n", "defaults:\n  concurrency: 2\n", "defaults:\n  timeoutSeconds: 30\n", "defaults:\n  allowSharedWorktreeConcurrency: true\n"):
+    def test_workflow_rejects_invalid_operation_overrides(self) -> None:
+        for extra in ("defaults:\n  operationSelect: ''\n", "defaults:\n  concurrency: 0\n", "defaults:\n  timeoutSeconds: 0\n", "defaults:\n  allowSharedWorktreeConcurrency: 1\n", "defaults:\n  params: []\n"):
             workflow, _, _ = self.write_workflow(extra=extra)
             stderr = io.StringIO()
 
             with contextlib.redirect_stderr(stderr):
                 self.assertEqual(cli.main(["workflow", "validate", str(workflow)]), 2)
 
-            self.assertIn("is not supported in workflows", stderr.getvalue())
+            self.assertTrue(stderr.getvalue().startswith("ocmo:"), stderr.getvalue())
 
-    def test_workflow_rejects_step_operation_overrides(self) -> None:
+    def test_workflow_rejects_invalid_step_operation_overrides(self) -> None:
         workflow, _, _ = self.write_workflow(
             extra="""  - id: third
     manifest: missing.yaml
-    timeoutSeconds: 30
+    timeoutSeconds: 0
 """
         )
         stderr = io.StringIO()
@@ -3838,7 +3838,74 @@ steps:
         with contextlib.redirect_stderr(stderr):
             self.assertEqual(cli.main(["workflow", "validate", str(workflow)]), 2)
 
-        self.assertIn("steps[3].timeoutSeconds is not supported in workflows", stderr.getvalue())
+        self.assertIn("steps[3].timeoutSeconds must be a positive integer", stderr.getvalue())
+
+    def test_workflow_passes_step_operation_overrides(self) -> None:
+        first = self.write_operation_manifest("first")
+        workflow = self.root / "workflow-overrides.yaml"
+        workflow.write_text(
+            f"""schema: ocmo-workflow/v1
+params:
+  rootParam: default-root
+workflow:
+  id: override-workflow
+state:
+  path: workflow-state.json
+defaults:
+  stopOnFailure: true
+  operationSelect: "1"
+  concurrency: 2
+  timeoutSeconds: 9
+  allowSharedWorktreeConcurrency: false
+  params:
+    inherited: "{{{{params.rootParam}}}}"
+    mode: default
+steps:
+  - id: first
+    manifest: {first.as_posix()}
+    concurrency: 3
+    allowSharedWorktreeConcurrency: true
+    params:
+      mode: step
+""",
+            encoding="utf-8",
+        )
+        calls = []
+
+        with mock.patch("ocmo.cli.run_manifest", side_effect=lambda options: calls.append(options) or 0), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(["workflow", "run", str(workflow), "--param", "rootParam=runtime-root", "--yes", "--ui", "plain"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].manifest_path, first)
+        self.assertEqual(calls[0].select, "1")
+        self.assertEqual(calls[0].concurrency, 3)
+        self.assertEqual(calls[0].timeout_seconds, 9)
+        self.assertTrue(calls[0].allow_shared_worktree_concurrency)
+        self.assertEqual(calls[0].params["rootParam"], "runtime-root")
+        self.assertEqual(calls[0].params["inherited"], "runtime-root")
+        self.assertEqual(calls[0].params["mode"], "step")
+
+    def test_workflow_dry_run_prints_step_operation_overrides(self) -> None:
+        workflow, _, _ = self.write_workflow(
+            extra="""  - id: third
+    manifest: first/manifest.yaml
+    operationSelect: "1"
+    concurrency: 4
+    timeoutSeconds: 11
+    allowSharedWorktreeConcurrency: true
+"""
+        )
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "run", str(workflow), "--select", "third", "--dry-run"]), 0)
+
+        output = stdout.getvalue()
+        self.assertIn("--select 1", output)
+        self.assertIn("--concurrency 4", output)
+        self.assertIn("--timeout-seconds 11", output)
+        self.assertIn("--allow-shared-worktree-concurrency", output)
 
     def test_workflow_run_writes_step_state_and_stops_on_failure(self) -> None:
         workflow, first, second = self.write_workflow()

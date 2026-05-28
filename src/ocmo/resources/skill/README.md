@@ -240,12 +240,15 @@ state:
 
 defaults:
   stopOnFailure: true
+  operationSelect: uncompleted
 
 steps:
   - id: plan-docs
     manifest: ../plan-docs/manifest.yaml
   - id: implement-docs
     manifest: ../implement-docs/manifest.yaml
+    concurrency: 3
+    allowSharedWorktreeConcurrency: true
 ```
 
 Workflow commands:
@@ -269,7 +272,9 @@ Workflow facts:
 
 - Workflow `--select` selects workflow steps, not work units.
 - Workflow commands accept `--param` and `--params-file`; resolved parameters apply to the workflow file and every referenced operation manifest.
-- Referenced operation manifests control their own work unit selection, concurrency, timeouts, and worktree safety policy.
+- Workflow `defaults` and individual `steps` can pass operation run overrides to referenced manifests: `operationSelect`, `concurrency`, `timeoutSeconds`, `allowSharedWorktreeConcurrency`, and `params`.
+- Step values override workflow defaults. Operation-specific `params` merge after workflow parameters, then `defaults.params`, then `steps[].params`.
+- `allowSharedWorktreeConcurrency: true` is equivalent to operation `--allow-shared-worktree-concurrency`; use only when selected work unit scopes are explicitly non-overlapping.
 - Workflow state records orchestration status; operation state remains authoritative for work units, runs, sessions, outputs, artifacts, and token usage.
 - `ocmo workflow rerun` defaults to retryable workflow steps, then delegates work unit selection to each referenced operation.
 - `ocmo workflow pause` and `ocmo workflow kill` delegate to the active operation step and preserve operation files.

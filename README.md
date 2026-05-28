@@ -318,12 +318,15 @@ state:
 
 defaults:
   stopOnFailure: true
+  operationSelect: uncompleted
 
 steps:
   - id: plan-docs
     manifest: ../plan-docs/manifest.yaml
   - id: implement-docs
     manifest: ../implement-docs/manifest.yaml
+    concurrency: 3
+    allowSharedWorktreeConcurrency: true
 ```
 
 Workflow commands:
@@ -342,7 +345,17 @@ ocmo workflow rerun workflow.yaml --detach
 ocmo workflow kill workflow.yaml --force
 ```
 
-Workflow `--select` selects workflow steps, not work units. Referenced operation manifests control their own work unit selection, concurrency, timeouts, and worktree safety policy.
+Workflow `--select` selects workflow steps, not work units.
+
+Workflow `defaults` and individual `steps` can pass operation run overrides to referenced manifests:
+
+- `operationSelect`: operation work-unit selector, equivalent to `ocmo operation run --select`.
+- `concurrency`: operation queue concurrency override, equivalent to `--concurrency`.
+- `timeoutSeconds`: per-process timeout override, equivalent to `--timeout-seconds`.
+- `allowSharedWorktreeConcurrency`: allows `policy.worktree: single` with concurrency above `1`, equivalent to `--allow-shared-worktree-concurrency`. Use only when selected work unit scopes are explicitly non-overlapping.
+- `params`: operation-specific runtime parameters for referenced operation manifests.
+
+Step values override workflow defaults. Operation-specific `params` merge after workflow parameters, then `defaults.params`, then `steps[].params`.
 
 Workflows also accept `--param` and `--params-file`; the resolved parameters apply to the workflow file and every referenced operation manifest.
 
