@@ -27,6 +27,86 @@ import yaml
 
 from .common import *
 
+if os.name == "nt":
+    import msvcrt
+else:  # pragma: no cover - exercised on non-Windows platforms
+    import fcntl
+
+_STATE_LOCKS_GUARD = threading.Lock()
+_STATE_LOCKS: dict[str, threading.RLock] = {}
+
+
+def process_state_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _STATE_LOCKS_GUARD:
+        lock = _STATE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _STATE_LOCKS[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def state_file_lock(path: Path):
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    process_lock = process_state_lock(path)
+    with process_lock:
+        with lock_path.open("a+b") as lock_file:
+            lock_file.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            else:  # pragma: no cover - exercised on non-Windows platforms
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:  # pragma: no cover - exercised on non-Windows platforms
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def read_json_state_file(path: Path) -> dict[str, Any]:
+    with state_file_lock(path):
+        return _read_json_state_file_unlocked(path)
+
+
+def update_json_state_file(path: Path, update: Any) -> Any:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with state_file_lock(path):
+        data = _read_json_state_file_unlocked(path)
+        result = update(data)
+        _write_json_state_file_unlocked(path, data)
+        return result
+
+
+def write_json_state_file(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with state_file_lock(path):
+        _write_json_state_file_unlocked(path, data)
+
+
+def _read_json_state_file_unlocked(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json_state_file_unlocked(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as tmp_file:
+            tmp_file.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp_path.unlink()
+
 def state_path(manifest: dict[str, Any], manifest_path: Path) -> Path:
     configured = manifest.get("state", {}).get("path")
     if configured:
@@ -80,93 +160,101 @@ class StateStore:
 
     def ensure_operation(self, manifest: dict[str, Any]) -> None:
         with self.lock:
-            data = self._read()
-            now = utc_now()
-            data.setdefault("schema", "ocmo-state/v1")
-            data.setdefault("operationId", manifest["operation"]["id"])
-            params = resolved_params(manifest)
-            if params:
-                data["params"] = params
-            data.setdefault("startedAt", now)
-            data.setdefault("workUnits", {})
-            data.pop("completedAt", None)
-            data["control"] = {"status": "running", "updatedAt": now}
-            data["updatedAt"] = now
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                now = utc_now()
+                data.setdefault("schema", "ocmo-state/v1")
+                data.setdefault("operationId", manifest["operation"]["id"])
+                params = resolved_params(manifest)
+                if params:
+                    data["params"] = params
+                data.setdefault("startedAt", now)
+                data.setdefault("workUnits", {})
+                data.pop("completedAt", None)
+                data["control"] = {"status": "running", "updatedAt": now}
+                data["updatedAt"] = now
+
+            self._update(update)
 
     def mark(self, item_id: str, status: str, patch: dict[str, Any]) -> None:
         with self.lock:
-            data = self._read()
-            data.setdefault("workUnits", {})
-            item_state = data["workUnits"].setdefault(item_id, {})
-            item_state.update(patch)
-            item_state["status"] = status
-            data["updatedAt"] = utc_now()
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                data.setdefault("workUnits", {})
+                item_state = data["workUnits"].setdefault(item_id, {})
+                item_state.update(patch)
+                item_state["status"] = status
+                data["updatedAt"] = utc_now()
+
+            self._update(update)
 
     def mark_run(self, item_id: str, run_id: str, status: str, patch: dict[str, Any]) -> None:
         with self.lock:
-            data = self._read()
-            data.setdefault("workUnits", {})
-            item_state = data["workUnits"].setdefault(item_id, {})
-            runs = item_state.setdefault("runs", {})
-            run_state = runs.setdefault(run_id, {})
-            run_state.update(patch)
-            run_state["status"] = status
-            data["updatedAt"] = utc_now()
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                data.setdefault("workUnits", {})
+                item_state = data["workUnits"].setdefault(item_id, {})
+                runs = item_state.setdefault("runs", {})
+                run_state = runs.setdefault(run_id, {})
+                run_state.update(patch)
+                run_state["status"] = status
+                data["updatedAt"] = utc_now()
+
+            self._update(update)
 
     def replace_run(self, item_id: str, run_id: str, status: str, patch: dict[str, Any]) -> None:
         with self.lock:
-            data = self._read()
-            data.setdefault("workUnits", {})
-            item_state = data["workUnits"].setdefault(item_id, {})
-            runs = item_state.setdefault("runs", {})
-            runs[run_id] = {**patch, "status": status}
-            data["updatedAt"] = utc_now()
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                data.setdefault("workUnits", {})
+                item_state = data["workUnits"].setdefault(item_id, {})
+                runs = item_state.setdefault("runs", {})
+                runs[run_id] = {**patch, "status": status}
+                data["updatedAt"] = utc_now()
+
+            self._update(update)
 
     def clear_item_terminal_fields(self, item_id: str) -> None:
         with self.lock:
-            data = self._read()
-            data.setdefault("workUnits", {})
-            item_state = data["workUnits"].setdefault(item_id, {})
-            for key in ("completedAt", "exitCode", "error", "pausedAt", "killedAt", "resumedAt"):
-                item_state.pop(key, None)
-            data["updatedAt"] = utc_now()
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                data.setdefault("workUnits", {})
+                item_state = data["workUnits"].setdefault(item_id, {})
+                for key in ("completedAt", "exitCode", "error", "pausedAt", "killedAt", "resumedAt"):
+                    item_state.pop(key, None)
+                data["updatedAt"] = utc_now()
+
+            self._update(update)
 
     def patch_run(self, item_id: str, run_id: str, patch: dict[str, Any]) -> None:
         with self.lock:
-            data = self._read()
-            data.setdefault("workUnits", {})
-            item_state = data["workUnits"].setdefault(item_id, {})
-            runs = item_state.setdefault("runs", {})
-            run_state = runs.setdefault(run_id, {})
-            run_state.update(patch)
-            data["updatedAt"] = utc_now()
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                data.setdefault("workUnits", {})
+                item_state = data["workUnits"].setdefault(item_id, {})
+                runs = item_state.setdefault("runs", {})
+                run_state = runs.setdefault(run_id, {})
+                run_state.update(patch)
+                data["updatedAt"] = utc_now()
+
+            self._update(update)
 
     def patch(self, item_id: str, patch: dict[str, Any]) -> None:
         with self.lock:
-            data = self._read()
-            data.setdefault("workUnits", {})
-            item_state = data["workUnits"].setdefault(item_id, {})
-            item_state.update(patch)
-            data["updatedAt"] = utc_now()
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                data.setdefault("workUnits", {})
+                item_state = data["workUnits"].setdefault(item_id, {})
+                item_state.update(patch)
+                data["updatedAt"] = utc_now()
+
+            self._update(update)
 
     def finish(self, status: str) -> None:
         with self.lock:
-            data = self._read()
-            now = utc_now()
-            if status in DONE_STATUSES or (status in TERMINAL_STATUSES and status not in PAUSED_STATUSES):
-                data["completedAt"] = now
-            else:
-                data.pop("completedAt", None)
-            data.setdefault("control", {}).update({"status": status, "updatedAt": now})
-            data["updatedAt"] = now
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                now = utc_now()
+                if status in DONE_STATUSES or (status in TERMINAL_STATUSES and status not in PAUSED_STATUSES):
+                    data["completedAt"] = now
+                else:
+                    data.pop("completedAt", None)
+                data.setdefault("control", {}).update({"status": status, "updatedAt": now})
+                data["updatedAt"] = now
+
+            self._update(update)
 
     def data(self) -> dict[str, Any]:
         with self.lock:
@@ -182,13 +270,13 @@ class StateStore:
         return run if isinstance(run, dict) else {}
 
     def _read(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {}
-        return json.loads(self.path.read_text(encoding="utf-8"))
+        return read_json_state_file(self.path)
 
     def _write(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        write_json_state_file(self.path, data)
+
+    def _update(self, update: Any) -> Any:
+        return update_json_state_file(self.path, update)
 
 
 class WorkflowStateStore:
@@ -198,35 +286,37 @@ class WorkflowStateStore:
 
     def ensure_workflow(self, workflow: dict[str, Any]) -> None:
         with self.lock:
-            data = self._read()
-            now = utc_now()
-            data.setdefault("schema", "ocmo-workflow-state/v1")
-            data.setdefault("workflowId", workflow["workflow"]["id"])
-            params = resolved_params(workflow)
-            if params:
-                data["params"] = params
-            data.setdefault("startedAt", now)
-            data.setdefault("steps", {})
-            data["status"] = "running"
-            data.pop("completedAt", None)
-            data["control"] = {"status": "running", "updatedAt": now}
-            data["updatedAt"] = now
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                now = utc_now()
+                data.setdefault("schema", "ocmo-workflow-state/v1")
+                data.setdefault("workflowId", workflow["workflow"]["id"])
+                params = resolved_params(workflow)
+                if params:
+                    data["params"] = params
+                data.setdefault("startedAt", now)
+                data.setdefault("steps", {})
+                data["status"] = "running"
+                data.pop("completedAt", None)
+                data["control"] = {"status": "running", "updatedAt": now}
+                data["updatedAt"] = now
+
+            self._update(update)
 
     def mark_step(self, step_id: str, status: str, patch: dict[str, Any]) -> None:
         with self.lock:
-            data = self._read()
-            data.setdefault("steps", {})
-            step_state = data["steps"].setdefault(step_id, {})
-            if status in {"pending", "running", "completed"}:
-                for key in ("completedAt", "exitCode", "error", "pausedAt", "killedAt"):
-                    step_state.pop(key, None)
-            if status == "pending":
-                step_state.pop("startedAt", None)
-            step_state.update(patch)
-            step_state["status"] = status
-            data["updatedAt"] = utc_now()
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                data.setdefault("steps", {})
+                step_state = data["steps"].setdefault(step_id, {})
+                if status in {"pending", "running", "completed"}:
+                    for key in ("completedAt", "exitCode", "error", "pausedAt", "killedAt"):
+                        step_state.pop(key, None)
+                if status == "pending":
+                    step_state.pop("startedAt", None)
+                step_state.update(patch)
+                step_state["status"] = status
+                data["updatedAt"] = utc_now()
+
+            self._update(update)
 
     def prepare_step(self, workflow: dict[str, Any], workflow_path: Path, step: dict[str, Any], rerun: bool) -> None:
         manifest_path = workflow_step_manifest_path(workflow_path, step)
@@ -243,27 +333,29 @@ class WorkflowStateStore:
 
     def finish(self, status: str) -> None:
         with self.lock:
-            data = self._read()
-            now = utc_now()
-            if status == "completed":
-                status = workflow_overall_status(data)
-            data["status"] = status
-            if status in TERMINAL_STATUSES or status in DONE_STATUSES or status == "completed":
-                data["completedAt"] = now
-            else:
-                data.pop("completedAt", None)
-            data.setdefault("control", {}).update({"status": status, "updatedAt": now})
-            data["updatedAt"] = now
-            self._write(data)
+            def update(data: dict[str, Any]) -> None:
+                nonlocal status
+                now = utc_now()
+                if status == "completed":
+                    status = workflow_overall_status(data)
+                data["status"] = status
+                if status in TERMINAL_STATUSES or status in DONE_STATUSES or status == "completed":
+                    data["completedAt"] = now
+                else:
+                    data.pop("completedAt", None)
+                data.setdefault("control", {}).update({"status": status, "updatedAt": now})
+                data["updatedAt"] = now
+
+            self._update(update)
 
     def _read(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {}
-        return json.loads(self.path.read_text(encoding="utf-8"))
+        return read_json_state_file(self.path)
 
     def _write(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        write_json_state_file(self.path, data)
+
+    def _update(self, update: Any) -> Any:
+        return update_json_state_file(self.path, update)
 
 
 def workflow_overall_status(state: dict[str, Any]) -> str:

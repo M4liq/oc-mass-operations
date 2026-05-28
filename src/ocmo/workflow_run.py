@@ -438,18 +438,20 @@ def mark_active_workflow_steps(workflow_path: Path, status: str, params: dict[st
     path = workflow_state_path(workflow, workflow_path)
     if not path.exists():
         return 0
-    data = read_json_file(path)
-    steps = data.get("steps") if isinstance(data.get("steps"), dict) else {}
-    changed = 0
-    now = utc_now()
-    for step in steps.values():
-        if isinstance(step, dict) and step.get("status") == "running":
-            step["status"] = status
-            step[f"{status}At"] = now
-            changed += 1
-    data.setdefault("control", {}).update({"status": status, "updatedAt": now})
-    data["status"] = status
-    data.pop("completedAt", None)
-    data["updatedAt"] = now
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    return changed
+
+    def update(data: dict[str, Any]) -> int:
+        steps = data.get("steps") if isinstance(data.get("steps"), dict) else {}
+        changed = 0
+        now = utc_now()
+        for step in steps.values():
+            if isinstance(step, dict) and step.get("status") == "running":
+                step["status"] = status
+                step[f"{status}At"] = now
+                changed += 1
+        data.setdefault("control", {}).update({"status": status, "updatedAt": now})
+        data["status"] = status
+        data.pop("completedAt", None)
+        data["updatedAt"] = now
+        return changed
+
+    return update_json_state_file(path, update)

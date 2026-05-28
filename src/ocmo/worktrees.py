@@ -125,11 +125,21 @@ def run_item(
             state.mark_run(item_id, run_id, "running", running_run_state)
         reporter.run(item_id, run_id, "running", "starting")
         usage_total = empty_usage()
+        last_usage_write = 0.0
+
+        def flush_usage(item_id: str = item_id, run_id: str = run_id) -> None:
+            nonlocal last_usage_write
+            if usage_total.get("steps"):
+                state.patch_run(item_id, run_id, {"usage": usage_total})
+                last_usage_write = time.monotonic()
 
         def record_usage(delta: dict[str, Any], item_id: str = item_id, run_id: str = run_id) -> None:
-            nonlocal usage_total
+            nonlocal usage_total, last_usage_write
             usage_total = add_usage(usage_total, delta)
-            state.patch_run(item_id, run_id, {"usage": usage_total})
+            now = time.monotonic()
+            if now - last_usage_write >= 1.0:
+                state.patch_run(item_id, run_id, {"usage": usage_total})
+                last_usage_write = now
             reporter.usage(item_id, run_id, usage_total)
 
         try:
@@ -143,17 +153,20 @@ def run_item(
                 on_usage=record_usage,
             )
         except subprocess.TimeoutExpired:
+            flush_usage()
             state.mark_run(item_id, run_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout})
             state.mark(item_id, "timed_out", {"completedAt": utc_now(), "exitCode": None, "timeoutSeconds": run_timeout, **execution})
             reporter.run(item_id, run_id, "timed_out", f"timed out after {run_timeout} seconds")
             cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
             return 124
         except OSError as exc:
+            flush_usage()
             state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
             state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
             reporter.run(item_id, run_id, "failed", f"failed to start: {exc}")
             cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
             return cleanup_code or 1
+        flush_usage()
         reporter.subprocess_output(item_id, run_id, completed)
         session_id = extract_session_id(completed.stdout or "")
         if session_id:

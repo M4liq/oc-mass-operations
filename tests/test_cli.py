@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -3229,6 +3230,60 @@ class EdgeCaseCoverageTests(OcmoTestCase):
         data = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertTrue(data["workUnits"]["1"]["old"])
         self.assertTrue(data["workUnits"]["1"]["new"])
+
+    def test_state_json_update_serializes_concurrent_writers(self) -> None:
+        state_path = self.root / "state.json"
+        barrier = threading.Barrier(16)
+        errors: list[BaseException] = []
+
+        def worker(index: int) -> None:
+            try:
+                barrier.wait(timeout=2)
+
+                def update(data: dict) -> None:
+                    data.setdefault("workUnits", {})
+                    time.sleep(0.002)
+                    data["workUnits"][str(index)] = {"status": "completed"}
+
+                cli.update_json_state_file(state_path, update)
+            except BaseException as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(set(data["workUnits"]), {str(index) for index in range(16)})
+        self.assertEqual(list(self.root.glob(".state.json.*.tmp")), [])
+
+    def test_state_store_multiple_instances_preserve_updates(self) -> None:
+        state_path = self.root / "state.json"
+        barrier = threading.Barrier(8)
+        errors: list[BaseException] = []
+
+        def worker(index: int) -> None:
+            try:
+                store = cli.StateStore(state_path)
+                barrier.wait(timeout=2)
+                for run_index in range(5):
+                    item_id = f"{index}-{run_index}"
+                    store.mark(item_id, "completed", {"worker": index})
+            except BaseException as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(data["workUnits"]), 40)
 
     def test_plan_manifest_missing_prompt_success_and_failure(self) -> None:
         missing = self.root / "missing.txt"

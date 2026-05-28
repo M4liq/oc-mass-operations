@@ -96,35 +96,36 @@ def terminate_process_tree(pid: int, force: bool = True) -> None:
 
 
 def mark_active_runs(path: Path, status: str) -> int:
+    def update(data: dict[str, Any]) -> int:
+        items = data.get("workUnits") if isinstance(data.get("workUnits"), dict) else {}
+        changed = 0
+        now = utc_now()
+        for item in items.values():
+            if not isinstance(item, dict):
+                continue
+            runs = item.get("runs") if isinstance(item.get("runs"), dict) else {}
+            item_changed = False
+            for run in runs.values():
+                if not isinstance(run, dict) or run.get("status") != "running":
+                    continue
+                next_status = status
+                if status == "paused" and not run.get("sessionId"):
+                    next_status = "paused_unresumable"
+                run["status"] = next_status
+                run[f"{status}At"] = now
+                item_changed = True
+                changed += 1
+            if item.get("status") == "running" or item_changed:
+                item["status"] = status if status != "paused" or any(isinstance(run, dict) and run.get("status") == "paused" for run in runs.values()) else "paused_unresumable"
+                item[f"{status}At"] = now
+        data.setdefault("control", {})
+        data["control"].update({"status": status, "updatedAt": now})
+        data["updatedAt"] = now
+        return changed
+
     if not path.exists():
         return 0
-    data = read_json_file(path)
-    items = data.get("workUnits") if isinstance(data.get("workUnits"), dict) else {}
-    changed = 0
-    now = utc_now()
-    for item in items.values():
-        if not isinstance(item, dict):
-            continue
-        runs = item.get("runs") if isinstance(item.get("runs"), dict) else {}
-        item_changed = False
-        for run in runs.values():
-            if not isinstance(run, dict) or run.get("status") != "running":
-                continue
-            next_status = status
-            if status == "paused" and not run.get("sessionId"):
-                next_status = "paused_unresumable"
-            run["status"] = next_status
-            run[f"{status}At"] = now
-            item_changed = True
-            changed += 1
-        if item.get("status") == "running" or item_changed:
-            item["status"] = status if status != "paused" or any(isinstance(run, dict) and run.get("status") == "paused" for run in runs.values()) else "paused_unresumable"
-            item[f"{status}At"] = now
-    data.setdefault("control", {})
-    data["control"].update({"status": status, "updatedAt": now})
-    data["updatedAt"] = now
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    return changed
+    return update_json_state_file(path, update)
 
 
 def select_paused_work_units(manifest: dict[str, Any], state: dict[str, Any]) -> list[dict[str, Any]]:
