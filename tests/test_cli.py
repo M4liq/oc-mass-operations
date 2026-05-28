@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -121,6 +122,88 @@ class ValidationTests(OcmoTestCase):
         manifest = self.load()
 
         cli.validate_manifest(manifest, self.manifest_path)
+
+    def test_manifest_parameters_resolve_before_validation(self) -> None:
+        self.manifest_path.write_text(
+            f"""schema: ocmo/v1
+params:
+  title: Default
+operation:
+  id: test-op
+  workspace: "{{{{params.workspace}}}}"
+runner:
+  command: opencode
+  agent: build
+queue:
+  concurrency: "{{{{params.concurrency}}}}"
+policy:
+  worktree: single
+prompt:
+  template: {self.prompt.as_posix()}
+state:
+  path: "{{{{params.statePath}}}}"
+workUnits:
+  - id: "1"
+    title: "{{{{params.title}}}}"
+    payload:
+      repo: "{{{{params.workspace}}}}"
+      exactCount: "{{{{params.concurrency}}}}"
+""",
+            encoding="utf-8",
+        )
+
+        manifest = cli.load_manifest(
+            self.manifest_path,
+            {
+                "workspace": self.workspace.as_posix(),
+                "statePath": (self.root / "state.json").as_posix(),
+                "concurrency": 2,
+            },
+        )
+
+        cli.validate_manifest(manifest, self.manifest_path, allow_shared_worktree_concurrency=True)
+        self.assertEqual(manifest["operation"]["workspace"], self.workspace.as_posix())
+        self.assertEqual(manifest["queue"]["concurrency"], 2)
+        self.assertEqual(manifest["workUnits"][0]["title"], "Default")
+        self.assertEqual(manifest["workUnits"][0]["payload"]["exactCount"], 2)
+
+    def test_missing_manifest_parameter_fails_clearly(self) -> None:
+        self.manifest_path.write_text(
+            """schema: ocmo/v1
+operation:
+  id: test-op
+  workspace: "{{params.workspace}}"
+runner:
+  command: opencode
+queue:
+  concurrency: 1
+prompt:
+  template: prompt.md
+workUnits:
+  - id: "1"
+""",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(cli.OcmoError, "unresolved parameter: params.workspace"):
+            cli.load_manifest(self.manifest_path)
+
+    def test_command_params_json_preserves_types(self) -> None:
+        args = mock.Mock(params=[], params_file=None, params_json='{"count": 2, "enabled": true, "items": ["a"]}')
+
+        self.assertEqual(cli.command_params(args), {"count": 2, "enabled": True, "items": ["a"]})
+
+    def test_invalid_params_file_reports_cli_error(self) -> None:
+        self.write_manifest()
+        params_file = self.root / "bad-params.yaml"
+        params_file.write_text("name: [", encoding="utf-8")
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            code = cli.main(["operation", "validate", str(self.manifest_path), "--params-file", str(params_file)])
+
+        self.assertEqual(code, 2)
+        self.assertIn("invalid params file yaml", stderr.getvalue())
 
     def test_missing_workspace_fails_validation(self) -> None:
         manifest = self.load()
@@ -655,6 +738,71 @@ class SelectionAndRenderingTests(OcmoTestCase):
 
 
 class RunManifestTests(OcmoTestCase):
+    def test_operation_render_accepts_params_file_and_cli_overrides(self) -> None:
+        params_file = self.root / "params.yaml"
+        params_file.write_text(
+            f"""workspace: {self.workspace.as_posix()}
+statePath: {(self.root / 'state.json').as_posix()}
+name: FromFile
+""",
+            encoding="utf-8",
+        )
+        self.prompt.write_text("Workspace $workspace payload $payload_json", encoding="utf-8")
+        self.manifest_path.write_text(
+            f"""schema: ocmo/v1
+operation:
+  id: test-op
+  workspace: "{{{{params.workspace}}}}"
+runner:
+  command: opencode
+  agent: build
+queue:
+  concurrency: 1
+policy:
+  worktree: single
+prompt:
+  template: {self.prompt.as_posix()}
+state:
+  path: "{{{{params.statePath}}}}"
+workUnits:
+  - id: "1"
+    payload:
+      name: "{{{{params.name}}}}"
+""",
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            code = cli.main(["operation", "render", str(self.manifest_path), "--params-file", str(params_file), "--param", "name=FromCli"])
+
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertIn(self.workspace.as_posix(), output)
+        self.assertIn('"name": "FromCli"', output)
+
+    def test_detached_run_preserves_params_in_command_and_metadata(self) -> None:
+        self.write_manifest()
+        registry = self.root / "registry"
+        captured = {}
+
+        class FakeProcess:
+            pid = 12345
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            return FakeProcess()
+
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.detached_run_id", return_value="ocmo-param"), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, False, detach=True, params={"repoRoot": "D:/repo"}))
+
+        self.assertEqual(code, 0)
+        self.assertIn("--params-json", captured["command"])
+        params_json = captured["command"][captured["command"].index("--params-json") + 1]
+        self.assertEqual(json.loads(params_json), {"repoRoot": "D:/repo"})
+        metadata = json.loads((registry / "ocmo-param.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["params"], {"repoRoot": "D:/repo"})
+
     def test_dry_run_prints_each_sequential_run_without_state_or_subprocess(self) -> None:
         impl_prompt = self.root / "impl.md"
         review_prompt = self.root / "review.md"
@@ -1196,6 +1344,29 @@ class RunManifestTests(OcmoTestCase):
         self.assertEqual(metadata["timeoutSeconds"], 9)
         self.assertIn("status: ocmo operation status --run-id ocmo-test", stdout.getvalue())
 
+    def test_detached_run_preserves_runtime_params(self) -> None:
+        self.write_manifest()
+        registry = self.root / "registry"
+
+        class FakeProcess:
+            pid = 12345
+
+        captured = {}
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            return FakeProcess()
+
+        with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), mock.patch("ocmo.cli.detached_run_id", return_value="ocmo-param"), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, False, detach=True, params={"repoRoot": "D:/repo", "projectName": "PerfectGym", "exactCount": 2, "enabled": True}))
+
+        self.assertEqual(code, 0)
+        self.assertIn("--params-json", captured["command"])
+        params_json = captured["command"][captured["command"].index("--params-json") + 1]
+        self.assertEqual(json.loads(params_json), {"repoRoot": "D:/repo", "projectName": "PerfectGym", "exactCount": 2, "enabled": True})
+        metadata = json.loads((registry / "ocmo-param.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["params"], {"repoRoot": "D:/repo", "projectName": "PerfectGym", "exactCount": 2, "enabled": True})
+
     def test_list_shows_detached_runs_and_status_shows_operation_table(self) -> None:
         self.write_manifest()
         registry = self.root / "registry"
@@ -1311,6 +1482,51 @@ class RunManifestTests(OcmoTestCase):
         self.assertIn("running-op active kind=operation", output)
         self.assertIn("completed-op inactive kind=operation", output)
         self.assertIn("elapsed=03:00", output)
+
+    def test_operation_list_discovers_parameterized_generated_operations(self) -> None:
+        operation_dir = self.root / ".ocmo" / "param-op"
+        operation_dir.mkdir(parents=True)
+        prompt = operation_dir / "prompt.md"
+        prompt.write_text("Item $work_unit_id", encoding="utf-8")
+        (operation_dir / "manifest.yaml").write_text(
+            """schema: ocmo/v1
+operation:
+  id: param-op
+  workspace: "{{params.workspace}}"
+runner:
+  command: opencode
+  agent: build
+queue:
+  concurrency: 1
+prompt:
+  template: prompt.md
+state:
+  path: state.json
+workUnits:
+  - id: "1"
+""",
+            encoding="utf-8",
+        )
+        (operation_dir / "state.json").write_text(
+            json.dumps({"params": {"workspace": self.workspace.as_posix()}, "updatedAt": "now", "workUnits": {"1": {"status": "running"}}}),
+            encoding="utf-8",
+        )
+
+        old_cwd = Path.cwd()
+        try:
+            os.chdir(self.root)
+            registry = self.root / "registry"
+            registry.mkdir()
+            stdout = io.StringIO()
+            with mock.patch.dict("os.environ", {"OCMO_RUN_REGISTRY": str(registry)}), contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main(["operation", "list"]), 0)
+                self.assertEqual(cli.main(["operation", "status", "--active-or-latest", "--once"]), 0)
+        finally:
+            os.chdir(old_cwd)
+
+        output = stdout.getvalue()
+        self.assertIn("param-op active kind=operation", output)
+        self.assertIn("OC Mass Operations: param-op", output)
 
     def test_erased_operation_is_hidden_from_list_all(self) -> None:
         generated_dir = self.root / ".ocmo" / "erased-op"
@@ -3505,6 +3721,101 @@ steps:
         self.assertIn("ocmo operation run", output)
         self.assertNotIn("--select", output)
 
+    def test_workflow_passes_params_to_step_operations(self) -> None:
+        first_dir = self.root / "first"
+        first_dir.mkdir()
+        prompt = first_dir / "prompt.md"
+        prompt.write_text("Item $work_unit_id", encoding="utf-8")
+        first = first_dir / "manifest.yaml"
+        first.write_text(
+            f"""schema: ocmo/v1
+operation:
+  id: first
+  workspace: "{{{{params.workspace}}}}"
+runner:
+  command: opencode
+  agent: build
+queue:
+  concurrency: 1
+policy:
+  worktree: single
+prompt:
+  template: {prompt.as_posix()}
+state:
+  path: state.json
+workUnits:
+  - id: "1"
+""",
+            encoding="utf-8",
+        )
+        workflow = self.root / "workflow.yaml"
+        workflow.write_text(
+            f"""schema: ocmo-workflow/v1
+params:
+  workspace: {self.workspace.as_posix()}
+workflow:
+  id: test-workflow
+state:
+  path: workflow-state.json
+steps:
+  - id: first
+    manifest: "{{{{params.firstManifest}}}}"
+""",
+            encoding="utf-8",
+        )
+        calls = []
+
+        with mock.patch("ocmo.cli.run_manifest", side_effect=lambda options: calls.append(options) or 0), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(["workflow", "run", str(workflow), "--param", f"firstManifest={first.as_posix()}", "--yes", "--ui", "plain"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0].manifest_path, first)
+        self.assertEqual(calls[0].params["workspace"], self.workspace.as_posix())
+        self.assertEqual(calls[0].params["firstManifest"], first.as_posix())
+
+    def test_workflow_parameters_resolve_step_manifests_and_operations(self) -> None:
+        manifest = self.root / "param-op.yaml"
+        manifest.write_text(
+            f"""schema: ocmo/v1
+operation:
+  id: param-op
+  workspace: "{{{{params.workspace}}}}"
+runner:
+  command: opencode
+  agent: build
+queue:
+  concurrency: 1
+prompt:
+  template: {self.prompt.as_posix()}
+state:
+  path: state.json
+workUnits:
+  - id: "1"
+""",
+            encoding="utf-8",
+        )
+        workflow = self.root / "param-workflow.yaml"
+        workflow.write_text(
+            """schema: ocmo-workflow/v1
+workflow:
+  id: param-workflow
+state:
+  path: workflow-state.json
+steps:
+  - id: first
+    manifest: "{{params.manifestPath}}"
+""",
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "validate", str(workflow), "--param", f"manifestPath={manifest.as_posix()}", "--param", f"workspace={self.workspace.as_posix()}"]), 0)
+            self.assertEqual(cli.main(["workflow", "run", str(workflow), "--dry-run", "--param", f"manifestPath={manifest.as_posix()}", "--param", f"workspace={self.workspace.as_posix()}"]), 0)
+
+        self.assertIn("valid:", stdout.getvalue())
+        self.assertIn(str(manifest), stdout.getvalue())
+
     def test_workflow_rejects_operation_overrides(self) -> None:
         for extra in ("defaults:\n  operationSelect: uncompleted\n", "defaults:\n  concurrency: 2\n", "defaults:\n  timeoutSeconds: 30\n", "defaults:\n  allowSharedWorktreeConcurrency: true\n"):
             workflow, _, _ = self.write_workflow(extra=extra)
@@ -4050,6 +4361,78 @@ steps:
         output = stdout.getvalue()
         self.assertIn("erased 2 operation(s)", output)
         self.assertIn("cleared workflow state", output)
+
+    def test_workflow_erase_wipes_nested_generated_step_runtime(self) -> None:
+        workflow_dir = self.root / ".ocmo" / "project-taxonomy"
+        workflow_dir.mkdir(parents=True)
+        step_manifests = []
+        for step_id in ("scan", "analyze"):
+            step_dir = workflow_dir / step_id
+            step_dir.mkdir()
+            prompt = step_dir / "prompt.md"
+            prompt.write_text("Item $work_unit_id", encoding="utf-8")
+            manifest = step_dir / "manifest.yaml"
+            manifest.write_text(
+                f"""schema: ocmo/v1
+operation:
+  id: project-taxonomy-{step_id}
+  workspace: {self.workspace.as_posix()}
+runner:
+  command: opencode
+  agent: build
+queue:
+  concurrency: 1
+prompt:
+  template: prompts/{step_id}.md
+state:
+  path: state.json
+workUnits:
+  - id: "1"
+""",
+                encoding="utf-8",
+            )
+            step_manifests.append(manifest)
+
+        workflow = workflow_dir / "workflow.yaml"
+        workflow.write_text(
+            """schema: ocmo-workflow/v1
+workflow:
+  id: project-taxonomy
+state:
+  path: state.json
+steps:
+  - id: scan
+    manifest: scan/manifest.yaml
+  - id: analyze
+    manifest: analyze/manifest.yaml
+""",
+            encoding="utf-8",
+        )
+        workflow_state = workflow_dir / "state.json"
+        workflow_state.write_text(json.dumps({"steps": {"scan": {"status": "completed"}}}), encoding="utf-8")
+        notes = workflow_dir / "prompts-notes.md"
+        notes.write_text("notes", encoding="utf-8")
+        runtime_paths = [self.seed_operation_runtime(manifest) for manifest in step_manifests]
+
+        stdout = io.StringIO()
+        with mock.patch("ocmo.cli.stop_operation_processes"), mock.patch("ocmo.cli.stop_workflow_processes"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(cli.main(["workflow", "erase", str(workflow), "--force"]), 0)
+
+        for paths in runtime_paths:
+            self.assertFalse(paths["state"].exists())
+            self.assertFalse(paths["outputs"].exists())
+            self.assertFalse(paths["artifacts"].exists())
+            self.assertFalse(paths["prompt_inputs"].exists())
+            self.assertFalse(paths["runs"].exists())
+        for manifest in step_manifests:
+            self.assertTrue(manifest.exists())
+            self.assertTrue((manifest.parent / "prompt.md").exists())
+        self.assertTrue(workflow.exists())
+        self.assertTrue(notes.exists())
+        self.assertFalse(workflow_state.exists())
+        output = stdout.getvalue()
+        self.assertIn("erased 2 operation(s)", output)
+        self.assertNotIn("skipped", output)
 
     def test_workflow_erase_hides_erased_workflow_from_list_all(self) -> None:
         workflow_dir = self.root / ".ocmo" / "erased-wf"

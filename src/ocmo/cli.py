@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import copy
 import io
 import os
 from importlib import resources
@@ -51,6 +52,10 @@ OCMO_SKILL_NAME = "ocmo"
 OLD_OCMO_SKILL_NAMES = ("ocmo-plan-grill",)
 OCMO_SKILL_RESOURCE = "resources/skill"
 OCMO_COMMAND_RESOURCE = "resources/commands"
+PARAM_PLACEHOLDER_RE = re.compile(r"\{\{\s*params\.([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}")
+PARAM_PLACEHOLDER_EXACT_RE = re.compile(r"^\s*\{\{\s*params\.([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}\s*$")
+PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
+RESOLVED_PARAMS_KEY = "__ocmoResolvedParams"
 
 
 class OcmoError(Exception):
@@ -75,6 +80,7 @@ class RunOptions:
     detach: bool = False
     resume: bool = False
     rerun: bool = False
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -87,6 +93,7 @@ class WorkflowOptions:
     detach: bool = False
     resume: bool = False
     rerun: bool = False
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -192,6 +199,9 @@ def main(argv: list[str] | None = None) -> int:
     erase_parser.add_argument("--run-id", help="Erase by detached run id")
     erase_parser.add_argument("--force", action="store_true", help="Required for non-interactive erase")
 
+    for operation_parameterized_parser in (run_parser, validate_parser, render_parser, status_parser, list_parser, pause_parser, resume_parser, rerun_parser, kill_parser, erase_parser):
+        add_parameter_arguments(operation_parameterized_parser)
+
     workflow_parser = subparsers.add_parser("workflow", help="Run operation manifests sequentially")
     workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_command", required=True)
 
@@ -247,6 +257,9 @@ def main(argv: list[str] | None = None) -> int:
     workflow_erase_parser.add_argument("--force", action="store_true", help="Required for non-interactive erase")
     workflow_erase_parser.add_argument("--keep-workflow-state", action="store_true", help="Erase per-step operations only; keep workflow state and detached records")
 
+    for workflow_parameterized_parser in (workflow_validate_parser, workflow_run_parser, workflow_status_parser, workflow_list_parser, workflow_pause_parser, workflow_resume_parser, workflow_rerun_parser, workflow_kill_parser, workflow_erase_parser):
+        add_parameter_arguments(workflow_parameterized_parser)
+
     skill_parser = subparsers.add_parser("skill", help="Manage the bundled OCMO opencode skill")
     skill_subparsers = skill_parser.add_subparsers(dest="skill_command", required=True)
     skill_install_parser = skill_subparsers.add_parser("install", help="Install the bundled opencode planning skill")
@@ -269,18 +282,21 @@ def main(argv: list[str] | None = None) -> int:
                     args.allow_shared_worktree_concurrency,
                     args.all,
                     args.detach,
+                    False,
+                    False,
+                    command_params(args),
                 )
             )
         if args.command == "operation" and args.operation_command == "validate":
             manifest_path = infer_manifest_path(args.manifest)
-            manifest = load_manifest(manifest_path)
+            manifest = load_manifest(manifest_path, command_params(args))
             validate_manifest(manifest, manifest_path)
             warn_shared_worktree_concurrency(manifest)
             print(f"valid: {manifest_path}")
             return 0
         if args.command == "operation" and args.operation_command == "render":
             manifest_path = infer_manifest_path(args.manifest)
-            manifest = load_manifest(manifest_path)
+            manifest = load_manifest(manifest_path, command_params(args))
             validate_manifest(manifest, manifest_path)
             warn_shared_worktree_concurrency(manifest)
             path = state_path(manifest, manifest_path)
@@ -357,6 +373,83 @@ def skill_command(args: argparse.Namespace) -> int:
         install_skill(force=args.force)
         return 0
     return 1  # pragma: no cover
+
+
+def add_parameter_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--param", dest="params", action="append", default=[], metavar="NAME=VALUE", help="Runtime manifest/workflow parameter; can be repeated")
+    parser.add_argument("--params-file", dest="params_file", type=Path, help="YAML or JSON file containing runtime parameters")
+    parser.add_argument("--params-json", dest="params_json", help=argparse.SUPPRESS)
+
+
+def command_params(args: argparse.Namespace, record: dict[str, Any] | None = None) -> dict[str, Any]:
+    params: dict[str, Any] = record_params(record)
+    params_json = getattr(args, "params_json", None)
+    if isinstance(params_json, str):
+        try:
+            loaded_json = json.loads(params_json)
+        except json.JSONDecodeError as exc:
+            raise OcmoError(f"invalid params json: {exc}") from exc
+        if not isinstance(loaded_json, dict):
+            raise OcmoError("params json must contain an object")
+        params.update(validate_parameter_mapping(loaded_json, "params json"))
+    params_file = getattr(args, "params_file", None)
+    if isinstance(params_file, Path):
+        if not params_file.exists():
+            raise OcmoError(f"params file not found: {params_file}")
+        try:
+            loaded = yaml.safe_load(params_file.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise OcmoError(f"could not read params file: {exc}") from exc
+        except yaml.YAMLError as exc:
+            raise OcmoError(f"invalid params file yaml: {exc}") from exc
+        if loaded is None:
+            loaded = {}
+        if not isinstance(loaded, dict):
+            raise OcmoError("params file must contain a mapping")
+        params.update(validate_parameter_mapping(loaded, "params file"))
+    for raw in getattr(args, "params", []) or []:
+        if not isinstance(raw, str) or "=" not in raw:
+            raise OcmoError("--param must use NAME=VALUE")
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise OcmoError("--param name must be non-empty")
+        validate_parameter_name(key, "--param name")
+        params[key] = value
+    return params
+
+
+def validate_parameter_mapping(values: dict[Any, Any], source: str) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    for key, value in values.items():
+        name = str(key)
+        validate_parameter_name(name, f"{source} parameter name")
+        params[name] = value
+    return params
+
+
+def validate_parameter_name(name: str, source: str) -> None:
+    if not PARAM_NAME_RE.fullmatch(name):
+        raise OcmoError(f"{source} must match {PARAM_NAME_RE.pattern}")
+
+
+def record_params(record: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        return {}
+    return stored_params(record)
+
+
+def stored_params(data: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    params = data.get("params")
+    return dict(params) if isinstance(params, dict) else {}
+
+
+def parameter_arguments(params: dict[str, Any]) -> list[str]:
+    if not params:
+        return []
+    return ["--params-json", json.dumps(params, ensure_ascii=False)]
 
 
 def install_skill(force: bool = False) -> Path:
@@ -496,14 +589,14 @@ def bundled_command_dir() -> Path:
     return Path("__missing_ocmo_commands__")
 
 
-def load_manifest(path: Path) -> dict[str, Any]:
+def load_manifest(path: Path, params: dict[str, Any] | None = None) -> dict[str, Any]:
     if not path.exists():
         raise OcmoError(f"manifest not found: {path}")
     with path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
     if not isinstance(data, dict):
         raise OcmoError("manifest must be a YAML mapping")
-    return data
+    return resolve_parameterized_document(data, params or {}, "manifest")
 
 
 def load_manifest_text(text: str) -> dict[str, Any]:
@@ -511,6 +604,67 @@ def load_manifest_text(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise OcmoError("manifest must be a YAML mapping")
     return data
+
+
+def resolve_parameterized_document(data: dict[str, Any], runtime_params: dict[str, Any], kind: str) -> dict[str, Any]:
+    defaults = data.get("params", {})
+    if defaults is None:
+        defaults = {}
+    if not isinstance(defaults, dict):
+        raise OcmoError(f"{kind}.params must be a mapping")
+    params = validate_parameter_mapping(defaults, f"{kind}.params")
+    params.update(runtime_params)
+    effective_params = resolve_parameter_values(params)
+    resolved = resolve_parameter_placeholders(copy.deepcopy(data), effective_params)
+    if isinstance(resolved, dict):
+        resolved[RESOLVED_PARAMS_KEY] = effective_params
+        return resolved
+    raise OcmoError(f"{kind} must be a YAML mapping")  # pragma: no cover
+
+
+def resolve_parameter_values(params: dict[str, Any]) -> dict[str, Any]:
+    current = copy.deepcopy(params)
+    for _ in range(10):
+        resolved = resolve_parameter_placeholders(copy.deepcopy(current), current)
+        if resolved == current:
+            return resolved
+        current = resolved
+    return current
+
+
+def resolve_parameter_placeholders(value: Any, params: dict[str, Any]) -> Any:
+    if isinstance(value, dict):
+        return {key: resolve_parameter_placeholders(item, params) for key, item in value.items()}
+    if isinstance(value, list):
+        return [resolve_parameter_placeholders(item, params) for item in value]
+    if isinstance(value, str):
+        return resolve_parameter_string(value, params)
+    return value
+
+
+def resolve_parameter_string(value: str, params: dict[str, Any]) -> Any:
+    exact = PARAM_PLACEHOLDER_EXACT_RE.fullmatch(value)
+    if exact:
+        return parameter_value(params, exact.group(1))
+
+    def replace(match: re.Match[str]) -> str:
+        return format_placeholder_value(parameter_value(params, match.group(1)))
+
+    return PARAM_PLACEHOLDER_RE.sub(replace, value)
+
+
+def parameter_value(params: dict[str, Any], name: str) -> Any:
+    if name not in params:
+        value = resolve_brace_placeholder(name, {"params": params})
+        if value is MISSING_PLACEHOLDER:
+            raise OcmoError(f"unresolved parameter: params.{name}")
+        return value
+    return params[name]
+
+
+def resolved_params(data: dict[str, Any]) -> dict[str, Any]:
+    value = data.get(RESOLVED_PARAMS_KEY)
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def validate_manifest(manifest: dict[str, Any], manifest_path: Path, allow_shared_worktree_concurrency: bool = False) -> None:
@@ -1049,7 +1203,7 @@ def select_rerun_work_units(manifest: dict[str, Any], state: dict[str, Any], sel
     return selected
 
 
-def load_workflow(path: Path) -> dict[str, Any]:
+def load_workflow(path: Path, params: dict[str, Any] | None = None) -> dict[str, Any]:
     if not path.exists():
         raise OcmoError(f"workflow not found: {path}")
     try:
@@ -1058,7 +1212,7 @@ def load_workflow(path: Path) -> dict[str, Any]:
         raise OcmoError(f"invalid workflow yaml: {exc}") from exc
     if not isinstance(data, dict):
         raise OcmoError("workflow must be a mapping")
-    return data
+    return resolve_parameterized_document(data, params or {}, "workflow")
 
 
 def validate_workflow(workflow: dict[str, Any], workflow_path: Path) -> None:
@@ -1087,7 +1241,7 @@ def validate_workflow(workflow: dict[str, Any], workflow_path: Path) -> None:
         require_string(step, "manifest")
         validate_workflow_options(step, f"steps[{index}]")
         manifest_path = workflow_step_manifest_path(workflow_path, step)
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest(manifest_path, resolved_params(workflow))
         validate_manifest(manifest, manifest_path)
 
 
@@ -2038,7 +2192,7 @@ def opencode_capture_env() -> dict[str, str]:
 
 
 def run_manifest(options: RunOptions) -> int:
-    manifest = load_manifest(options.manifest_path)
+    manifest = load_manifest(options.manifest_path, options.params)
     validate_manifest(manifest, options.manifest_path, options.allow_shared_worktree_concurrency)
     existing_state = read_json_file(state_path(manifest, options.manifest_path)) if state_path(manifest, options.manifest_path).exists() else {}
     if options.resume:
@@ -2181,6 +2335,7 @@ def start_detached_run(options: RunOptions, manifest: dict[str, Any], concurrenc
         "select": options.select,
         "concurrency": concurrency,
         "timeoutSeconds": timeout_seconds,
+        "params": options.params,
     }
     write_detached_metadata(local_dir / f"{run_id}.json", metadata)
     write_detached_metadata(global_detached_run_path(run_id), metadata)
@@ -2200,6 +2355,7 @@ def detached_child_command(options: RunOptions) -> list[str]:
         command += ["--concurrency", str(options.concurrency)]
     if options.timeout_seconds is not None:
         command += ["--timeout-seconds", str(options.timeout_seconds)]
+    command += parameter_arguments(options.params)
     command += ["--ui", "plain", "--yes"]
     if options.allow_shared_worktree_concurrency and not options.resume:
         command.append("--allow-shared-worktree-concurrency")
@@ -2282,7 +2438,7 @@ def list_runs(args: argparse.Namespace) -> int:
         print_detached_record(read_json_file(path), details=True)
         return 0
     if args.manifest:
-        print_manifest_detached_runs(infer_manifest_path(args.manifest), include_inactive=args.all)
+        print_manifest_detached_runs(infer_manifest_path(args.manifest), include_inactive=args.all, params=command_params(args))
         return 0
     records = detached_records(include_inactive=args.all, kind="operation")
     operations = discovered_operation_records(include_inactive=args.all, detached=records)
@@ -2316,10 +2472,11 @@ def status_operation(args: argparse.Namespace) -> int:
     interval = getattr(args, "interval", 1.0)
     if interval <= 0:
         raise OcmoError("--interval must be greater than zero")
+    params = command_params(args, record)
     if args.once:
-        print_operation_status(manifest_path, include_inactive=args.all, selected_record=record)
+        print_operation_status(manifest_path, include_inactive=args.all, selected_record=record, params=params)
         return 0
-    return watch_operation_status(manifest_path, include_inactive=args.all, selected_record=record, interval=interval)
+    return watch_operation_status(manifest_path, include_inactive=args.all, selected_record=record, interval=interval, params=params)
 
 
 def print_active_or_latest_operation_statuses(include_inactive: bool = False) -> int:
@@ -2340,13 +2497,13 @@ def print_active_or_latest_operation_statuses(include_inactive: bool = False) ->
     for index, target in enumerate(targets):
         if index:
             print()
-        print_operation_status(target["manifestPath"], include_inactive=include_inactive, selected_record=target.get("record"))
+        print_operation_status(target["manifestPath"], include_inactive=include_inactive, selected_record=target.get("record"), params=target.get("params"))
     return 0
 
 
 def pause_operation(args: argparse.Namespace) -> int:
     manifest_path, record = control_manifest_and_record(args)
-    manifest = load_manifest(manifest_path)
+    manifest = load_manifest(manifest_path, command_params(args, record))
     path = state_path(manifest, manifest_path)
     state = read_json_file(path) if path.exists() else {}
     changed = mark_active_runs(path, "paused")
@@ -2357,7 +2514,7 @@ def pause_operation(args: argparse.Namespace) -> int:
 
 def kill_operation(args: argparse.Namespace) -> int:
     manifest_path, record = control_manifest_and_record(args)
-    manifest = load_manifest(manifest_path)
+    manifest = load_manifest(manifest_path, command_params(args, record))
     path = state_path(manifest, manifest_path)
     state = read_json_file(path) if path.exists() else {}
     if not args.force and sys.stdin.isatty():
@@ -2377,7 +2534,7 @@ def erase_operation(args: argparse.Namespace) -> int:
     manifest_path, record = control_manifest_and_record(args)
     if not is_generated_operation_manifest(manifest_path):
         raise OcmoError("erase only removes generated .ocmo/<operation>/manifest.yaml operation directories")
-    manifest = load_manifest(manifest_path)
+    manifest = load_manifest(manifest_path, command_params(args, record))
     if not args.force and sys.stdin.isatty():
         answer = input(f"Erase runtime data for generated operation {manifest_path.parent}? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
@@ -2425,7 +2582,7 @@ def erase_operation_runtime_path(path: Path, operation_dir: Path) -> None:
 
 def resume_operation(args: argparse.Namespace) -> int:
     manifest_path = infer_manifest_path(args.manifest)
-    return run_manifest(RunOptions(manifest_path, None, None, None, False, args.yes, args.ui, False, False, args.detach, True))
+    return run_manifest(RunOptions(manifest_path, None, None, None, False, args.yes, args.ui, False, False, args.detach, True, False, command_params(args)))
 
 
 def rerun_operation(args: argparse.Namespace) -> int:
@@ -2444,20 +2601,22 @@ def rerun_operation(args: argparse.Namespace) -> int:
             args.detach,
             False,
             True,
+            command_params(args),
         )
     )
 
 
 def workflow_command(args: argparse.Namespace) -> int:
     command = args.workflow_command
+    params = command_params(args)
     if command == "validate":
         workflow_path = infer_workflow_path(args.workflow)
-        workflow = load_workflow(workflow_path)
+        workflow = load_workflow(workflow_path, params)
         validate_workflow(workflow, workflow_path)
         print(f"valid: {workflow_path}")
         return 0
     if command == "run":
-        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, args.dry_run, args.yes, args.ui, args.detach))
+        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, args.dry_run, args.yes, args.ui, args.detach, False, False, params))
     if command == "status":
         return status_workflow(args)
     if command == "list":
@@ -2465,9 +2624,9 @@ def workflow_command(args: argparse.Namespace) -> int:
     if command == "pause":
         return pause_workflow(args)
     if command == "resume":
-        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, False, args.yes, args.ui, args.detach, True))
+        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, False, args.yes, args.ui, args.detach, True, False, params))
     if command == "rerun":
-        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, False, args.yes, args.ui, args.detach, False, True))
+        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, False, args.yes, args.ui, args.detach, False, True, params))
     if command == "kill":
         return kill_workflow(args)
     if command == "erase":
@@ -2476,7 +2635,7 @@ def workflow_command(args: argparse.Namespace) -> int:
 
 
 def run_workflow(options: WorkflowOptions) -> int:
-    workflow = load_workflow(options.workflow_path)
+    workflow = load_workflow(options.workflow_path, options.params)
     validate_workflow(workflow, options.workflow_path)
     state_path_value = workflow_state_path(workflow, options.workflow_path)
     existing_state = read_json_file(state_path_value) if state_path_value.exists() else {}
@@ -2511,7 +2670,7 @@ def run_workflow(options: WorkflowOptions) -> int:
                 return 1
     except KeyboardInterrupt:
         print("ocmo: interrupted; pausing active workflow step", file=sys.stderr)
-        pause_workflow_path(options.workflow_path)
+        pause_workflow_path(options.workflow_path, params=resolved_params(workflow))
         return 130
     state.finish("completed" if all(code == 0 for code in results) else "failed")
     return 0 if all(code == 0 for code in results) else 1
@@ -2519,8 +2678,9 @@ def run_workflow(options: WorkflowOptions) -> int:
 
 def run_workflow_step(workflow: dict[str, Any], workflow_path: Path, step: dict[str, Any], state: "WorkflowStateStore", options: WorkflowOptions) -> int:
     step_id = str(step["id"])
+    workflow_params = resolved_params(workflow)
     manifest_path = workflow_step_manifest_path(workflow_path, step)
-    manifest = load_manifest(manifest_path)
+    manifest = load_manifest(manifest_path, workflow_params)
     operation_state_path = state_path(manifest, manifest_path)
     operation_id = str(manifest["operation"]["id"])
     state.mark_step(
@@ -2547,6 +2707,7 @@ def run_workflow_step(workflow: dict[str, Any], workflow_path: Path, step: dict[
         False,
         resume_step,
         options.rerun,
+        workflow_params,
     )
     code = run_manifest(run_options)
     status = "completed" if code == 0 else workflow_failed_step_status(operation_state_path)
@@ -2605,6 +2766,7 @@ def start_detached_workflow(options: WorkflowOptions, workflow: dict[str, Any]) 
         "logPath": str(log_path.resolve()),
         "command": command,
         "select": options.select,
+        "params": options.params,
     }
     write_detached_metadata(local_dir / f"{run_id}.json", metadata)
     write_detached_metadata(global_detached_run_path(run_id), metadata)
@@ -2620,6 +2782,7 @@ def detached_workflow_child_command(options: WorkflowOptions) -> list[str]:
     command = [sys.executable, "-m", "ocmo", "workflow", subcommand, str(options.workflow_path.resolve())]
     if options.select:
         command += ["--select", options.select]
+    command += parameter_arguments(options.params)
     command += ["--ui", "plain", "--yes"]
     return command
 
@@ -2650,10 +2813,11 @@ def status_workflow(args: argparse.Namespace) -> int:
     interval = getattr(args, "interval", 1.0)
     if interval <= 0:
         raise OcmoError("--interval must be greater than zero")
+    params = command_params(args, record)
     if args.once:
-        print_workflow_status(workflow_path, include_inactive=args.all, selected_record=record)
+        print_workflow_status(workflow_path, include_inactive=args.all, selected_record=record, params=params)
         return 0
-    return watch_workflow_status(workflow_path, include_inactive=args.all, selected_record=record, interval=interval)
+    return watch_workflow_status(workflow_path, include_inactive=args.all, selected_record=record, interval=interval, params=params)
 
 
 def print_active_or_latest_workflow_statuses(include_inactive: bool = False) -> int:
@@ -2674,7 +2838,7 @@ def print_active_or_latest_workflow_statuses(include_inactive: bool = False) -> 
     for index, target in enumerate(targets):
         if index:
             print()
-        print_workflow_status(target["workflowPath"], include_inactive=include_inactive, selected_record=target.get("record"))
+        print_workflow_status(target["workflowPath"], include_inactive=include_inactive, selected_record=target.get("record"), params=target.get("params"))
     return 0
 
 
@@ -2689,7 +2853,7 @@ def list_workflow_runs(args: argparse.Namespace) -> int:
         print_detached_record(record, details=True)
         return 0
     if args.workflow:
-        print_workflow_detached_runs(infer_workflow_path(args.workflow), include_inactive=args.all)
+        print_workflow_detached_runs(infer_workflow_path(args.workflow), include_inactive=args.all, params=command_params(args))
         return 0
     records = detached_records(include_inactive=args.all, kind="workflow")
     workflows = discovered_workflow_records(include_inactive=args.all, detached=records)
@@ -2706,33 +2870,35 @@ def list_workflow_runs(args: argparse.Namespace) -> int:
 
 def pause_workflow(args: argparse.Namespace) -> int:
     workflow_path, record = control_workflow_and_record(args)
-    changed = pause_workflow_path(workflow_path, record)
-    workflow = load_workflow(workflow_path)
+    params = command_params(args, record)
+    changed = pause_workflow_path(workflow_path, record, params)
+    workflow = load_workflow(workflow_path, params)
     print(f"paused: {workflow['workflow']['id']} ({changed} step(s))")
     return 0
 
 
 def kill_workflow(args: argparse.Namespace) -> int:
     workflow_path, record = control_workflow_and_record(args)
-    workflow = load_workflow(workflow_path)
+    params = command_params(args, record)
+    workflow = load_workflow(workflow_path, params)
     if not args.force and sys.stdin.isatty():
         answer = input(f"Kill workflow {workflow['workflow']['id']}? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled.")
             return 1
-    changed = mark_active_workflow_steps(workflow_path, "killed")
-    stop_workflow_processes(workflow_path, record, "killed")
+    changed = mark_active_workflow_steps(workflow_path, "killed", params)
+    stop_workflow_processes(workflow_path, record, "killed", params)
     print(f"killed: {workflow['workflow']['id']} ({changed} step(s))")
     return 0
 
 
 def erase_workflow(args: argparse.Namespace) -> int:
     workflow_path = infer_workflow_path(args.workflow)
-    return erase_workflow_path(workflow_path, args.force, args.keep_workflow_state)
+    return erase_workflow_path(workflow_path, args.force, args.keep_workflow_state, command_params(args))
 
 
-def erase_workflow_path(workflow_path: Path, force: bool, keep_workflow_state: bool) -> int:
-    workflow = load_workflow(workflow_path)
+def erase_workflow_path(workflow_path: Path, force: bool, keep_workflow_state: bool, params: dict[str, Any] | None = None) -> int:
+    workflow = load_workflow(workflow_path, params)
     if workflow.get("schema") != "ocmo-workflow/v1":
         raise OcmoError("workflow schema must be ocmo-workflow/v1")
     metadata = require_mapping(workflow, "workflow")
@@ -2747,7 +2913,7 @@ def erase_workflow_path(workflow_path: Path, force: bool, keep_workflow_state: b
             return 1
     if not force and not sys.stdin.isatty():
         raise OcmoError("erase requires --force when not interactive")
-    stop_workflow_processes(workflow_path, None, "killed")
+    stop_workflow_processes(workflow_path, None, "killed", params)
     erased = 0
     skipped_missing = 0
     skipped_non_generated = 0
@@ -2758,11 +2924,11 @@ def erase_workflow_path(workflow_path: Path, force: bool, keep_workflow_state: b
             print(f"skip {step_id}: manifest not found ({manifest_path})")
             skipped_missing += 1
             continue
-        if not is_generated_operation_manifest(manifest_path):
-            print(f"skip {step_id}: not a generated .ocmo/<operation>/manifest.yaml ({manifest_path})")
+        if not is_generated_workflow_operation_manifest(workflow_path, manifest_path):
+            print(f"skip {step_id}: not a generated workflow operation manifest ({manifest_path})")
             skipped_non_generated += 1
             continue
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest(manifest_path, resolved_params(workflow))
         op_state_path = state_path(manifest, manifest_path)
         op_state = read_json_file(op_state_path) if op_state_path.exists() else {}
         stop_operation_processes(manifest_path, op_state)
@@ -2799,9 +2965,10 @@ def remove_workflow_detached_records(workflow_path: Path) -> None:
                 pass
 
 
-def pause_workflow_path(workflow_path: Path, record: dict[str, Any] | None = None) -> int:
-    changed = mark_active_workflow_steps(workflow_path, "paused")
-    stop_workflow_processes(workflow_path, record, "paused")
+def pause_workflow_path(workflow_path: Path, record: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> int:
+    effective_params = params or record_params(record)
+    changed = mark_active_workflow_steps(workflow_path, "paused", effective_params)
+    stop_workflow_processes(workflow_path, record, "paused", effective_params)
     return changed
 
 
@@ -2820,14 +2987,14 @@ def control_workflow_and_record(args: argparse.Namespace) -> tuple[Path, dict[st
     return infer_workflow_path(args.workflow), None
 
 
-def stop_workflow_processes(workflow_path: Path, selected_record: dict[str, Any] | None = None, operation_status: str = "paused") -> None:
+def stop_workflow_processes(workflow_path: Path, selected_record: dict[str, Any] | None = None, operation_status: str = "paused", params: dict[str, Any] | None = None) -> None:
     if selected_record and isinstance(selected_record.get("pid"), int):
         terminate_process_tree(selected_record["pid"], force=True)
     for record in related_workflow_detached_records(workflow_path, include_inactive=True):
         pid = record.get("pid")
         if isinstance(pid, int):
             terminate_process_tree(pid, force=True)
-    workflow = load_workflow(workflow_path)
+    workflow = load_workflow(workflow_path, params or record_params(selected_record))
     state_file = workflow_state_path(workflow, workflow_path)
     state = read_json_file(state_file) if state_file.exists() else {}
     steps = state.get("steps") if isinstance(state.get("steps"), dict) else {}
@@ -2837,14 +3004,14 @@ def stop_workflow_processes(workflow_path: Path, selected_record: dict[str, Any]
         manifest_value = step_state.get("manifestPath")
         if isinstance(manifest_value, str):
             manifest_path = Path(manifest_value)
-            manifest = load_manifest(manifest_path)
+            manifest = load_manifest(manifest_path, resolved_params(workflow))
             operation_state = read_json_file(state_path(manifest, manifest_path)) if state_path(manifest, manifest_path).exists() else {}
             mark_active_runs(state_path(manifest, manifest_path), operation_status)
             stop_operation_processes(manifest_path, operation_state)
 
 
-def mark_active_workflow_steps(workflow_path: Path, status: str) -> int:
-    workflow = load_workflow(workflow_path)
+def mark_active_workflow_steps(workflow_path: Path, status: str, params: dict[str, Any] | None = None) -> int:
+    workflow = load_workflow(workflow_path, params)
     path = workflow_state_path(workflow, workflow_path)
     if not path.exists():
         return 0
@@ -2989,6 +3156,18 @@ def is_generated_operation_manifest(manifest_path: Path) -> bool:
     return manifest_path.name == "manifest.yaml" and len(parts) >= 3 and parts[-3] == ".ocmo"
 
 
+def is_generated_workflow_operation_manifest(workflow_path: Path, manifest_path: Path) -> bool:
+    if is_generated_operation_manifest(manifest_path):
+        return True
+    workflow = workflow_path.resolve()
+    workflow_parts = workflow.parts
+    if workflow.name != "workflow.yaml" or len(workflow_parts) < 3 or workflow_parts[-3] != ".ocmo":
+        return False
+    manifest = manifest_path.resolve()
+    workflow_dir = workflow.parent
+    return manifest.name == "manifest.yaml" and manifest.parent != workflow_dir and manifest.is_relative_to(workflow_dir)
+
+
 def remove_detached_records(manifest_path: Path) -> None:
     for record in related_detached_records(manifest_path, include_inactive=True):
         run_id = record.get("runId")
@@ -3053,8 +3232,8 @@ def detached_record_is_erased(record: dict[str, Any]) -> bool:
     return False
 
 
-def print_manifest_detached_runs(manifest_path: Path, include_inactive: bool) -> None:
-    manifest = load_manifest(manifest_path)
+def print_manifest_detached_runs(manifest_path: Path, include_inactive: bool, params: dict[str, Any] | None = None) -> None:
+    manifest = load_manifest(manifest_path, params)
     path = state_path(manifest, manifest_path)
     state = read_json_file(path) if path.exists() else {}
     print(f"manifest: {manifest_path}")
@@ -3074,34 +3253,34 @@ def print_manifest_detached_runs(manifest_path: Path, include_inactive: bool) ->
             print_detached_record(record, details=False, prefix="  ")
 
 
-def print_operation_status(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> None:
-    print(render_operation_status(manifest_path, include_inactive, selected_record))
+def print_operation_status(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> None:
+    print(render_operation_status(manifest_path, include_inactive, selected_record, params))
 
 
-def render_operation_status(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> str:
+def render_operation_status(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> str:
     stdout = io.StringIO()
     with contextlib.redirect_stdout(stdout):
-        print_operation_status_snapshot(manifest_path, include_inactive, selected_record)
+        print_operation_status_snapshot(manifest_path, include_inactive, selected_record, params)
     return stdout.getvalue().rstrip("\n")
 
 
-def watch_operation_status(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float) -> int:
+def watch_operation_status(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float, params: dict[str, Any] | None = None) -> int:
     if sys.stdout.isatty():
         try:
             from rich.live import Live
         except ImportError:
-            return watch_operation_status_plain(manifest_path, include_inactive, selected_record, interval, clear_screen=True)
+            return watch_operation_status_plain(manifest_path, include_inactive, selected_record, interval, clear_screen=True, params=params)
         try:
-            with Live(render_operation_status(manifest_path, include_inactive, selected_record), refresh_per_second=max(1, int(1 / interval)), transient=False) as live:
+            with Live(render_operation_status(manifest_path, include_inactive, selected_record, params), refresh_per_second=max(1, int(1 / interval)), transient=False) as live:
                 while True:
                     time.sleep(interval)
-                    live.update(render_operation_status(manifest_path, include_inactive, selected_record))
+                    live.update(render_operation_status(manifest_path, include_inactive, selected_record, params))
         except KeyboardInterrupt:
             return 130
-    return watch_operation_status_plain(manifest_path, include_inactive, selected_record, interval, clear_screen=False)
+    return watch_operation_status_plain(manifest_path, include_inactive, selected_record, interval, clear_screen=False, params=params)
 
 
-def watch_operation_status_plain(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float, clear_screen: bool) -> int:
+def watch_operation_status_plain(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float, clear_screen: bool, params: dict[str, Any] | None = None) -> int:
     first = True
     try:
         while True:
@@ -3109,15 +3288,15 @@ def watch_operation_status_plain(manifest_path: Path, include_inactive: bool, se
                 print("\033[H\033[J", end="")
             elif not first:
                 print()
-            print(render_operation_status(manifest_path, include_inactive, selected_record), flush=True)
+            print(render_operation_status(manifest_path, include_inactive, selected_record, params), flush=True)
             first = False
             time.sleep(interval)
     except KeyboardInterrupt:
         return 130
 
 
-def print_operation_status_snapshot(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> None:
-    manifest = load_manifest(manifest_path)
+def print_operation_status_snapshot(manifest_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> None:
+    manifest = load_manifest(manifest_path, params)
     path = state_path(manifest, manifest_path)
     state = read_json_file(path) if path.exists() else {}
     related = [selected_record] if selected_record else related_detached_records(manifest_path, include_inactive)
@@ -3141,34 +3320,34 @@ def print_operation_status_snapshot(manifest_path: Path, include_inactive: bool,
     print_status_table(rows)
 
 
-def print_workflow_status(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> None:
-    print(render_workflow_status(workflow_path, include_inactive, selected_record))
+def print_workflow_status(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> None:
+    print(render_workflow_status(workflow_path, include_inactive, selected_record, params))
 
 
-def render_workflow_status(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> str:
+def render_workflow_status(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> str:
     stdout = io.StringIO()
     with contextlib.redirect_stdout(stdout):
-        print_workflow_status_snapshot(workflow_path, include_inactive, selected_record)
+        print_workflow_status_snapshot(workflow_path, include_inactive, selected_record, params)
     return stdout.getvalue().rstrip("\n")
 
 
-def watch_workflow_status(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float) -> int:
+def watch_workflow_status(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float, params: dict[str, Any] | None = None) -> int:
     if sys.stdout.isatty():
         try:
             from rich.live import Live
         except ImportError:
-            return watch_workflow_status_plain(workflow_path, include_inactive, selected_record, interval, clear_screen=True)
+            return watch_workflow_status_plain(workflow_path, include_inactive, selected_record, interval, clear_screen=True, params=params)
         try:
-            with Live(render_workflow_status(workflow_path, include_inactive, selected_record), refresh_per_second=max(1, int(1 / interval)), transient=False) as live:
+            with Live(render_workflow_status(workflow_path, include_inactive, selected_record, params), refresh_per_second=max(1, int(1 / interval)), transient=False) as live:
                 while True:
                     time.sleep(interval)
-                    live.update(render_workflow_status(workflow_path, include_inactive, selected_record))
+                    live.update(render_workflow_status(workflow_path, include_inactive, selected_record, params))
         except KeyboardInterrupt:
             return 130
-    return watch_workflow_status_plain(workflow_path, include_inactive, selected_record, interval, clear_screen=False)
+    return watch_workflow_status_plain(workflow_path, include_inactive, selected_record, interval, clear_screen=False, params=params)
 
 
-def watch_workflow_status_plain(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float, clear_screen: bool) -> int:
+def watch_workflow_status_plain(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None, interval: float, clear_screen: bool, params: dict[str, Any] | None = None) -> int:
     first = True
     try:
         while True:
@@ -3176,15 +3355,15 @@ def watch_workflow_status_plain(workflow_path: Path, include_inactive: bool, sel
                 print("\033[H\033[J", end="")
             elif not first:
                 print()
-            print(render_workflow_status(workflow_path, include_inactive, selected_record), flush=True)
+            print(render_workflow_status(workflow_path, include_inactive, selected_record, params), flush=True)
             first = False
             time.sleep(interval)
     except KeyboardInterrupt:
         return 130
 
 
-def print_workflow_status_snapshot(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None) -> None:
-    workflow = load_workflow(workflow_path)
+def print_workflow_status_snapshot(workflow_path: Path, include_inactive: bool, selected_record: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> None:
+    workflow = load_workflow(workflow_path, params)
     validate_workflow(workflow, workflow_path)
     path = workflow_state_path(workflow, workflow_path)
     state = read_json_file(path) if path.exists() else {}
@@ -3227,7 +3406,7 @@ def workflow_status_rows(workflow: dict[str, Any], workflow_path: Path, state: d
         detail = str(step.get("description") or "-")
         manifest_path_str = ""
         if manifest_path.exists():
-            manifest = load_manifest(manifest_path)
+            manifest = load_manifest(manifest_path, resolved_params(workflow))
             operation = str(manifest["operation"]["id"])
             manifest_path_str = str(manifest_path.resolve())
             op_state_path = state_path(manifest, manifest_path)
@@ -3263,15 +3442,15 @@ def workflow_usage(workflow: dict[str, Any], workflow_path: Path) -> dict[str, A
         manifest_path = workflow_step_manifest_path(workflow_path, step)
         if not manifest_path.exists():
             continue
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest(manifest_path, resolved_params(workflow))
         path = state_path(manifest, manifest_path)
         if path.exists():
             total = add_usage(total, state_usage(read_json_file(path)))
     return total
 
 
-def print_workflow_detached_runs(workflow_path: Path, include_inactive: bool) -> None:
-    workflow = load_workflow(workflow_path)
+def print_workflow_detached_runs(workflow_path: Path, include_inactive: bool, params: dict[str, Any] | None = None) -> None:
+    workflow = load_workflow(workflow_path, params)
     path = workflow_state_path(workflow, workflow_path)
     state = read_json_file(path) if path.exists() else {}
     print(f"workflow: {workflow_path}")
@@ -3322,17 +3501,31 @@ def discovered_operation_records(include_inactive: bool, detached: list[dict[str
             resolved = str(manifest_path.resolve())
             if resolved in detached_paths:
                 continue
-            manifest = load_manifest(manifest_path)
-            path = state_path(manifest, manifest_path)
-            if not path.exists():
-                continue
-            state = read_json_file(path)
+            manifest, path, state, params = load_manifest_with_persisted_params(manifest_path)
         except (OSError, json.JSONDecodeError, OcmoError):
             continue
         active = operation_state_is_active(state)
         if include_inactive or active:
-            records.append({"manifestPath": str(manifest_path), "statePath": str(path), "operationId": manifest["operation"]["id"], "active": active, "state": state})
+            records.append({"manifestPath": str(manifest_path), "statePath": str(path), "operationId": manifest["operation"]["id"], "active": active, "state": state, "params": params})
     return records
+
+
+def load_manifest_with_persisted_params(manifest_path: Path) -> tuple[dict[str, Any], Path, dict[str, Any], dict[str, Any]]:
+    fallback_state_path = manifest_path.parent / "state.json"
+    fallback_state = read_json_file(fallback_state_path) if fallback_state_path.exists() else {}
+    params = stored_params(fallback_state)
+    manifest = load_manifest(manifest_path, params)
+    path = state_path(manifest, manifest_path)
+    if not path.exists():
+        raise OcmoError(f"state not found: {path}")
+    state = read_json_file(path)
+    state_params = stored_params(state)
+    if state_params and state_params != params:
+        params = state_params
+        manifest = load_manifest(manifest_path, params)
+        path = state_path(manifest, manifest_path)
+        state = read_json_file(path) if path.exists() else state
+    return manifest, path, state, params
 
 
 def operation_status_targets(detached: list[dict[str, Any]], discovered: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3347,7 +3540,7 @@ def operation_status_targets(detached: list[dict[str, Any]], discovered: list[di
         if key in seen:
             continue
         seen.add(key)
-        targets.append({"manifestPath": manifest_path, "record": record, "updatedAt": operation_target_updated_at(record)})
+        targets.append({"manifestPath": manifest_path, "record": record, "params": record_params(record), "updatedAt": operation_target_updated_at(record)})
     for record in discovered:
         manifest_value = record.get("manifestPath")
         if not isinstance(manifest_value, str):
@@ -3358,7 +3551,7 @@ def operation_status_targets(detached: list[dict[str, Any]], discovered: list[di
             continue
         seen.add(key)
         state = record.get("state") if isinstance(record.get("state"), dict) else {}
-        targets.append({"manifestPath": manifest_path, "updatedAt": state.get("updatedAt")})
+        targets.append({"manifestPath": manifest_path, "params": record.get("params") if isinstance(record.get("params"), dict) else {}, "updatedAt": state.get("updatedAt")})
     return targets
 
 
@@ -3421,17 +3614,31 @@ def discovered_workflow_records(include_inactive: bool, detached: list[dict[str,
             resolved = str(workflow_path.resolve())
             if resolved in detached_paths:
                 continue
-            workflow = load_workflow(workflow_path)
-            path = workflow_state_path(workflow, workflow_path)
-            if not path.exists():
-                continue
-            state = read_json_file(path)
+            workflow, path, state, params = load_workflow_with_persisted_params(workflow_path)
         except (OSError, json.JSONDecodeError, OcmoError):
             continue
         active = workflow_state_is_active(state)
         if include_inactive or active:
-            records.append({"workflowPath": str(workflow_path), "statePath": str(path), "workflowId": workflow["workflow"]["id"], "active": active, "state": state, "workflow": workflow})
+            records.append({"workflowPath": str(workflow_path), "statePath": str(path), "workflowId": workflow["workflow"]["id"], "active": active, "state": state, "workflow": workflow, "params": params})
     return records
+
+
+def load_workflow_with_persisted_params(workflow_path: Path) -> tuple[dict[str, Any], Path, dict[str, Any], dict[str, Any]]:
+    fallback_state_path = workflow_path.parent / "state.json"
+    fallback_state = read_json_file(fallback_state_path) if fallback_state_path.exists() else {}
+    params = stored_params(fallback_state)
+    workflow = load_workflow(workflow_path, params)
+    path = workflow_state_path(workflow, workflow_path)
+    if not path.exists():
+        raise OcmoError(f"workflow state not found: {path}")
+    state = read_json_file(path)
+    state_params = stored_params(state)
+    if state_params and state_params != params:
+        params = state_params
+        workflow = load_workflow(workflow_path, params)
+        path = workflow_state_path(workflow, workflow_path)
+        state = read_json_file(path) if path.exists() else state
+    return workflow, path, state, params
 
 
 def workflow_state_is_active(state: dict[str, Any]) -> bool:
@@ -3455,7 +3662,7 @@ def workflow_status_targets(detached: list[dict[str, Any]], discovered: list[dic
         if key in seen:
             continue
         seen.add(key)
-        targets.append({"workflowPath": workflow_path, "record": record, "updatedAt": workflow_target_updated_at(record)})
+        targets.append({"workflowPath": workflow_path, "record": record, "params": record_params(record), "updatedAt": workflow_target_updated_at(record)})
     for record in discovered:
         workflow_value = record.get("workflowPath")
         if not isinstance(workflow_value, str):
@@ -3466,7 +3673,7 @@ def workflow_status_targets(detached: list[dict[str, Any]], discovered: list[dic
             continue
         seen.add(key)
         state = record.get("state") if isinstance(record.get("state"), dict) else {}
-        targets.append({"workflowPath": workflow_path, "updatedAt": state.get("updatedAt")})
+        targets.append({"workflowPath": workflow_path, "params": record.get("params") if isinstance(record.get("params"), dict) else {}, "updatedAt": state.get("updatedAt")})
     return targets
 
 
@@ -3518,7 +3725,7 @@ def print_workflow_record(record: dict[str, Any]) -> None:
             if not manifest_path.exists():
                 continue
             try:
-                step_manifest = load_manifest(manifest_path)
+                step_manifest = load_manifest(manifest_path, resolved_params(workflow))
             except OcmoError:
                 continue
             op_id = step_manifest.get("operation", {}).get("id") if isinstance(step_manifest.get("operation"), dict) else None
@@ -3710,7 +3917,7 @@ def detached_record_operation_id(record: dict[str, Any]) -> str | None:
     if not manifest_path.exists():
         return None
     try:
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest(manifest_path, record_params(record))
     except OcmoError:
         return None
     op = manifest.get("operation") if isinstance(manifest.get("operation"), dict) else None
@@ -4168,6 +4375,9 @@ class StateStore:
             now = utc_now()
             data.setdefault("schema", "ocmo-state/v1")
             data.setdefault("operationId", manifest["operation"]["id"])
+            params = resolved_params(manifest)
+            if params:
+                data["params"] = params
             data.setdefault("startedAt", now)
             data.setdefault("workUnits", {})
             data.pop("completedAt", None)
@@ -4283,6 +4493,9 @@ class WorkflowStateStore:
             now = utc_now()
             data.setdefault("schema", "ocmo-workflow-state/v1")
             data.setdefault("workflowId", workflow["workflow"]["id"])
+            params = resolved_params(workflow)
+            if params:
+                data["params"] = params
             data.setdefault("startedAt", now)
             data.setdefault("steps", {})
             data["status"] = "running"
@@ -4308,7 +4521,7 @@ class WorkflowStateStore:
 
     def prepare_step(self, workflow: dict[str, Any], workflow_path: Path, step: dict[str, Any], rerun: bool) -> None:
         manifest_path = workflow_step_manifest_path(workflow_path, step)
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest(manifest_path, resolved_params(workflow))
         self.mark_step(
             str(step["id"]),
             "pending",

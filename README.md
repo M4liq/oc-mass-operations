@@ -272,7 +272,7 @@ When many prompts are selected, preview output is compact by default: first two 
 ## Running
 
 ```powershell
-ocmo operation run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--allow-shared-worktree-concurrency] [--detach] [--dry-run] [--all] [--yes]
+ocmo operation run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--param <name=value>] [--params-file <path>] [--allow-shared-worktree-concurrency] [--detach] [--dry-run] [--all] [--yes]
 ```
 
 Useful options:
@@ -280,6 +280,8 @@ Useful options:
 - `--select <selector>`: overrides the manifest default selector.
 - `--concurrency <count>`: overrides work-unit-level queue concurrency.
 - `--timeout-seconds <seconds>`: overrides per-process timeouts.
+- `--param <name=value>`: supplies a runtime parameter for `{{params.name}}` placeholders; can be repeated.
+- `--params-file <path>`: loads runtime parameters from a YAML or JSON mapping; inline `--param` values override file values.
 - `--ui auto|live|plain`: controls foreground terminal output.
 - `--yes`, `-y`: skips confirmation for foreground runs.
 - `--detach`: starts a background `ocmo operation run` and returns a run ID.
@@ -341,6 +343,62 @@ ocmo workflow kill workflow.yaml --force
 ```
 
 Workflow `--select` selects workflow steps, not work units. Referenced operation manifests control their own work unit selection, concurrency, timeouts, and worktree safety policy.
+
+Workflows also accept `--param` and `--params-file`; the resolved parameters apply to the workflow file and every referenced operation manifest.
+
+## Runtime Parameters
+
+Operation manifests and workflow files can declare reusable parameters in a top-level `params` mapping and reference them with `{{params.name}}` placeholders. OCMO resolves parameters in memory before validation, rendering, running, status, and control commands. It does not rewrite the manifest or workflow file.
+
+```yaml
+params:
+  projectName: Example
+  taxonomyRoot: .ocmo/project-taxonomy
+
+operation:
+  id: project-taxonomy-scan
+  workspace: "{{params.repoRoot}}"
+
+state:
+  path: "{{params.taxonomyRoot}}/scan/state.json"
+
+workUnits:
+  - id: SCAN-001
+    payload:
+      projectName: "{{params.projectName}}"
+      outputPath: "{{params.taxonomyRoot}}/scan/artifacts/inventory.json"
+```
+
+Run or preview the same manifest against a different repository by passing parameters:
+
+```powershell
+ocmo operation run .ocmo/project-taxonomy/scan `
+  --param repoRoot=D:\repos\PerfectGym `
+  --param projectName=PerfectGym `
+  --dry-run
+```
+
+For larger parameter sets, use a YAML or JSON mapping file:
+
+```yaml
+repoRoot: D:\repos\PerfectGym
+projectName: PerfectGym
+taxonomyRoot: .ocmo/project-taxonomy
+```
+
+```powershell
+ocmo workflow run .ocmo/project-taxonomy/workflow.yaml --params-file perfectgym.params.yaml --dry-run
+```
+
+Parameter rules:
+
+- Top-level `params` values are defaults.
+- `--params-file` values override top-level defaults.
+- Repeated `--param name=value` values override both defaults and the params file.
+- A string that is exactly one placeholder, such as `"{{params.concurrency}}"`, preserves the parameter value type.
+- A placeholder embedded inside a larger string is formatted as text.
+- Missing parameters fail before agents are launched.
+- Detached runs persist parameters in detached metadata and pass them to the background child command.
 
 ## Detached Runs
 
@@ -465,6 +523,7 @@ workUnits: []
 Manifest rules:
 
 - `schema` must be `ocmo/v1`.
+- `params` is an optional mapping of runtime parameter defaults. Values are available as `{{params.name}}` in manifests and workflows.
 - `operation.id` is the stable operation identifier.
 - `operation.description` should explain the operation goal in human-readable terms.
 - `operation.workspace` is the target repository or directory where `opencode run` executes.

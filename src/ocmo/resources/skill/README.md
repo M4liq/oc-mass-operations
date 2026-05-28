@@ -83,7 +83,7 @@ Use `render` to inspect exact prompt text before launching agents. Interactive t
 ### `ocmo operation run`
 
 ```powershell
-ocmo operation run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--dry-run] [--all] [--yes] [--ui auto|live|plain] [--detach] [--allow-shared-worktree-concurrency]
+ocmo operation run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--dry-run] [--all] [--yes] [--ui auto|live|plain] [--param <name=value>] [--params-file <path>] [--detach] [--allow-shared-worktree-concurrency]
 ```
 
 Runs selected work units.
@@ -95,6 +95,8 @@ Runs selected work units.
 - `--all`: with `--dry-run`, prints every rendered prompt instead of compact preview.
 - `--yes`, `-y`: skips confirmation for foreground runs.
 - `--ui auto|live|plain`: controls foreground terminal output.
+- `--param <name=value>`: supplies a runtime parameter for `{{params.name}}` placeholders; can be repeated.
+- `--params-file <path>`: loads runtime parameters from a YAML or JSON mapping; inline `--param` values override file values.
 - `--detach`: starts a background `ocmo operation run` with `--yes` and `--ui plain`, writes detached metadata/logs under `.ocmo/runs/`, writes a global registry entry, returns a run ID, and exits.
 - `--allow-shared-worktree-concurrency`: allows concurrency above `1` when `policy.worktree: single`. Use only when selected work unit scopes are explicitly non-overlapping.
 
@@ -266,6 +268,7 @@ ocmo workflow erase workflow.yaml --force
 Workflow facts:
 
 - Workflow `--select` selects workflow steps, not work units.
+- Workflow commands accept `--param` and `--params-file`; resolved parameters apply to the workflow file and every referenced operation manifest.
 - Referenced operation manifests control their own work unit selection, concurrency, timeouts, and worktree safety policy.
 - Workflow state records orchestration status; operation state remains authoritative for work units, runs, sessions, outputs, artifacts, and token usage.
 - `ocmo workflow rerun` defaults to retryable workflow steps, then delegates work unit selection to each referenced operation.
@@ -380,6 +383,7 @@ workUnits:
 Manifest rules:
 
 - `schema` must be `ocmo/v1`.
+- `params` is an optional top-level mapping of runtime parameter defaults. Values are available as `{{params.name}}` in manifests and workflows.
 - `operation.id` is the stable operation identifier.
 - `operation.description` should explain the operation goal in human-readable terms.
 - `operation.workspace` is the target repository or directory for `opencode run`.
@@ -436,6 +440,20 @@ Good work units have clear boundaries. Prefer payloads that identify the exact t
 Selection uses work unit IDs and state statuses. For example, `--select DOC-001` runs one work unit, while `--select uncompleted` selects work units whose state status is not `completed`, `done`, or `skipped`. Missing state is treated as `pending`.
 
 `queue.concurrency` is work-unit-level concurrency. If a work unit defines sequential `runs`, those run steps execute in order inside that one work unit and do not become independently queued work.
+
+## Runtime Parameters
+
+Operation manifests and workflow files can declare reusable parameters in a top-level `params` mapping and reference them with `{{params.name}}` placeholders. OCMO resolves parameters in memory before validation, rendering, running, status, and control commands. It does not rewrite the manifest or workflow file.
+
+Parameter rules:
+
+- Top-level `params` values are defaults.
+- `--params-file` values override top-level defaults.
+- Repeated `--param name=value` values override both defaults and the params file.
+- A string that is exactly one placeholder, such as `"{{params.concurrency}}"`, preserves the parameter value type.
+- A placeholder embedded inside a larger string is formatted as text.
+- Missing parameters fail before agents are launched.
+- Detached runs persist parameters in detached metadata and pass them to the background child command.
 
 ## Prompt Templates
 
