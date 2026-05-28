@@ -91,7 +91,7 @@ Runs selected work units.
 - `--select <selector>`: overrides the manifest default selector.
 - `--concurrency <count>`: overrides `queue.concurrency`.
 - `--timeout-seconds <seconds>`: overrides per-process timeout.
-- `--dry-run`: validates, selects, renders, and previews commands without launching agents, writing state, creating worktrees, or running setup/teardown.
+- `--dry-run`: validates, selects, renders, and previews commands without launching agents, writing state, creating worktrees, running hooks, or running setup/teardown.
 - `--all`: with `--dry-run`, prints every rendered prompt instead of compact preview.
 - `--yes`, `-y`: skips confirmation for foreground runs.
 - `--ui auto|live|plain`: controls foreground terminal output.
@@ -367,6 +367,11 @@ queue:
     teardown: []
     cleanup: never
 
+hooks:
+  beforeRun: []
+  afterRun: []
+  onFailure: []
+
 policy:
   worktree: single
   baseBranch: main
@@ -403,6 +408,7 @@ Manifest rules:
 - `queue.order` is currently `manifest`.
 - `queue.stopOnFailure` controls whether the queue stops after failed work.
 - `queue.autoWorktrees` configures native git worktree creation for isolated work-unit execution.
+- `hooks.beforeRun`, `hooks.afterRun`, and `hooks.onFailure` are optional shell scripts that run once around an operation run.
 - `policy.worktree` is usually `single` or `per-work-unit`.
 - `prompt.template` is resolved relative to `manifest.yaml`.
 - `prompt.skills` lists opencode skills required in rendered work unit prompts.
@@ -411,6 +417,30 @@ Manifest rules:
 - Do not use `workUnits[].status`; work unit status is stored in `state.json`.
 - Work unit `payload` is task-specific and should contain the data needed by the prompt template.
 - Do not use `operation.kind` or `runner.mode`; OCMO rejects those fields.
+
+### Operation Hooks
+
+Use `hooks` when an operation needs preparation, diagnostics, or cleanup outside the agent prompt:
+
+```yaml
+hooks:
+  beforeRun:
+    - ./scripts/prepare.ps1
+  onFailure:
+    - ./scripts/diagnose.ps1
+  afterRun:
+    - ./scripts/cleanup.ps1
+```
+
+Hook facts:
+
+- `beforeRun` runs after confirmation and state initialization, before any work unit starts.
+- `onFailure` runs when the operation fails, including a failing `beforeRun` hook.
+- `afterRun` runs after work units finish, and also after a failing `beforeRun` hook, for cleanup.
+- Hooks do not run for `validate`, `render`, or `run --dry-run`; dry runs only preview them.
+- Detached operation hooks run inside the detached child process.
+- Hooks run from `operation.workspace` with shell execution, matching `queue.autoWorktrees.setup` and `teardown`.
+- Hook environment includes `OCMO_OPERATION_ID`, `OCMO_MANIFEST_PATH`, `OCMO_STATE_PATH`, `OCMO_WORKSPACE`, `OCMO_HOOK`, `OCMO_SELECTED_COUNT`, and `OCMO_OPERATION_STATUS` when known.
 
 ### Work Units
 

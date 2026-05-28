@@ -136,6 +136,11 @@ queue:
   autoWorktrees:
     enabled: false
 
+hooks:
+  beforeRun: []
+  afterRun: []
+  onFailure: []
+
 policy:
   worktree: single
 
@@ -158,6 +163,7 @@ Key sections:
 - `operation` identifies the operation and target workspace.
 - `runner` configures the `opencode run` process used for each selected work unit.
 - `selection` and `queue` control which work units run and how much parallelism is allowed.
+- `hooks` optionally runs shell scripts around operation execution.
 - `policy` describes worktree safety assumptions.
 - `prompt.template` points to the prompt rendered for each work unit.
 - `workUnits[].payload` is task-specific data available to the prompt template.
@@ -261,7 +267,7 @@ Planning does not execute work units.
 ocmo operation render .ocmo/business-taxonomy-prompt --select 41-48
 ```
 
-`ocmo operation run --dry-run` validates, selects, renders, and previews the effective `opencode run` commands without launching agents, writing state, creating worktrees, or running setup/teardown.
+`ocmo operation run --dry-run` validates, selects, renders, and previews the effective `opencode run` commands without launching agents, writing state, creating worktrees, running hooks, or running setup/teardown.
 
 ```powershell
 ocmo operation run .ocmo/business-taxonomy-prompt --select uncompleted --dry-run
@@ -291,6 +297,28 @@ If `policy.worktree: single` uses concurrency above `1`, `ocmo operation run` re
 Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata. `ocmo operation status` continuously refreshes operation status until interrupted, summarizes operation token usage and total operation elapsed time, and includes compact per-work-unit `Work Time`, `Agent Time`, and `Tokens` columns. `Tokens` is formatted as `input/output`.
 
 Changing a manifest or prompt template while an operation is running does not affect already-started agent processes. It can affect queued work units or later sequential run steps because prompts are rendered immediately before each run starts. Long-prompt transport writes the prompt input file before launching the agent, so edits after launch do not change that launched run.
+
+## Operation Hooks
+
+Operation manifests can define shell scripts that run once around an operation run:
+
+```yaml
+hooks:
+  beforeRun:
+    - ./scripts/prepare.ps1
+  onFailure:
+    - ./scripts/diagnose.ps1
+  afterRun:
+    - ./scripts/cleanup.ps1
+```
+
+- `beforeRun` runs after confirmation and state initialization, before any work unit starts.
+- `onFailure` runs when the operation fails, including a failing `beforeRun` hook.
+- `afterRun` runs after work units finish, and also after a failing `beforeRun` hook, for cleanup.
+- Hooks do not run for `validate`, `render`, or `run --dry-run`; dry runs only preview them.
+- Detached operation hooks run inside the detached child process.
+- Hooks run from `operation.workspace` with shell execution, matching `queue.autoWorktrees.setup` and `teardown`.
+- Hook environment includes `OCMO_OPERATION_ID`, `OCMO_MANIFEST_PATH`, `OCMO_STATE_PATH`, `OCMO_WORKSPACE`, `OCMO_HOOK`, `OCMO_SELECTED_COUNT`, and `OCMO_OPERATION_STATUS` when known.
 
 ## Status
 

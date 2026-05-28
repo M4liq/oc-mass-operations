@@ -59,6 +59,7 @@ def run_manifest(options: RunOptions) -> int:
 
     if options.dry_run:
         previews = []
+        hook_details = operation_hook_preview_details(manifest)
         for item in selected:
             execution = worktree_execution(manifest, options.manifest_path, item) if auto_worktrees["enabled"] else {}
             run_dir = Path(execution["worktreePath"]) if execution else None
@@ -82,6 +83,7 @@ def run_manifest(options: RunOptions) -> int:
                     details.append(("produces", f"{artifact_id} -> {produced_artifact_relative_path(options.manifest_path, item, str(run['id']), artifact_id, config)}"))
                 for reference in run.get("consumes") or []:
                     details.append(("consumes", str(reference)))
+                details.extend(hook_details)
                 previews.append(PromptPreview(str(item["id"]), str(run["id"]), prompt_text, format_command(command), details))
         print_prompt_previews(previews, options.preview_all)
         return 0
@@ -97,6 +99,12 @@ def run_manifest(options: RunOptions) -> int:
 
     state = StateStore(state_path(manifest, options.manifest_path))
     state.ensure_operation(manifest)
+    before_code = run_operation_hook(manifest, options.manifest_path, state, "beforeRun", len(selected))
+    if before_code != 0:
+        run_operation_hook(manifest, options.manifest_path, state, "onFailure", len(selected), "setup_failed")
+        after_code = run_operation_hook(manifest, options.manifest_path, state, "afterRun", len(selected), "setup_failed")
+        state.finish("cleanup_failed" if after_code != 0 else "setup_failed")
+        return 1
     results: list[int] = []
     with make_run_reporter(options.ui) as reporter:
         reporter.start(manifest, selected, concurrency, auto_worktrees)
@@ -129,10 +137,25 @@ def run_manifest(options: RunOptions) -> int:
             executor.shutdown(wait=True)
 
     if any(code != 0 for code in results):
-        state.finish(operation_failed_status(state.data()))
+        failed_status = operation_failed_status(state.data())
+        run_operation_hook(manifest, options.manifest_path, state, "onFailure", len(selected), failed_status)
+        after_code = run_operation_hook(manifest, options.manifest_path, state, "afterRun", len(selected), failed_status)
+        state.finish("cleanup_failed" if after_code != 0 else failed_status)
+        return 1
+    after_code = run_operation_hook(manifest, options.manifest_path, state, "afterRun", len(selected), "completed")
+    if after_code != 0:
+        state.finish("cleanup_failed")
         return 1
     state.finish("completed")
     return 0
+
+
+def operation_hook_preview_details(manifest: dict[str, Any]) -> list[tuple[str, str]]:
+    details = []
+    for hook in ("beforeRun", "onFailure", "afterRun"):
+        for script in operation_hook_scripts(manifest, hook):
+            details.append((f"hook {hook}", script))
+    return details
 
 
 def operation_failed_status(state: dict[str, Any]) -> str:

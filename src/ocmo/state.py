@@ -243,6 +243,20 @@ class StateStore:
 
             self._update(update)
 
+    def mark_hook(self, hook: str, status: str, patch: dict[str, Any]) -> None:
+        with self.lock:
+            def update(data: dict[str, Any]) -> None:
+                data.setdefault("hooks", {})
+                hook_state = data["hooks"].setdefault(hook, {})
+                if status == "running":
+                    for key in ("completedAt", "exitCode", "error"):
+                        hook_state.pop(key, None)
+                hook_state.update(patch)
+                hook_state["status"] = status
+                data["updatedAt"] = utc_now()
+
+            self._update(update)
+
     def finish(self, status: str) -> None:
         with self.lock:
             def update(data: dict[str, Any]) -> None:

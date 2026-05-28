@@ -367,6 +367,15 @@ workUnits:
         with self.assertRaisesRegex(cli.OcmoError, "field must be a string"):
             cli.normalize_scripts([""], "field")
 
+    def test_operation_hooks_validation(self) -> None:
+        cli.validate_operation_hooks({"beforeRun": "prepare", "afterRun": ["cleanup"], "onFailure": "diagnose"})
+        with self.assertRaisesRegex(cli.OcmoError, "hooks must be a mapping"):
+            cli.validate_operation_hooks("prepare")
+        with self.assertRaisesRegex(cli.OcmoError, "hooks.beforeRun must be a string"):
+            cli.validate_operation_hooks({"beforeRun": [""]})
+        with self.assertRaisesRegex(cli.OcmoError, "hooks.unknown is not supported"):
+            cli.validate_operation_hooks({"unknown": "script"})
+
     def test_git_helpers_convert_subprocess_failures_to_ocmo_errors(self) -> None:
         with mock.patch("ocmo.cli.subprocess.run", side_effect=OSError("no git")):
             with self.assertRaisesRegex(cli.OcmoError, "could not inspect git repository"):
@@ -1302,6 +1311,111 @@ workUnits:
 
         self.assertEqual(code, 0)
         self.assertIn("No work units selected.", stdout.getvalue())
+
+    def test_operation_hooks_run_before_and_after_work_units(self) -> None:
+        manifest = self.load()
+        manifest["hooks"] = {"beforeRun": "prepare", "afterRun": "cleanup"}
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        events = []
+
+        def fake_run(command, **kwargs):
+            events.append(command)
+            self.assertEqual(kwargs["cwd"], str(self.workspace))
+            self.assertEqual(kwargs["env"]["OCMO_HOOK"], "beforeRun" if command == "prepare" else "afterRun")
+            self.assertEqual(kwargs["env"]["OCMO_SELECTED_COUNT"], "1")
+            return subprocess.CompletedProcess(command, 0)
+
+        def fake_popen(command, **kwargs):
+            events.append("opencode")
+            return FakePopen(command, 0, "")
+
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ["prepare", "opencode", "cleanup"])
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["hooks"]["beforeRun"]["status"], "completed")
+        self.assertEqual(state["hooks"]["afterRun"]["status"], "completed")
+        self.assertEqual(state["control"]["status"], "completed")
+
+    def test_before_run_hook_failure_skips_work_and_runs_failure_and_after_hooks(self) -> None:
+        manifest = self.load()
+        manifest["hooks"] = {"beforeRun": "prepare", "onFailure": "diagnose", "afterRun": "cleanup"}
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        events = []
+
+        def fake_run(command, **kwargs):
+            events.append(command)
+            return subprocess.CompletedProcess(command, 5 if command == "prepare" else 0)
+
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), mock.patch("ocmo.cli.subprocess.Popen") as popen, contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(events, ["prepare", "diagnose", "cleanup"])
+        popen.assert_not_called()
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["hooks"]["beforeRun"]["status"], "failed")
+        self.assertEqual(state["hooks"]["onFailure"]["status"], "completed")
+        self.assertEqual(state["control"]["status"], "setup_failed")
+
+    def test_on_failure_hook_runs_after_work_unit_failure(self) -> None:
+        manifest = self.load()
+        manifest["hooks"] = {"onFailure": "diagnose", "afterRun": "cleanup"}
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        events = []
+
+        def fake_run(command, **kwargs):
+            events.append(command)
+            self.assertEqual(kwargs["env"]["OCMO_OPERATION_STATUS"], "failed")
+            return subprocess.CompletedProcess(command, 0)
+
+        def fake_popen(command, **kwargs):
+            events.append("opencode")
+            return FakePopen(command, 7, "")
+
+        with mock.patch("ocmo.cli.subprocess.run", side_effect=fake_run), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(events, ["opencode", "diagnose", "cleanup"])
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["hooks"]["onFailure"]["status"], "completed")
+        self.assertEqual(state["workUnits"]["1"]["status"], "failed")
+        self.assertEqual(state["control"]["status"], "failed")
+
+    def test_after_run_hook_failure_marks_operation_cleanup_failed(self) -> None:
+        manifest = self.load()
+        manifest["hooks"] = {"afterRun": "cleanup"}
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+
+        with mock.patch("ocmo.cli.subprocess.run", return_value=subprocess.CompletedProcess(["cleanup"], 4)), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "")), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, False, True))
+
+        self.assertEqual(code, 1)
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["hooks"]["afterRun"]["status"], "failed")
+        self.assertEqual(state["workUnits"]["1"]["status"], "completed")
+        self.assertEqual(state["control"]["status"], "cleanup_failed")
+
+    def test_dry_run_previews_hooks_without_running_them(self) -> None:
+        manifest = self.load()
+        manifest["hooks"] = {"beforeRun": "prepare", "onFailure": "diagnose", "afterRun": "cleanup"}
+        self.manifest_path.write_text(yaml_dump(manifest), encoding="utf-8")
+        stdout = io.StringIO()
+
+        with mock.patch("ocmo.cli.subprocess.run") as run, mock.patch("ocmo.cli.subprocess.Popen") as popen, contextlib.redirect_stdout(stdout):
+            code = cli.run_manifest(cli.RunOptions(self.manifest_path, "1", None, None, True, False))
+
+        self.assertEqual(code, 0)
+        run.assert_not_called()
+        popen.assert_not_called()
+        output = stdout.getvalue()
+        self.assertIn("# hook beforeRun: prepare", output)
+        self.assertIn("# hook onFailure: diagnose", output)
+        self.assertIn("# hook afterRun: cleanup", output)
+        self.assertFalse((self.root / "state.json").exists())
 
     def test_run_manifest_rejects_invalid_cli_overrides(self) -> None:
         self.write_manifest()

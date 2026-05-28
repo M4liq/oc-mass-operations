@@ -143,6 +143,7 @@ def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path, allo
     concurrency = queue.get("concurrency", 1)
     if not isinstance(concurrency, int) or concurrency < 1:
         raise OcmoError("queue.concurrency must be a positive integer")
+    validate_operation_hooks(manifest.get("hooks"))
     auto_worktrees = auto_worktrees_config(manifest)
     if auto_worktrees["enabled"]:
         validate_auto_worktrees(auto_worktrees)
@@ -528,6 +529,19 @@ def validate_auto_worktrees(config: dict[str, Any]) -> None:
         str(config.get("branchPattern", "ocmo/{operation_id}/{work_unit_id}")).format(operation_id="operation", work_unit_id="work-unit", work_unit_slug="work-unit")
     except (KeyError, ValueError, IndexError) as exc:
         raise OcmoError(f"invalid queue.autoWorktrees.branchPattern: {exc}") from exc
+
+
+def validate_operation_hooks(value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise OcmoError("hooks must be a mapping")
+    allowed = ("beforeRun", "afterRun", "onFailure")
+    for key in value:
+        if key not in allowed:
+            raise OcmoError(f"hooks.{key} is not supported")
+    for key in allowed:
+        normalize_scripts(value.get(key), f"hooks.{key}")
 
 
 def normalize_scripts(value: Any, field: str) -> list[str]:

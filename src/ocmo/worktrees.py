@@ -350,6 +350,59 @@ def run_scripts(kind: str, scripts: list[str], cwd: Path, execution: dict[str, A
     return 0
 
 
+def operation_hook_scripts(manifest: dict[str, Any], hook: str) -> list[str]:
+    hooks = manifest.get("hooks") if isinstance(manifest.get("hooks"), dict) else {}
+    return normalize_scripts(hooks.get(hook), f"hooks.{hook}")
+
+
+def run_operation_hook(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    state: "StateStore",
+    hook: str,
+    selected_count: int,
+    operation_status: str | None = None,
+) -> int:
+    scripts = operation_hook_scripts(manifest, hook)
+    if not scripts:
+        return 0
+    workspace = resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])
+    state.mark_hook(hook, "running", {"startedAt": utc_now(), "scripts": scripts})
+    for script in scripts:
+        print(f"[operation] {hook}: {script}")
+        try:
+            completed = subprocess.run(
+                script,
+                cwd=str(workspace),
+                shell=True,
+                env=operation_hook_env(manifest, manifest_path, hook, selected_count, operation_status),
+            )
+        except OSError as exc:
+            state.mark_hook(hook, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
+            print(f"[operation] {hook} failed: {exc}")
+            return 1
+        if completed.returncode != 0:
+            state.mark_hook(hook, "failed", {"completedAt": utc_now(), "exitCode": completed.returncode})
+            print(f"[operation] {hook} failed: exit {completed.returncode}")
+            return completed.returncode
+    state.mark_hook(hook, "completed", {"completedAt": utc_now(), "exitCode": 0})
+    return 0
+
+
+def operation_hook_env(manifest: dict[str, Any], manifest_path: Path, hook: str, selected_count: int, operation_status: str | None = None) -> dict[str, str]:
+    workspace = resolve_manifest_path(manifest_path, manifest["operation"]["workspace"])
+    env = dict(os.environ)
+    env["OCMO_OPERATION_ID"] = str(manifest["operation"]["id"])
+    env["OCMO_MANIFEST_PATH"] = str(manifest_path.resolve())
+    env["OCMO_STATE_PATH"] = str(state_path(manifest, manifest_path))
+    env["OCMO_WORKSPACE"] = str(workspace)
+    env["OCMO_HOOK"] = hook
+    env["OCMO_SELECTED_COUNT"] = str(selected_count)
+    if operation_status is not None:
+        env["OCMO_OPERATION_STATUS"] = operation_status
+    return env
+
+
 def worktree_env(execution: dict[str, Any]) -> dict[str, str]:
     env = dict(os.environ)
     env["OCMO_SOURCE_WORKSPACE"] = execution["sourceWorkspace"]
