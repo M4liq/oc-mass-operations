@@ -30,7 +30,8 @@ from .common import *
 def run_manifest(options: RunOptions) -> int:
     manifest = load_manifest(options.manifest_path, options.params)
     validate_manifest(manifest, options.manifest_path, options.allow_shared_worktree_concurrency)
-    existing_state = read_json_file(state_path(manifest, options.manifest_path)) if state_path(manifest, options.manifest_path).exists() else {}
+    fresh = options.fresh or (not options.resume and not options.rerun and clean_before_run_enabled(manifest))
+    existing_state = {} if fresh else read_json_file(state_path(manifest, options.manifest_path)) if state_path(manifest, options.manifest_path).exists() else {}
     if options.resume:
         selected = select_paused_work_units(manifest, existing_state)
     elif options.rerun:
@@ -60,6 +61,7 @@ def run_manifest(options: RunOptions) -> int:
     if options.dry_run:
         previews = []
         hook_details = operation_hook_preview_details(manifest)
+        clean_details = operation_clean_preview_details(manifest, options.manifest_path, "beforeRun") if fresh else []
         for item in selected:
             execution = worktree_execution(manifest, options.manifest_path, item) if auto_worktrees["enabled"] else {}
             run_dir = Path(execution["worktreePath"]) if execution else None
@@ -83,6 +85,7 @@ def run_manifest(options: RunOptions) -> int:
                     details.append(("produces", f"{artifact_id} -> {produced_artifact_relative_path(options.manifest_path, item, str(run['id']), artifact_id, config)}"))
                 for reference in run.get("consumes") or []:
                     details.append(("consumes", str(reference)))
+                details.extend(clean_details)
                 details.extend(hook_details)
                 previews.append(PromptPreview(str(item["id"]), str(run["id"]), prompt_text, format_command(command), details))
         print_prompt_previews(previews, options.preview_all)
@@ -91,12 +94,15 @@ def run_manifest(options: RunOptions) -> int:
     if not options.yes:
         timeout_text = f", timeout={timeout_seconds}s" if timeout_seconds else ""
         worktree_text = ", autoWorktrees=true" if auto_worktrees["enabled"] else ""
-        print(f"About to run {len(selected)} work unit(s) with concurrency={concurrency}{timeout_text}{worktree_text}.")
+        fresh_text = ", fresh=true" if fresh else ""
+        print(f"About to run {len(selected)} work unit(s) with concurrency={concurrency}{timeout_text}{worktree_text}{fresh_text}.")
         answer = input("Continue? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled.")
             return 1
 
+    if fresh:
+        clean_operation_before_run(manifest, options.manifest_path)
     state = StateStore(state_path(manifest, options.manifest_path))
     state.ensure_operation(manifest)
     before_code = run_operation_hook(manifest, options.manifest_path, state, "beforeRun", len(selected))
@@ -158,6 +164,26 @@ def operation_hook_preview_details(manifest: dict[str, Any]) -> list[tuple[str, 
     return details
 
 
+def clean_before_run_enabled(manifest: dict[str, Any]) -> bool:
+    clean = manifest.get("clean") if isinstance(manifest.get("clean"), dict) else {}
+    return bool(clean.get("beforeRun"))
+
+
+def operation_clean_preview_details(manifest: dict[str, Any], manifest_path: Path, event: str) -> list[tuple[str, str]]:
+    details = [("clean", str(path)) for path in operation_runtime_paths(manifest, manifest_path)]
+    details.extend(("clean", str(path)) for _, path in operation_configured_clean_paths(manifest, manifest_path, event))
+    return details
+
+
+def clean_operation_before_run(manifest: dict[str, Any], manifest_path: Path) -> None:
+    path = state_path(manifest, manifest_path)
+    state = read_json_file(path) if path.exists() else {}
+    if operation_state_is_active(state) or related_detached_records(manifest_path, include_inactive=False):
+        raise OcmoError("cannot clean before run while operation appears active; pause, kill, or erase it first")
+    remove_detached_records(manifest_path)
+    erase_operation_runtime_data(manifest, manifest_path, event="beforeRun", include_configured=True)
+
+
 def operation_failed_status(state: dict[str, Any]) -> str:
     work_units = state.get("workUnits") if isinstance(state.get("workUnits"), dict) else {}
     statuses = [work_unit.get("status") for work_unit in work_units.values() if isinstance(work_unit, dict)]
@@ -194,6 +220,7 @@ def start_detached_run(options: RunOptions, manifest: dict[str, Any], concurrenc
         "select": options.select,
         "concurrency": concurrency,
         "timeoutSeconds": timeout_seconds,
+        "fresh": options.fresh,
         "params": options.params,
     }
     write_detached_metadata(local_dir / f"{run_id}.json", metadata)
@@ -218,6 +245,8 @@ def detached_child_command(options: RunOptions) -> list[str]:
     command += ["--ui", "plain", "--yes"]
     if options.allow_shared_worktree_concurrency and not options.resume:
         command.append("--allow-shared-worktree-concurrency")
+    if options.fresh and not options.resume and not options.rerun:
+        command.append("--fresh")
     return command
 
 
@@ -405,22 +434,52 @@ def erase_operation(args: argparse.Namespace) -> int:
     state = read_json_file(path) if path.exists() else {}
     stop_operation_processes(manifest_path, state, record)
     remove_detached_records(manifest_path)
-    erase_operation_runtime_data(manifest, manifest_path)
+    erase_operation_runtime_data(manifest, manifest_path, event="erase", include_configured=True)
     print(f"erased runtime data: {manifest_path.parent}")
     return 0
 
 
-def erase_operation_runtime_data(manifest: dict[str, Any], manifest_path: Path) -> None:
+def erase_operation_runtime_data(manifest: dict[str, Any], manifest_path: Path, event: str = "erase", include_configured: bool = False) -> None:
     operation_dir = manifest_path.parent.resolve()
-    runtime_paths = [
+    for path in operation_runtime_paths(manifest, manifest_path):
+        erase_operation_runtime_path(path, operation_dir)
+    if include_configured:
+        for root, path in operation_configured_clean_paths(manifest, manifest_path, event):
+            erase_configured_clean_path(path, root)
+
+
+def operation_runtime_paths(manifest: dict[str, Any], manifest_path: Path) -> list[Path]:
+    return [
         state_path(manifest, manifest_path),
         manifest_path.parent / "outputs",
         manifest_path.parent / ARTIFACT_ROOT,
         manifest_path.parent / PROMPT_INPUT_ROOT,
         detached_runs_dir(manifest_path),
     ]
-    for path in runtime_paths:
-        erase_operation_runtime_path(path, operation_dir)
+
+
+def operation_configured_clean_paths(manifest: dict[str, Any], manifest_path: Path, event: str) -> list[tuple[Path, Path]]:
+    clean = manifest.get("clean") if isinstance(manifest.get("clean"), dict) else {}
+    paths = clean.get("paths") if isinstance(clean.get("paths"), list) else []
+    targets: list[tuple[Path, Path]] = []
+    for item in paths:
+        if isinstance(item, str):
+            root_name = "workspace"
+            value = item
+            events = {"beforeRun", "erase"}
+        elif isinstance(item, dict):
+            root_name = item.get("root", "workspace")
+            value = item.get("path")
+            when = item.get("when")
+            events = {"beforeRun", "erase"} if when is None else {when} if isinstance(when, str) else set(when)
+        else:  # pragma: no cover - validation rejects this.
+            continue
+        if event not in events:
+            continue
+        root = resolve_manifest_path(manifest_path, manifest["operation"]["workspace"]) if root_name == "workspace" else manifest_path.parent.resolve()
+        path = (root / str(value)).resolve()
+        targets.append((root.resolve(), path))
+    return targets
 
 
 def erase_operation_runtime_path(path: Path, operation_dir: Path) -> None:
@@ -437,6 +496,23 @@ def erase_operation_runtime_path(path: Path, operation_dir: Path) -> None:
             resolved.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def erase_configured_clean_path(path: Path, root: Path) -> None:
+    try:
+        resolved_root = root.resolve()
+        resolved = path.resolve()
+    except OSError as exc:
+        raise OcmoError(f"could not resolve clean path: {path}: {exc}") from exc
+    if not resolved.is_relative_to(resolved_root) or resolved == resolved_root:
+        raise OcmoError(f"clean path must stay under its configured root: {path}")
+    try:
+        if resolved.is_dir():
+            shutil.rmtree(resolved)
+        else:
+            resolved.unlink(missing_ok=True)
+    except OSError as exc:
+        raise OcmoError(f"could not remove clean path {path}: {exc}") from exc
 
 
 def resume_operation(args: argparse.Namespace) -> int:

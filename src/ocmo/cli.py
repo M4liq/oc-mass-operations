@@ -40,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--concurrency", type=int, help="Override queue.concurrency")
     run_parser.add_argument("--timeout-seconds", type=int, help="Override runner.timeoutSeconds for each work unit")
     run_parser.add_argument("--dry-run", action="store_true", help="Print commands/prompts without running opencode")
+    run_parser.add_argument("--fresh", action="store_true", help="Erase operation runtime data before selecting and running work units")
     run_parser.add_argument("--all", action="store_true", help="With --dry-run, print every rendered prompt instead of a compact preview")
     run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for non-dry runs")
     run_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for non-dry runs")
@@ -129,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     workflow_run_parser.add_argument("workflow", nargs="?", type=Path, help="Workflow path or directory; defaults to workflow.yaml")
     workflow_run_parser.add_argument("--select", help="Workflow step selection: all, pending, uncompleted, IDs, or ranges")
     workflow_run_parser.add_argument("--dry-run", action="store_true", help="Preview workflow execution without running operations")
+    workflow_run_parser.add_argument("--fresh", action="store_true", help="Erase workflow state and per-step operation runtime data before running")
     workflow_run_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation for foreground runs")
     workflow_run_parser.add_argument("--ui", choices=("auto", "live", "plain"), default="auto", help="Terminal UI for foreground operation steps")
     workflow_run_parser.add_argument("--detach", action="store_true", help="Start workflow in the background and return immediately")
@@ -202,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
                     False,
                     False,
                     command_params(args),
+                    args.fresh,
                 )
             )
         if args.command == "operation" and args.operation_command == "validate":

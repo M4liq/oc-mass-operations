@@ -813,6 +813,72 @@ workUnits:
         metadata = json.loads((registry / "ocmo-param.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["params"], {"repoRoot": "D:/repo"})
 
+    def test_operation_run_fresh_erases_runtime_and_configured_clean_paths(self) -> None:
+        self.write_manifest(
+            """clean:
+  paths:
+    - root: workspace
+      path: generated
+      when: beforeRun
+"""
+        )
+        (self.root / "state.json").write_text(json.dumps({"workUnits": {"1": {"status": "completed"}, "2": {"status": "completed"}}}), encoding="utf-8")
+        outputs = self.root / "outputs"
+        outputs.mkdir()
+        (outputs / "old.txt").write_text("old", encoding="utf-8")
+        generated = self.workspace / "generated"
+        generated.mkdir()
+        (generated / "agent.txt").write_text("agent", encoding="utf-8")
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "")), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(["operation", "run", str(self.manifest_path), "--fresh", "--yes", "--ui", "plain"])
+
+        self.assertEqual(code, 0)
+        self.assertFalse((outputs / "old.txt").exists())
+        self.assertFalse(generated.exists())
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["workUnits"]["1"]["status"], "completed")
+        self.assertEqual(state["workUnits"]["2"]["status"], "completed")
+
+    def test_clean_before_run_makes_plain_run_fresh(self) -> None:
+        self.write_manifest("""clean:
+  beforeRun: true
+""")
+        (self.root / "state.json").write_text(json.dumps({"workUnits": {"1": {"status": "completed"}, "2": {"status": "completed"}}}), encoding="utf-8")
+
+        with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "")), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(["operation", "run", str(self.manifest_path), "--yes", "--ui", "plain"])
+
+        self.assertEqual(code, 0)
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(state["workUnits"]), {"1", "2"})
+
+    def test_clean_validation_rejects_unsafe_paths(self) -> None:
+        for path in ("..", ".", "../x", ".git/cache"):
+            manifest = self.load(f"""clean:
+  paths:
+    - path: {path}
+""")
+            with self.assertRaisesRegex(cli.OcmoError, "clean.paths"):
+                cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_detached_run_preserves_fresh_in_child_command(self) -> None:
+        self.write_manifest()
+        captured = {}
+
+        class FakeProcess:
+            pid = 12345
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            return FakeProcess()
+
+        with mock.patch("ocmo.cli.detached_run_id", return_value="ocmo-fresh"), mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(["operation", "run", str(self.manifest_path), "--fresh", "--detach", "--yes"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("--fresh", captured["command"])
+
     def test_dry_run_prints_each_sequential_run_without_state_or_subprocess(self) -> None:
         impl_prompt = self.root / "impl.md"
         review_prompt = self.root / "review.md"
@@ -2251,6 +2317,50 @@ workUnits:
         self.assertFalse((generated_dir / "prompt-inputs").exists())
         self.assertFalse(runs_dir.exists())
         self.assertIn("erased runtime data:", stdout.getvalue())
+
+    def test_erase_removes_configured_clean_paths_for_erase(self) -> None:
+        generated_dir = self.root / ".ocmo" / "clean-erase"
+        generated_dir.mkdir(parents=True)
+        generated_manifest = generated_dir / "manifest.yaml"
+        generated_manifest.write_text(
+            f"""schema: ocmo/v1
+operation:
+  id: clean-erase
+  workspace: {self.workspace.as_posix()}
+runner:
+  command: opencode
+queue:
+  concurrency: 1
+prompt:
+  template: prompt.md
+state:
+  path: state.json
+clean:
+  paths:
+    - root: workspace
+      path: generated
+      when: erase
+    - root: manifest
+      path: scratch
+      when: erase
+workUnits:
+  - id: one
+""",
+            encoding="utf-8",
+        )
+        (generated_dir / "prompt.md").write_text("prompt", encoding="utf-8")
+        (generated_dir / "scratch").mkdir()
+        (generated_dir / "scratch" / "file.txt").write_text("scratch", encoding="utf-8")
+        generated = self.workspace / "generated"
+        generated.mkdir()
+        (generated / "file.txt").write_text("generated", encoding="utf-8")
+
+        with mock.patch("ocmo.cli.stop_operation_processes"), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["operation", "erase", str(generated_manifest), "--force"]), 0)
+
+        self.assertFalse(generated.exists())
+        self.assertFalse((generated_dir / "scratch").exists())
+        self.assertTrue(generated_manifest.exists())
 
     def test_erase_interactive_preserves_definition_files(self) -> None:
         generated_dir = self.root / ".ocmo" / "keep-interactive"
@@ -3889,6 +3999,28 @@ steps:
         self.assertIn("valid:", output)
         self.assertIn("ocmo operation run", output)
         self.assertNotIn("--select", output)
+
+    def test_workflow_run_fresh_clears_workflow_and_operation_state(self) -> None:
+        workflow, first, second = self.write_workflow()
+        workflow_state = self.root / "workflow-state.json"
+        workflow_state.write_text(json.dumps({"steps": {"first": {"status": "completed"}, "second": {"status": "completed"}}}), encoding="utf-8")
+        first_state = first.parent / "state.json"
+        second_state = second.parent / "state.json"
+        first_state.write_text(json.dumps({"workUnits": {"1": {"status": "completed"}}}), encoding="utf-8")
+        second_state.write_text(json.dumps({"workUnits": {"1": {"status": "completed"}}}), encoding="utf-8")
+        calls = []
+
+        with mock.patch("ocmo.cli.run_manifest", side_effect=lambda options: calls.append(options) or 0), contextlib.redirect_stdout(io.StringIO()):
+            code = cli.main(["workflow", "run", str(workflow), "--fresh", "--yes", "--ui", "plain"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual([call.manifest_path for call in calls], [first, second])
+        self.assertTrue(all(call.fresh for call in calls))
+        self.assertFalse(first_state.exists())
+        self.assertFalse(second_state.exists())
+        state = json.loads(workflow_state.read_text(encoding="utf-8"))
+        self.assertEqual(state["steps"]["first"]["status"], "completed")
+        self.assertEqual(state["steps"]["second"]["status"], "completed")
 
     def test_workflow_passes_params_to_step_operations(self) -> None:
         first_dir = self.root / "first"

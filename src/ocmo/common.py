@@ -80,6 +80,7 @@ class RunOptions:
     resume: bool = False
     rerun: bool = False
     params: dict[str, Any] = field(default_factory=dict)
+    fresh: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,7 @@ class WorkflowOptions:
     resume: bool = False
     rerun: bool = False
     params: dict[str, Any] = field(default_factory=dict)
+    fresh: bool = False
 
 
 @dataclass(frozen=True)

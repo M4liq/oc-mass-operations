@@ -37,7 +37,7 @@ def workflow_command(args: argparse.Namespace) -> int:
         print(f"valid: {workflow_path}")
         return 0
     if command == "run":
-        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, args.dry_run, args.yes, args.ui, args.detach, False, False, params))
+        return run_workflow(WorkflowOptions(infer_workflow_path(args.workflow), args.select, args.dry_run, args.yes, args.ui, args.detach, False, False, params, args.fresh))
     if command == "status":
         return status_workflow(args)
     if command == "list":
@@ -59,7 +59,7 @@ def run_workflow(options: WorkflowOptions) -> int:
     workflow = load_workflow(options.workflow_path, options.params)
     validate_workflow(workflow, options.workflow_path)
     state_path_value = workflow_state_path(workflow, options.workflow_path)
-    existing_state = read_json_file(state_path_value) if state_path_value.exists() else {}
+    existing_state = {} if options.fresh else read_json_file(state_path_value) if state_path_value.exists() else {}
     selected = select_workflow_steps(workflow, existing_state, options.select or ("retryable" if options.rerun else "uncompleted"))
     if not selected:
         print("No workflow steps selected.")
@@ -69,6 +69,8 @@ def run_workflow(options: WorkflowOptions) -> int:
             raise OcmoError("--detach cannot be used with --dry-run")
         return start_detached_workflow(options, workflow)
     if options.dry_run:
+        if options.fresh:
+            print(f"# fresh: would erase workflow state {state_path_value}")
         print_workflow_dry_run(workflow, options.workflow_path, selected, options.rerun, options.resume)
         return 0
     if not options.yes:
@@ -77,6 +79,8 @@ def run_workflow(options: WorkflowOptions) -> int:
         if answer not in {"y", "yes"}:
             print("Cancelled.")
             return 1
+    if options.fresh:
+        clean_workflow_before_run(workflow, options.workflow_path, selected)
     state = WorkflowStateStore(state_path_value)
     state.ensure_workflow(workflow)
     for step in selected:
@@ -129,6 +133,7 @@ def run_workflow_step(workflow: dict[str, Any], workflow_path: Path, step: dict[
         resume_step,
         options.rerun,
         operation_params,
+        options.fresh,
     )
     code = run_manifest(run_options)
     status = "completed" if code == 0 else workflow_failed_step_status(operation_state_path)
@@ -137,6 +142,22 @@ def run_workflow_step(workflow: dict[str, Any], workflow_path: Path, step: dict[
         patch["error"] = f"operation exited with code {code}"
     state.mark_step(step_id, status, patch)
     return code
+
+
+def clean_workflow_before_run(workflow: dict[str, Any], workflow_path: Path, selected: list[dict[str, Any]]) -> None:
+    path = workflow_state_path(workflow, workflow_path)
+    state = read_json_file(path) if path.exists() else {}
+    if workflow_state_is_active(state) or related_workflow_detached_records(workflow_path, include_inactive=False):
+        raise OcmoError("cannot clean before run while workflow appears active; pause, kill, or erase it first")
+    remove_workflow_detached_records(workflow_path)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise OcmoError(f"could not remove workflow state {path}: {exc}") from exc
+    for step in selected:
+        manifest_path = workflow_step_manifest_path(workflow_path, step)
+        manifest = load_manifest(manifest_path, workflow_step_operation_params(workflow, step))
+        clean_operation_before_run(manifest, manifest_path)
 
 
 def workflow_failed_step_status(operation_state_path: Path) -> str:
@@ -187,6 +208,7 @@ def start_detached_workflow(options: WorkflowOptions, workflow: dict[str, Any]) 
         "logPath": str(log_path.resolve()),
         "command": command,
         "select": options.select,
+        "fresh": options.fresh,
         "params": options.params,
     }
     write_detached_metadata(local_dir / f"{run_id}.json", metadata)
@@ -205,6 +227,8 @@ def detached_workflow_child_command(options: WorkflowOptions) -> list[str]:
         command += ["--select", options.select]
     command += parameter_arguments(options.params)
     command += ["--ui", "plain", "--yes"]
+    if options.fresh and not options.resume and not options.rerun:
+        command.append("--fresh")
     return command
 
 

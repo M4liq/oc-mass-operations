@@ -143,6 +143,7 @@ def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path, allo
     concurrency = queue.get("concurrency", 1)
     if not isinstance(concurrency, int) or concurrency < 1:
         raise OcmoError("queue.concurrency must be a positive integer")
+    validate_clean(manifest.get("clean"))
     validate_operation_hooks(manifest.get("hooks"))
     auto_worktrees = auto_worktrees_config(manifest)
     if auto_worktrees["enabled"]:
@@ -542,6 +543,60 @@ def validate_operation_hooks(value: Any) -> None:
             raise OcmoError(f"hooks.{key} is not supported")
     for key in allowed:
         normalize_scripts(value.get(key), f"hooks.{key}")
+
+
+def validate_clean(value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise OcmoError("clean must be a mapping")
+    allowed = {"beforeRun", "paths"}
+    for key in value:
+        if key not in allowed:
+            raise OcmoError(f"clean.{key} is not supported")
+    before_run = value.get("beforeRun")
+    if before_run is not None and not isinstance(before_run, bool):
+        raise OcmoError("clean.beforeRun must be a boolean")
+    paths = value.get("paths")
+    if paths is None:
+        return
+    if not isinstance(paths, list):
+        raise OcmoError("clean.paths must be a list")
+    for index, item in enumerate(paths, start=1):
+        if isinstance(item, str):
+            validate_clean_relative_path(item, f"clean.paths[{index}]")
+            continue
+        if not isinstance(item, dict):
+            raise OcmoError(f"clean.paths[{index}] must be a string or mapping")
+        allowed_item = {"path", "root", "when"}
+        for key in item:
+            if key not in allowed_item:
+                raise OcmoError(f"clean.paths[{index}].{key} is not supported")
+        path = item.get("path")
+        validate_clean_relative_path(path, f"clean.paths[{index}].path")
+        root = item.get("root", "workspace")
+        if root not in {"workspace", "manifest"}:
+            raise OcmoError(f"clean.paths[{index}].root must be workspace or manifest")
+        validate_clean_when(item.get("when"), f"clean.paths[{index}].when")
+
+
+def validate_clean_relative_path(value: Any, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise OcmoError(f"{field} must be a non-empty relative path")
+    path = Path(value)
+    if path.is_absolute() or path.drive or path == Path(".") or ".." in path.parts or ".git" in path.parts:
+        raise OcmoError(f"{field} must be relative, not '.', and must not contain '..' or '.git'")
+
+
+def validate_clean_when(value: Any, field: str) -> None:
+    if value is None:
+        return
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, list) or not values:
+        raise OcmoError(f"{field} must be beforeRun, erase, or a non-empty list")
+    for item in values:
+        if item not in {"beforeRun", "erase"}:
+            raise OcmoError(f"{field} values must be beforeRun or erase")
 
 
 def normalize_scripts(value: Any, field: str) -> list[str]:

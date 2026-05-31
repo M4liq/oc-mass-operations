@@ -141,6 +141,10 @@ hooks:
   afterRun: []
   onFailure: []
 
+clean:
+  beforeRun: false
+  paths: []
+
 policy:
   worktree: single
 
@@ -164,6 +168,7 @@ Key sections:
 - `runner` configures the `opencode run` process used for each selected work unit.
 - `selection` and `queue` control which work units run and how much parallelism is allowed.
 - `hooks` optionally runs shell scripts around operation execution.
+- `clean` optionally declares transient paths removed by fresh runs and erase.
 - `policy` describes worktree safety assumptions.
 - `prompt.template` points to the prompt rendered for each work unit.
 - `workUnits[].payload` is task-specific data available to the prompt template.
@@ -227,6 +232,7 @@ Review `state.json` beside the manifest for durable execution status, including 
 | Preview rendered prompts | `ocmo operation render [manifest-or-directory] --select <selector>` |
 | Preview execution | `ocmo operation run [manifest-or-directory] --select <selector> --dry-run` |
 | Execute operation foreground | `ocmo operation run [manifest-or-directory] --select <selector> --yes` |
+| Execute operation from a clean slate | `ocmo operation run [manifest-or-directory] --fresh --yes` |
 | Execute operation background | `ocmo operation run [manifest-or-directory] --select <selector> --detach` |
 | Watch operation status | `ocmo operation status [manifest-or-directory]` |
 | Show operation status once | `ocmo operation status [manifest-or-directory] --once` |
@@ -238,6 +244,7 @@ Review `state.json` beside the manifest for durable execution status, including 
 | Erase operation runtime data | `ocmo operation erase .ocmo/<operation>/manifest.yaml --force` |
 | Validate workflow | `ocmo workflow validate <workflow>` |
 | Execute workflow background | `ocmo workflow run <workflow> --detach` |
+| Execute workflow from a clean slate | `ocmo workflow run <workflow> --fresh --yes` |
 | Watch workflow status | `ocmo workflow status <workflow>` |
 | Show workflow status once | `ocmo workflow status <workflow> --once` |
 | List workflow runs and discovered workflow states | `ocmo workflow list` |
@@ -278,7 +285,7 @@ When many prompts are selected, preview output is compact by default: first two 
 ## Running
 
 ```powershell
-ocmo operation run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--param <name=value>] [--params-file <path>] [--allow-shared-worktree-concurrency] [--detach] [--dry-run] [--all] [--yes]
+ocmo operation run [manifest-or-directory] [--select <selector>] [--concurrency <count>] [--timeout-seconds <seconds>] [--ui auto|live|plain] [--param <name=value>] [--params-file <path>] [--allow-shared-worktree-concurrency] [--fresh] [--detach] [--dry-run] [--all] [--yes]
 ```
 
 Useful options:
@@ -289,6 +296,7 @@ Useful options:
 - `--param <name=value>`: supplies a runtime parameter for `{{params.name}}` placeholders; can be repeated.
 - `--params-file <path>`: loads runtime parameters from a YAML or JSON mapping; inline `--param` values override file values.
 - `--ui auto|live|plain`: controls foreground terminal output.
+- `--fresh`: removes operation runtime data before selecting work units, so default `uncompleted` selection behaves like a new operation.
 - `--yes`, `-y`: skips confirmation for foreground runs.
 - `--detach`: starts a background `ocmo operation run` and returns a run ID.
 
@@ -297,6 +305,24 @@ If `policy.worktree: single` uses concurrency above `1`, `ocmo operation run` re
 Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata. `ocmo operation status` continuously refreshes operation status until interrupted, summarizes operation token usage and total operation elapsed time, and includes compact per-work-unit `Work Time`, `Agent Time`, and `Tokens` columns. `Tokens` is formatted as `input/output`.
 
 Changing a manifest or prompt template while an operation is running does not affect already-started agent processes. It can affect queued work units or later sequential run steps because prompts are rendered immediately before each run starts. Long-prompt transport writes the prompt input file before launching the agent, so edits after launch do not change that launched run.
+
+## Cleaning Fresh Runs
+
+Use `--fresh` when an operation should behave like a build from clean transient outputs. Fresh runs remove OCMO runtime files before selecting work units: configured state, `outputs/`, `artifacts/`, `prompt-inputs/`, and detached run metadata. If the manifest sets `clean.beforeRun: true`, plain `ocmo operation run` behaves as a fresh run. Dry runs do not delete files; they preview cleanup targets.
+
+```yaml
+clean:
+  beforeRun: true
+  paths:
+    - root: workspace
+      path: generated/ocmo-results
+      when: [beforeRun, erase]
+    - root: manifest
+      path: scratch
+      when: erase
+```
+
+Custom clean paths are exact relative paths only. `root` is `workspace` or `manifest` and defaults to `workspace`. `when` is `beforeRun`, `erase`, or a list of those values and defaults to both. OCMO rejects absolute paths, `..`, `.`, and `.git` path components. Fresh cleanup refuses to run while the operation appears active.
 
 ## Operation Hooks
 
@@ -362,6 +388,7 @@ Workflow commands:
 ```powershell
 ocmo workflow validate workflow.yaml
 ocmo workflow run workflow.yaml --dry-run
+ocmo workflow run workflow.yaml --fresh --yes
 ocmo workflow run workflow.yaml --detach
 ocmo workflow status workflow.yaml
 ocmo workflow status workflow.yaml --once
@@ -386,6 +413,8 @@ Workflow `defaults` and individual `steps` can pass operation run overrides to r
 Step values override workflow defaults. Operation-specific `params` merge after workflow parameters, then `defaults.params`, then `steps[].params`.
 
 Workflows also accept `--param` and `--params-file`; the resolved parameters apply to the workflow file and every referenced operation manifest.
+
+`ocmo workflow run --fresh` removes workflow state before step selection and runs each selected operation with operation-level fresh cleanup. Use it when a workflow should re-execute from a clean slate instead of continuing from completed workflow and operation state.
 
 ## Runtime Parameters
 
@@ -487,11 +516,13 @@ Pressing `Ctrl+C` during `ocmo operation plan` terminates the active planner pro
 
 `rerun` is a fresh start and never uses `--session`. By default, `ocmo operation rerun` selects `retryable` work units: `paused_unresumable`, `timed_out`, `failed`, `cleanup_failed`, `worktree_failed`, `setup_failed`, and `killed`. Use `--select unresumable`, `--select timed-out`, `--select failed`, `--select killed`, `--select all`, or explicit work unit IDs/ranges to narrow or expand the fresh rerun.
 
+`run --fresh` is different from `rerun`: it erases runtime data first, then performs normal run selection against an empty operation state. Use it when you want the whole operation or workflow to behave like a clean build output, not just retry failed work.
+
 If an `opencode run` exceeds `timeoutSeconds`, ocmo terminates the child process tree, marks the run and work unit `timed_out`, and treats that work unit as retryable for `ocmo operation rerun --select timed-out` or the default `--select retryable`.
 
 `kill` terminates tracked processes and marks active work units/runs as `killed`, preserving the operation directory, state, outputs, logs, and artifacts for audit.
 
-`erase` runs the same termination step and removes only operation runtime data (`state.json`, `outputs/`, `artifacts/`, `prompt-inputs/`, and detached run metadata). It never deletes operation definition files such as `manifest.yaml`, prompt templates, or notes; delete those manually if they are no longer needed. In non-interactive mode, use `--force`. It refuses manifests outside `.ocmo/<operation>/manifest.yaml`.
+`erase` runs the same termination step and removes operation runtime data (`state.json`, `outputs/`, `artifacts/`, `prompt-inputs/`, detached run metadata, and manifest `clean.paths` entries whose `when` includes `erase`). It never deletes operation definition files such as `manifest.yaml`, prompt templates, or notes; delete those manually if they are no longer needed. In non-interactive mode, use `--force`. It refuses manifests outside `.ocmo/<operation>/manifest.yaml`.
 
 ## Selection Rules
 
