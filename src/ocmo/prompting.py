@@ -218,7 +218,7 @@ def build_command(
 ) -> list[str]:
     operation = manifest["operation"]
     runner = runner or manifest["runner"]
-    command = [runner.get("command", "opencode"), "run"]
+    command = [resolve_executable_command(str(runner.get("command", "opencode"))), "run"]
     if runner.get("agent"):
         command += ["--agent", str(runner["agent"])]
     if runner.get("model"):

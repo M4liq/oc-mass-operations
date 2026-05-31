@@ -680,6 +680,36 @@ class SelectionAndRenderingTests(OcmoTestCase):
         self.assertEqual(command[-1], cli.PROMPT_FILE_MESSAGE)
         self.assertNotIn("long prompt", cli.format_command(command))
 
+    def test_build_command_resolves_bare_windows_runner_command(self) -> None:
+        manifest = self.load()
+        resolved = str(self.root / "npm" / "opencode.cmd")
+
+        with mock.patch("ocmo.cli.os.name", "nt"), mock.patch("ocmo.cli.shutil.which", return_value=resolved) as which:
+            command = cli.build_command(manifest, self.manifest_path, "prompt")
+
+        which.assert_called_once_with("opencode")
+        self.assertEqual(command[0], resolved)
+
+    def test_build_command_keeps_explicit_windows_runner_command(self) -> None:
+        manifest = self.load()
+        manifest["runner"]["command"] = r".\.ocmo\runner.cmd"
+
+        with mock.patch("ocmo.cli.os.name", "nt"), mock.patch("ocmo.cli.shutil.which") as which:
+            command = cli.build_command(manifest, self.manifest_path, "prompt")
+
+        which.assert_not_called()
+        self.assertEqual(command[0], r".\.ocmo\runner.cmd")
+
+    def test_build_plan_command_resolves_bare_windows_opencode(self) -> None:
+        args = mock.Mock(model=None, read_files=[], reasoning_effort=None)
+        resolved = str(self.root / "npm" / "opencode.cmd")
+
+        with mock.patch("ocmo.cli.os.name", "nt"), mock.patch("ocmo.cli.shutil.which", return_value=resolved) as which:
+            command = cli.build_plan_command(args, "prompt", self.workspace)
+
+        which.assert_called_once_with("opencode")
+        self.assertEqual(command[0], resolved)
+
     def test_prompt_input_path_is_absolute_for_relative_manifest(self) -> None:
         path = cli.prompt_input_path(Path(".ocmo/op/manifest.yaml"), "ITEM-1", "default")
 

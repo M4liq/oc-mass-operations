@@ -57,6 +57,16 @@ PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
 RESOLVED_PARAMS_KEY = "__ocmoResolvedParams"
 
 
+def resolve_executable_command(command: str) -> str:
+    if os.name != "nt" or not is_bare_executable_command(command):
+        return command
+    return shutil.which(command) or command
+
+
+def is_bare_executable_command(command: str) -> bool:
+    return not any(separator in command for separator in ("/", "\\", ":"))
+
+
 class OcmoError(Exception):
     pass
 

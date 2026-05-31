@@ -183,7 +183,7 @@ def plan_prompt_input_path(out_path: Path, attempt: int) -> Path:
 
 
 def build_plan_command(args: argparse.Namespace, prompt: str, workspace: Path, interactive: bool = False, prompt_file: Path | None = None) -> list[str]:
-    command = ["opencode", "run", "--agent", PLAN_AGENT]
+    command = [resolve_executable_command("opencode"), "run", "--agent", PLAN_AGENT]
     if args.model:
         command += ["--model", args.model]
     if getattr(args, "reasoning_effort", None):
