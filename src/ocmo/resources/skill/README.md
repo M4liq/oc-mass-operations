@@ -1,6 +1,6 @@
 # OCMO Skill Handbook
 
-This handbook is installed with the `/ocmo` opencode skill by `ocmo skill install`. It is version-matched to the OCMO CLI that installed it.
+This handbook is installed with the `/ocmo` skill by `ocmo skill install` for every supported agent (opencode and Claude Code). It is version-matched to the OCMO CLI that installed it.
 
 Use it when working with OCMO commands, `ocmo/v1` operation manifests, `ocmo-workflow/v1` workflow files, generated `.ocmo` operation folders, state files, outputs, planning, execution, or operation/workflow control.
 
@@ -101,7 +101,7 @@ Runs selected work units.
 - `--detach`: starts a background `ocmo operation run` with `--yes` and `--ui plain`, writes detached metadata/logs under `.ocmo/runs/`, writes a global registry entry, returns a run ID, and exits.
 - `--allow-shared-worktree-concurrency`: allows concurrency above `1` when `policy.worktree: single`. Use only when selected work unit scopes are explicitly non-overlapping.
 
-Very long rendered prompts are written under `prompt-inputs/` beside the manifest and attached to `opencode run` with `--file` to avoid OS command-line limits. Dry runs show the rendered prompt and note when file transport would be used.
+Very long rendered prompts are written under `prompt-inputs/` beside the manifest to avoid OS command-line limits and attached to `opencode run` with `--file`; when `runner.provider` is `claude-code`, the prompt is piped via stdin instead and the file is kept as an audit copy. Dry runs show the rendered prompt and note when file or stdin transport would be used.
 
 Changing a manifest or prompt template while an operation is running does not affect already-started agent processes. It can affect queued work units or later sequential run steps because prompts are rendered immediately before each run starts. Long-prompt transport writes the prompt input file before launching the agent, so edits after launch do not change that launched run.
 
@@ -153,9 +153,9 @@ Stops active tracked processes and marks running work units/runs as paused.
 ocmo operation resume [manifest-or-directory] [--detach] [--yes] [--ui auto|live|plain]
 ```
 
-Strictly resumes paused runs by persisted opencode session id.
+Strictly resumes paused runs by persisted runner session id.
 
-- Uses `opencode run --session <sessionId>`.
+- Uses `opencode run --session <sessionId>` (or `claude -p --resume <sessionId>` when `runner.provider` is `claude-code`).
 - Never falls back to `opencode --continue`.
 - Fails for `paused_unresumable` work.
 - Use `ocmo operation rerun` for fresh retry of unresumable work.
@@ -204,11 +204,11 @@ ocmo skill install [--force]
 ocmo skill path
 ```
 
-- `install`: installs or updates the bundled `/ocmo` opencode skill and this handbook under `~/.config/opencode/skills/ocmo/`, and installs `/ocmo-operation-statuses` and `/ocmo-workflow-statuses` under `~/.config/opencode/commands/`.
-- `path`: prints the installed `SKILL.md` path.
+- `install`: installs or updates the bundled `/ocmo` skill and this handbook for every supported agent whose config directory is present — opencode (`~/.config/opencode/skills/ocmo/`) and Claude Code (`~/.claude/skills/ocmo/`) — and installs `/ocmo-operation-statuses` and `/ocmo-workflow-statuses` under each agent's `commands/` directory. Agents whose directory is missing are reported and skipped.
+- `path`: prints the target `SKILL.md` path for each supported agent.
 - `--force`: accepted for compatibility; install updates bundled skill files by default.
 
-Restart opencode after installing or updating the skill.
+Restart opencode or start a new Claude Code session after installing or updating the skill.
 
 ### `/ocmo-operation-statuses`
 
@@ -406,10 +406,11 @@ Manifest rules:
 - `operation.id` is the stable operation identifier.
 - `operation.description` should explain the operation goal in human-readable terms.
 - `operation.workspace` is the target repository or directory for `opencode run`.
-- `runner.command` is normally `opencode`.
-- Explicit `runner.agent` and run-step `agent` values must be `build`.
-- `runner.model` is optional.
-- `runner.attach` is an optional `opencode serve` URL.
+- `runner.provider` selects the agent CLI: `opencode` (default) or `claude-code`. One provider per manifest; run steps cannot override it.
+- `runner.command` is normally `opencode` (or `claude` when `runner.provider` is `claude-code`).
+- Explicit `runner.agent` and run-step `agent` values must be `build`. opencode only — ignored with a warning under `claude-code`.
+- `runner.model` is optional. For `claude-code` it must be a plain Anthropic model name (e.g. `sonnet`), not `provider/model`.
+- `runner.attach` is an optional `opencode serve` URL. opencode only — ignored with a warning under `claude-code`.
 - `runner.timeoutSeconds` controls the per-run timeout unless overridden from the CLI.
 - `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` when true.
 - `selection.default` is used when `--select` is omitted. Prefer `uncompleted` for repeatable operations.

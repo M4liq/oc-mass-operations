@@ -216,6 +216,19 @@ def build_command(
     runner: dict[str, Any] | None = None,
     prompt_file: Path | None = None,
 ) -> list[str]:
+    if runner_provider(runner or manifest["runner"]) == "claude-code":
+        return build_claude_code_command(manifest, manifest_path, prompt_text, run_dir, runner, prompt_file)
+    return build_opencode_command(manifest, manifest_path, prompt_text, run_dir, runner, prompt_file)
+
+
+def build_opencode_command(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    prompt_text: str,
+    run_dir: Path | None = None,
+    runner: dict[str, Any] | None = None,
+    prompt_file: Path | None = None,
+) -> list[str]:
     operation = manifest["operation"]
     runner = runner or manifest["runner"]
     command = [runner.get("command", "opencode"), "run"]
@@ -248,7 +261,9 @@ def build_resume_command(
     runner: dict[str, Any] | None = None,
     prompt_file: Path | None = None,
 ) -> list[str]:
-    command = build_command(manifest, manifest_path, prompt_text, run_dir, runner, prompt_file)
+    if runner_provider(runner or manifest["runner"]) == "claude-code":
+        return build_claude_code_resume_command(manifest, manifest_path, prompt_text, session_id, run_dir, runner, prompt_file)
+    command = build_opencode_command(manifest, manifest_path, prompt_text, run_dir, runner, prompt_file)
     command[2:2] = ["--session", session_id]
     return command
 
@@ -278,9 +293,15 @@ def build_transport_command(
     prompt_file: Path,
     run_dir: Path | None = None,
     runner: dict[str, Any] | None = None,
-) -> tuple[list[str], Path | None]:
+) -> tuple[list[str], Path | None, str | None]:
     command = build_command(manifest, manifest_path, prompt_text, run_dir, runner)
     if not should_use_prompt_file(command):
-        return command, None
+        return command, None, None
+    # The prompt file is always written so long prompts stay auditable; for
+    # claude-code it is only an audit copy because the CLI has no --file flag
+    # and the prompt travels via stdin instead.
     written_prompt_file = write_prompt_input(prompt_file, prompt_text)
-    return build_command(manifest, manifest_path, prompt_text, run_dir, runner, written_prompt_file), written_prompt_file
+    file_command = build_command(manifest, manifest_path, prompt_text, run_dir, runner, written_prompt_file)
+    if runner_provider(runner or manifest["runner"]) == "claude-code":
+        return file_command, written_prompt_file, prompt_text
+    return file_command, written_prompt_file, None

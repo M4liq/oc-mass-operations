@@ -53,7 +53,7 @@ class PlainRunReporter:
     def worker_error(self, item_id: str, error: Exception) -> None:
         print(f"[{item_id}] unexpected worker error: {error}")
 
-    def subprocess_output(self, item_id: str, run_id: str, completed: subprocess.CompletedProcess) -> None:
+    def subprocess_output(self, item_id: str, run_id: str, completed: subprocess.CompletedProcess, provider: str = DEFAULT_RUNNER_PROVIDER) -> None:
         return None
 
 
@@ -166,9 +166,9 @@ class LiveRunReporter(PlainRunReporter):  # pragma: no cover
     def worker_error(self, item_id: str, error: Exception) -> None:
         self.item(item_id, "failed", f"unexpected worker error: {error}")
 
-    def subprocess_output(self, item_id: str, run_id: str, completed: subprocess.CompletedProcess) -> None:
+    def subprocess_output(self, item_id: str, run_id: str, completed: subprocess.CompletedProcess, provider: str = DEFAULT_RUNNER_PROVIDER) -> None:
         text = "\n".join(part for part in [getattr(completed, "stdout", ""), getattr(completed, "stderr", "")] if part)
-        rendered = render_opencode_output_text(text)
+        rendered = provider_render_output_text(provider, text)
         last_line = next((line.strip() for line in reversed(rendered.splitlines()) if line.strip()), "")
         if last_line:
             with self.lock:
@@ -329,7 +329,7 @@ def verify_handoff_artifact(path: Path, relative: str, config: dict[str, Any]) -
     return handoff
 
 
-def run_opencode_command(
+def run_runner_command(
     command: list[str],
     run_dir: Path,
     run_timeout: int | None,
@@ -337,11 +337,16 @@ def run_opencode_command(
     on_start: Any | None = None,
     on_session: Any | None = None,
     on_usage: Any | None = None,
+    provider: str = DEFAULT_RUNNER_PROVIDER,
+    stdin_text: str | None = None,
 ) -> subprocess.CompletedProcess:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     env = opencode_capture_env()
     with output_path.open("w", encoding="utf-8") as output:
-        output.write(f"$ {format_command(command)}\n\n")
+        output.write(f"$ {format_command(command, prompt_in_argv=stdin_text is None)}\n")
+        if stdin_text is not None:
+            output.write(f"[ocmo] prompt sent via stdin ({len(stdin_text)} chars)\n")
+        output.write("\n")
         output.flush()
         process: subprocess.Popen[str] | None = None
         transcript_needs_newline = False
@@ -366,6 +371,7 @@ def run_opencode_command(
             process = subprocess.Popen(
                 command,
                 cwd=str(run_dir),
+                stdin=subprocess.PIPE if stdin_text is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -376,6 +382,19 @@ def run_opencode_command(
             if on_start:
                 on_start(process.pid)
             if on_session:
+                if stdin_text is not None:
+                    # Write stdin from its own thread so a full stdout pipe
+                    # cannot deadlock the write against the reader below.
+                    def write_stdin() -> None:
+                        try:
+                            assert process is not None
+                            assert process.stdin is not None
+                            process.stdin.write(stdin_text)
+                            process.stdin.close()
+                        except OSError:  # pragma: no cover - process exited early
+                            pass
+
+                    threading.Thread(target=write_stdin, daemon=True).start()
                 chunks = []
                 read_error: list[BaseException] = []
 
@@ -385,11 +404,11 @@ def run_opencode_command(
                         assert process.stdout is not None
                         for line in process.stdout:
                             chunks.append(line)
-                            write_transcript(render_opencode_output_line(line))
-                            session_id = extract_session_id(line)
+                            write_transcript(provider_render_output_line(provider, line))
+                            session_id = provider_extract_session_id(provider, line)
                             if session_id:
                                 on_session(session_id)
-                            usage = extract_usage_delta(line)
+                            usage = provider_extract_usage_delta(provider, line)
                             if usage and on_usage:
                                 on_usage(usage)
                     except BaseException as exc:  # pragma: no cover - defensive; re-raised by caller
@@ -403,12 +422,17 @@ def run_opencode_command(
                     raise read_error[0]
                 stdout = "".join(chunks)
             else:
-                stdout, _ = process.communicate(timeout=run_timeout)
+                if stdin_text is not None:
+                    stdout, _ = process.communicate(input=stdin_text, timeout=run_timeout)
+                else:
+                    stdout, _ = process.communicate(timeout=run_timeout)
                 if on_usage:
-                    for usage in extract_usage_deltas(stdout or ""):
-                        on_usage(usage)
+                    for line in (stdout or "").splitlines():
+                        usage = provider_extract_usage_delta(provider, line)
+                        if usage:
+                            on_usage(usage)
                 for line in (stdout or "").splitlines(keepends=True):
-                    write_transcript(render_opencode_output_line(line))
+                    write_transcript(provider_render_output_line(provider, line))
         except subprocess.TimeoutExpired:
             if process is not None:
                 terminate_process_tree(process.pid, force=True)

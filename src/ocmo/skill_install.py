@@ -27,37 +27,50 @@ import yaml
 
 from .common import *
 
-def install_skill(force: bool = False) -> Path:
+def install_skill(force: bool = False) -> list[Path]:
     source_dir = bundled_skill_dir()
-    destination = opencode_skill_path()
-    destination_dir = destination.parent
     source_files = bundled_skill_files(source_dir)
-    if destination.exists():
-        if installed_skill_matches(destination_dir, source_files):
-            print(f"already installed: {destination}")
-            install_opencode_commands()
-            remove_old_skill_installs(destination_dir.parent)
-            return destination
-        action = "updated"
-    else:
-        action = "installed"
+    installed: list[Path] = []
+    available = False
+    for target in skill_provider_targets():
+        skills_dir = target["skills_dir"]
+        if skills_dir is None or not skills_dir.parent.exists():
+            reason = "could not determine home directory" if skills_dir is None else f"{skills_dir.parent} not found"
+            print(f"{target['label']} not available ({reason}); skipping")
+            continue
+        available = True
+        installed.append(install_skill_to_target(target, source_files))
+    if not available:
+        print("no supported agent directories found; nothing installed")
+    return installed
+
+
+def install_skill_to_target(target: dict[str, Any], source_files: dict[Path, Any]) -> Path:
+    skills_dir = target["skills_dir"]
+    destination_dir = skills_dir / OCMO_SKILL_NAME
+    destination = destination_dir / "SKILL.md"
+    if destination.exists() and installed_skill_matches(destination_dir, source_files):
+        print(f"already installed: {destination}")
+        install_skill_commands(target["commands_dir"])
+        remove_old_skill_installs(skills_dir)
+        return destination
+    action = "updated" if destination.exists() else "installed"
     destination_dir.mkdir(parents=True, exist_ok=True)
     for relative_path, source_path in source_files.items():
-        target = destination_dir / relative_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(source_path.read_bytes())
+        out = destination_dir / relative_path
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(source_path.read_bytes())
     print(f"{action}: {destination}")
-    install_opencode_commands()
-    remove_old_skill_installs(destination_dir.parent)
-    print("restart opencode to load the skill")
+    install_skill_commands(target["commands_dir"])
+    remove_old_skill_installs(skills_dir)
+    print(target["restart"])
     return destination
 
 
-def install_opencode_commands() -> None:
+def install_skill_commands(destination_dir: Path | None) -> None:
     source_dir = bundled_command_dir()
-    if not source_dir.exists():
+    if destination_dir is None or not source_dir.exists():
         return
-    destination_dir = opencode_commands_dir()
     destination_dir.mkdir(parents=True, exist_ok=True)
     for source_path in sorted((path for path in source_dir.iterdir() if path.name.endswith(".md")), key=lambda path: path.name):
         target = destination_dir / source_path.name
@@ -108,20 +121,57 @@ def remove_old_skill_installs(skills_dir: Path) -> None:
         print(f"removed old skill: {old_skill}")
 
 
-def opencode_skill_path() -> Path:
-    root = os.environ.get("OCMO_OPENCODE_SKILLS_DIR")
-    skills_dir = Path(root) if root else Path.home() / ".config" / "opencode" / "skills"
-    return skills_dir / OCMO_SKILL_NAME / "SKILL.md"
+def agent_home() -> Path | None:
+    try:
+        return Path.home()
+    except RuntimeError:
+        return None
 
 
-def opencode_commands_dir() -> Path:
-    root = os.environ.get("OCMO_OPENCODE_COMMANDS_DIR")
-    if root:
-        return Path(root)
-    skills_root = os.environ.get("OCMO_OPENCODE_SKILLS_DIR")
-    if skills_root:
-        return Path(skills_root).parent / "commands"
-    return Path.home() / ".config" / "opencode" / "commands"
+def env_path(name: str) -> Path | None:
+    value = os.environ.get(name)
+    return Path(value) if value else None
+
+
+def skill_provider_targets() -> list[dict[str, Any]]:
+    """Skill install targets per supported agent. ``skills_dir`` is None when the
+    default location cannot be resolved (no override and no home directory)."""
+    home = agent_home()
+    targets: list[dict[str, Any]] = []
+
+    opencode_skills = env_path("OCMO_OPENCODE_SKILLS_DIR")
+    if opencode_skills is None and home is not None:
+        opencode_skills = home / ".config" / "opencode" / "skills"
+    opencode_commands = env_path("OCMO_OPENCODE_COMMANDS_DIR")
+    if opencode_commands is None and opencode_skills is not None:
+        opencode_commands = opencode_skills.parent / "commands"
+    targets.append({
+        "provider": "opencode",
+        "label": "opencode",
+        "skills_dir": opencode_skills,
+        "commands_dir": opencode_commands,
+        "restart": "restart opencode to load the skill",
+    })
+
+    claude_skills = env_path("OCMO_CLAUDE_SKILLS_DIR")
+    if claude_skills is None and home is not None:
+        claude_skills = home / ".claude" / "skills"
+    claude_commands = env_path("OCMO_CLAUDE_COMMANDS_DIR")
+    if claude_commands is None and claude_skills is not None:
+        claude_commands = claude_skills.parent / "commands"
+    targets.append({
+        "provider": "claude-code",
+        "label": "claude",
+        "skills_dir": claude_skills,
+        "commands_dir": claude_commands,
+        "restart": "start a new claude session to load the skill",
+    })
+    return targets
+
+
+def skill_target_path(target: dict[str, Any]) -> Path | None:
+    skills_dir = target["skills_dir"]
+    return skills_dir / OCMO_SKILL_NAME / "SKILL.md" if skills_dir is not None else None
 
 
 def bundled_skill_path() -> Path:

@@ -5,6 +5,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -747,6 +748,231 @@ class SelectionAndRenderingTests(OcmoTestCase):
         self.assertEqual(command[command.index("--variant") + 1], "high")
 
 
+FAKE_CLAUDE_SCRIPT = """\
+import json
+import sys
+
+args = sys.argv[1:]
+positional = []
+index = 0
+while index < len(args):
+    arg = args[index]
+    if arg in ("--output-format", "--model", "--resume"):
+        index += 2
+        continue
+    if arg in ("-p", "--verbose", "--dangerously-skip-permissions"):
+        index += 1
+        continue
+    positional.append(arg)
+    index += 1
+if "-p" not in args or "--output-format" not in args or "--verbose" not in args:
+    raise SystemExit(3)
+prompt = positional[0] if positional else sys.stdin.read()
+print(json.dumps({"type": "system", "subtype": "init", "session_id": "fake-session"}))
+print(json.dumps({"type": "assistant", "session_id": "fake-session", "message": {"content": [{"type": "text", "text": "prompt length %d" % len(prompt)}]}}))
+print(json.dumps({"type": "result", "subtype": "success", "session_id": "fake-session", "total_cost_usd": 0.05, "usage": {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 1, "cache_read_input_tokens": 2}}))
+"""
+
+
+class ClaudeCodeProviderTests(OcmoTestCase):
+    def claude_runner(self, **extra) -> dict:
+        return {"provider": "claude-code", "command": "claude", **extra}
+
+    def make_fake_claude(self) -> Path:
+        script = self.root / "fake_claude.py"
+        script.write_text(FAKE_CLAUDE_SCRIPT, encoding="utf-8")
+        if os.name == "nt":
+            wrapper = self.root / "fake_claude.cmd"
+            wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        else:
+            wrapper = self.root / "fake_claude"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+        return wrapper
+
+    def test_build_command_claude_code_flags(self) -> None:
+        manifest = self.load()
+        command = cli.build_command(
+            manifest,
+            self.manifest_path,
+            "do the task",
+            runner=self.claude_runner(model="claude-sonnet-4-6", dangerouslySkipPermissions=True),
+        )
+        self.assertEqual(
+            command,
+            ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", "claude-sonnet-4-6", "--dangerously-skip-permissions", "do the task"],
+        )
+
+    def test_build_command_claude_code_ignores_opencode_fields(self) -> None:
+        manifest = self.load()
+        command = cli.build_command(
+            manifest,
+            self.manifest_path,
+            "prompt",
+            runner=self.claude_runner(agent="build", reasoningEffort="high", attach="http://localhost:1", title="My Title"),
+        )
+        for flag in ("--agent", "--variant", "--attach", "--title", "--format", "--file", "--dir"):
+            self.assertNotIn(flag, command)
+        self.assertEqual(command[-1], "prompt")
+
+    def test_build_resume_command_claude_code(self) -> None:
+        manifest = self.load()
+        command = cli.build_resume_command(manifest, self.manifest_path, "continue", "sess-1", runner=self.claude_runner())
+        self.assertEqual(command[:4], ["claude", "-p", "--resume", "sess-1"])
+        self.assertEqual(command[-1], "continue")
+        self.assertNotIn("--session", command)
+
+    def test_build_transport_command_claude_code_uses_stdin_for_long_prompts(self) -> None:
+        manifest = self.load()
+        prompt_file = self.root / "prompt-input.md"
+        long_prompt = "x" * (cli.PROMPT_ARG_MAX_CHARS + 1)
+        command, written, stdin_text = cli.build_transport_command(manifest, self.manifest_path, long_prompt, prompt_file, runner=self.claude_runner())
+        self.assertEqual(stdin_text, long_prompt)
+        self.assertEqual(written, prompt_file)
+        self.assertEqual(prompt_file.read_text(encoding="utf-8"), long_prompt)
+        self.assertNotIn(long_prompt, command)
+        self.assertNotIn("--file", command)
+        self.assertEqual(command[-1], "--verbose")
+
+    def test_build_transport_command_claude_code_short_prompt_stays_in_argv(self) -> None:
+        manifest = self.load()
+        command, written, stdin_text = cli.build_transport_command(manifest, self.manifest_path, "short", self.root / "prompt-input.md", runner=self.claude_runner())
+        self.assertIsNone(written)
+        self.assertIsNone(stdin_text)
+        self.assertEqual(command[-1], "short")
+
+    def test_build_transport_command_opencode_keeps_file_transport(self) -> None:
+        manifest = self.load()
+        prompt_file = self.root / "prompt-input.md"
+        long_prompt = "y" * (cli.PROMPT_ARG_MAX_CHARS + 1)
+        command, written, stdin_text = cli.build_transport_command(manifest, self.manifest_path, long_prompt, prompt_file)
+        self.assertIsNone(stdin_text)
+        self.assertEqual(written, prompt_file)
+        self.assertIn("--file", command)
+        self.assertEqual(command[-1], cli.PROMPT_FILE_MESSAGE)
+
+    def test_validate_manifest_rejects_unknown_runner_provider(self) -> None:
+        manifest = self.load()
+        manifest["runner"]["provider"] = "cursor"
+        with self.assertRaisesRegex(cli.OcmoError, "runner.provider must be one of"):
+            cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_validate_manifest_rejects_claude_code_model_with_slash(self) -> None:
+        manifest = self.load()
+        manifest["runner"]["provider"] = "claude-code"
+        manifest["runner"]["model"] = "openai/gpt-5.5"
+        with self.assertRaisesRegex(cli.OcmoError, "plain Anthropic model name"):
+            cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_validate_manifest_accepts_claude_code_models(self) -> None:
+        for model in ("sonnet", "opus", "claude-sonnet-4-6"):
+            manifest = self.load()
+            manifest["runner"]["provider"] = "claude-code"
+            manifest["runner"]["model"] = model
+            cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_validate_manifest_rejects_step_level_provider(self) -> None:
+        manifest = self.load()
+        manifest["workUnits"][0]["runs"] = {"steps": [{"id": "plan", "provider": "claude-code"}]}
+        with self.assertRaisesRegex(cli.OcmoError, "set runner.provider once per manifest"):
+            cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_provider_runner_warnings_list_ignored_fields(self) -> None:
+        manifest = self.load()
+        manifest["runner"].update({"provider": "claude-code", "agent": "build", "reasoningEffort": "high", "title": "T"})
+        manifest["workUnits"][0]["runs"] = {"steps": [{"id": "plan", "attach": "http://localhost:1"}]}
+        warnings = cli.provider_runner_warnings(manifest)
+        self.assertEqual(
+            warnings,
+            [
+                "warning: runner.agent is ignored when runner.provider=claude-code",
+                "warning: runner.reasoningEffort is ignored when runner.provider=claude-code",
+                "warning: runs.steps[].attach is ignored when runner.provider=claude-code",
+                "warning: runner.title is ignored when runner.provider=claude-code",
+            ],
+        )
+
+    def test_provider_runner_warnings_empty_for_opencode(self) -> None:
+        manifest = self.load()
+        manifest["runner"]["title"] = "T"
+        self.assertEqual(cli.provider_runner_warnings(manifest), [])
+
+    def test_validate_command_prints_provider_warnings_once(self) -> None:
+        self.write_manifest()
+        text = self.manifest_path.read_text(encoding="utf-8")
+        self.manifest_path.write_text(text.replace("command: opencode", "command: claude\n  provider: claude-code"), encoding="utf-8")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.main(["operation", "validate", str(self.manifest_path)])
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr.getvalue().count("runner.agent is ignored"), 1)
+
+    def test_render_claude_output_line(self) -> None:
+        assistant = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello"}, {"type": "tool_use", "name": "Bash"}, {"type": "text", "text": " world"}]}})
+        self.assertEqual(cli.render_claude_output_line(assistant), "Hello world\n")
+        self.assertEqual(cli.render_claude_output_line(json.dumps({"type": "system", "subtype": "init"})), "")
+        self.assertEqual(cli.render_claude_output_line(json.dumps({"type": "result", "result": "final"})), "")
+        self.assertEqual(cli.render_claude_output_line("plain text\n"), "plain text\n")
+        self.assertEqual(cli.render_claude_output_line('{"broken json\n'), "")
+
+    def test_extract_claude_session_id(self) -> None:
+        output = "noise\n" + json.dumps({"type": "system", "subtype": "init", "session_id": "sess-init"}) + "\n"
+        self.assertEqual(cli.extract_claude_session_id(output), "sess-init")
+        self.assertIsNone(cli.extract_claude_session_id("no events here"))
+
+    def test_extract_claude_usage_delta(self) -> None:
+        result = json.dumps({"type": "result", "subtype": "success", "total_cost_usd": 0.25, "usage": {"input_tokens": 100, "output_tokens": 20, "cache_creation_input_tokens": 5, "cache_read_input_tokens": 50}})
+        usage = cli.extract_claude_usage_delta(result)
+        self.assertEqual(usage["input"], 100)
+        self.assertEqual(usage["output"], 20)
+        self.assertEqual(usage["cacheWrite"], 5)
+        self.assertEqual(usage["cacheRead"], 50)
+        self.assertEqual(usage["total"], 175)
+        self.assertEqual(usage["cost"], 0.25)
+        self.assertEqual(usage["steps"], 1)
+        self.assertIsNone(cli.extract_claude_usage_delta(json.dumps({"type": "assistant"})))
+        self.assertIsNone(cli.extract_claude_usage_delta("not json"))
+
+    def test_command_without_prompt_keeps_argv_in_stdin_mode(self) -> None:
+        command = ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+        self.assertEqual(cli.command_without_prompt(command, prompt_in_argv=False), command)
+        self.assertNotIn("<prompt>", cli.format_command(command, prompt_in_argv=False))
+
+    def test_run_runner_command_pipes_stdin(self) -> None:
+        output_path = self.root / "outputs" / "stdin.txt"
+        command = [sys.executable, "-c", "import sys; print(sys.stdin.read())"]
+        completed = cli.run_runner_command(command, self.root, None, output_path, provider="claude-code", stdin_text="hello stdin")
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("hello stdin", completed.stdout)
+        transcript = output_path.read_text(encoding="utf-8")
+        self.assertIn("[ocmo] prompt sent via stdin (11 chars)", transcript)
+        self.assertNotIn("<prompt>", transcript)
+
+    def test_run_item_with_fake_claude_records_session_and_usage(self) -> None:
+        wrapper = self.make_fake_claude()
+        long_prompt = "CLAUDE_STDIN_SMOKE " + "z" * (cli.PROMPT_ARG_MAX_CHARS + 100)
+        self.prompt.write_text(long_prompt, encoding="utf-8")
+        self.write_manifest()
+        text = self.manifest_path.read_text(encoding="utf-8")
+        self.manifest_path.write_text(
+            text.replace("command: opencode\n  agent: build\n  model: test-model", f"command: {wrapper.as_posix()}\n  provider: claude-code"),
+            encoding="utf-8",
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.main(["operation", "run", str(self.manifest_path), "--select", "1", "--yes", "--ui", "plain"])
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        run_state = state["workUnits"]["1"]["runs"]["default"]
+        self.assertEqual(code, 0, msg=stdout.getvalue() + stderr.getvalue())
+        self.assertEqual(run_state["status"], "completed")
+        self.assertEqual(run_state["sessionId"], "fake-session")
+        self.assertEqual(run_state["usage"]["input"], 10)
+        self.assertEqual(run_state["usage"]["output"], 5)
+        self.assertEqual(run_state["usage"]["cost"], 0.05)
+        self.assertIn("promptPath", run_state)
+        self.assertNotIn("<prompt>", " ".join(run_state["command"]))
+
+
 class RunManifestTests(OcmoTestCase):
     def test_operation_render_accepts_params_file_and_cli_overrides(self) -> None:
         params_file = self.root / "params.yaml"
@@ -1033,7 +1259,7 @@ workUnits:
         self.assertEqual(run["sessionId"], "ses-readable")
         self.assertEqual(run["usage"]["total"], 7)
 
-    def test_run_opencode_command_streams_readable_output_before_exit(self) -> None:
+    def test_run_runner_command_streams_readable_output_before_exit(self) -> None:
         output_path = self.root / "outputs" / "stream.txt"
         lines = [
             '{"type":"text","sessionID":"ses-stream","part":{"type":"text","text":"First chunk."}}\n',
@@ -1072,7 +1298,7 @@ workUnits:
         self_test = self
         sessions: list[str] = []
         with mock.patch("ocmo.cli.subprocess.Popen", StreamingPopen):
-            completed = cli.run_opencode_command(
+            completed = cli.run_runner_command(
                 ["opencode", "run", "--format", "json", "prompt"],
                 self.root,
                 None,
@@ -1086,7 +1312,7 @@ workUnits:
         self.assertIn("[ocmo] exit code: 0", output)
         self.assertEqual(sessions, ["ses-stream", "ses-stream"])
 
-    def test_run_opencode_command_times_out_while_streaming_output(self) -> None:
+    def test_run_runner_command_times_out_while_streaming_output(self) -> None:
         output_path = self.root / "outputs" / "stream-timeout.txt"
         first_line_written = threading.Event()
         release_reader = threading.Event()
@@ -1121,7 +1347,7 @@ workUnits:
         sessions: list[str] = []
         with mock.patch("ocmo.cli.subprocess.Popen", TimeoutPopen), mock.patch("ocmo.cli.terminate_process_tree") as terminate:
             with self.assertRaises(subprocess.TimeoutExpired):
-                cli.run_opencode_command(
+                cli.run_runner_command(
                     ["opencode", "run", "--format", "json", "prompt"],
                     self.root,
                     1,
@@ -1155,13 +1381,13 @@ workUnits:
         self.assertEqual(cli.format_token_count(0), "-")
         self.assertEqual(cli.format_token_count(1_200_000), "1.2m")
 
-    def test_run_opencode_command_reports_usage_without_session_callback(self) -> None:
+    def test_run_runner_command_reports_usage_without_session_callback(self) -> None:
         output = self.root / "outputs" / "usage.txt"
         events = ['{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":12,"input":8,"output":4}}}']
         usage: list[dict[str, object]] = []
 
         with mock.patch("ocmo.cli.subprocess.Popen", return_value=FakePopen(["opencode"], 0, "\n".join(events))):
-            completed = cli.run_opencode_command(["opencode", "run", "prompt"], self.root, None, output, on_usage=usage.append)
+            completed = cli.run_runner_command(["opencode", "run", "prompt"], self.root, None, output, on_usage=usage.append)
 
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(usage[0]["total"], 12)
@@ -1344,7 +1570,7 @@ workUnits:
         self.assertEqual(state["workUnits"]["1"]["status"], "paused")
         self.assertEqual(state["workUnits"]["1"]["runs"]["default"]["status"], "paused")
 
-    def test_run_opencode_command_ctrl_c_terminates_child_and_logs_interrupt(self) -> None:
+    def test_run_runner_command_ctrl_c_terminates_child_and_logs_interrupt(self) -> None:
         class InterruptingPopen(FakePopen):
             def communicate(self, timeout: int | None = None):
                 raise KeyboardInterrupt
@@ -1352,7 +1578,7 @@ workUnits:
         output = self.root / "outputs" / "interrupt.txt"
         with mock.patch("ocmo.cli.subprocess.Popen", return_value=InterruptingPopen(["opencode"], 0, "")), mock.patch("ocmo.cli.terminate_process_tree") as terminate:
             with self.assertRaises(KeyboardInterrupt):
-                cli.run_opencode_command(["opencode", "run", "prompt"], self.root, None, output)
+                cli.run_runner_command(["opencode", "run", "prompt"], self.root, None, output)
 
         terminate.assert_called_once_with(1234, force=True)
         self.assertIn("[ocmo] interrupted", output.read_text(encoding="utf-8"))
@@ -1360,7 +1586,7 @@ workUnits:
         before_start_output = self.root / "outputs" / "interrupt-before-start.txt"
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=KeyboardInterrupt), mock.patch("ocmo.cli.terminate_process_tree") as terminate_before_start:
             with self.assertRaises(KeyboardInterrupt):
-                cli.run_opencode_command(["opencode", "run", "prompt"], self.root, None, before_start_output)
+                cli.run_runner_command(["opencode", "run", "prompt"], self.root, None, before_start_output)
         terminate_before_start.assert_not_called()
         self.assertIn("[ocmo] interrupted", before_start_output.read_text(encoding="utf-8"))
 
@@ -2424,14 +2650,14 @@ workUnits:
 
         started: list[int] = []
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "ok")):
-            completed = cli.run_opencode_command(["opencode", "run", "prompt"], self.workspace, None, self.root / "output.txt", on_start=started.append)
+            completed = cli.run_runner_command(["opencode", "run", "prompt"], self.workspace, None, self.root / "output.txt", on_start=started.append)
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(started, [1234])
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=fake_popen_completed(0, "ok")):
-            self.assertEqual(cli.run_opencode_command(["opencode", "run", "prompt"], self.workspace, None, self.root / "output2.txt").returncode, 0)
+            self.assertEqual(cli.run_runner_command(["opencode", "run", "prompt"], self.workspace, None, self.root / "output2.txt").returncode, 0)
         with mock.patch("ocmo.cli.subprocess.Popen", side_effect=subprocess.TimeoutExpired(["opencode"], 1)), mock.patch("ocmo.cli.terminate_process_tree"):
             with self.assertRaises(subprocess.TimeoutExpired):
-                cli.run_opencode_command(["opencode", "run", "prompt"], self.workspace, 1, self.root / "timeout.txt")
+                cli.run_runner_command(["opencode", "run", "prompt"], self.workspace, 1, self.root / "timeout.txt")
 
         stdout = io.StringIO()
         with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(stdout):
@@ -2565,11 +2791,11 @@ workUnits:
         state = cli.StateStore(self.root / "state.json")
         state.ensure_operation(manifest)
 
-        def fake_run(command, run_dir, run_timeout, output_path, on_start=None, on_session=None, on_usage=None):
+        def fake_run(command, run_dir, run_timeout, output_path, on_start=None, on_session=None, on_usage=None, provider="opencode", stdin_text=None):
             state.mark_run("1", "default", "paused", {"sessionId": "ses-paused"})
             return subprocess.CompletedProcess(command, 1, stdout="", stderr=None)
 
-        with mock.patch("ocmo.cli.run_opencode_command", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("ocmo.cli.run_runner_command", side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.run_item(manifest, self.manifest_path, manifest["workUnits"][0], state, None, {"enabled": False}), 1)
         data = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(data["workUnits"]["1"]["runs"]["default"]["status"], "paused")
@@ -2931,15 +3157,27 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertIn("Rewrite the reports", stdout.getvalue())
         run.assert_not_called()
 
-    def test_skill_path_prints_opencode_skill_destination(self) -> None:
-        skills_dir = self.root / "skills-dir"
+    def test_skill_path_prints_per_provider_destinations(self) -> None:
+        opencode_skills = self.root / "opencode-skills"
+        claude_skills = self.root / "claude-skills"
         stdout = io.StringIO()
 
-        with mock.patch.dict("os.environ", {"OCMO_OPENCODE_SKILLS_DIR": str(skills_dir)}, clear=True), contextlib.redirect_stdout(stdout):
+        env = {"OCMO_OPENCODE_SKILLS_DIR": str(opencode_skills), "OCMO_CLAUDE_SKILLS_DIR": str(claude_skills)}
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
             code = cli.main(["skill", "path"])
 
         self.assertEqual(code, 0)
-        self.assertEqual(stdout.getvalue().strip(), str(skills_dir / "ocmo" / "SKILL.md"))
+        output = stdout.getvalue()
+        self.assertIn(f"opencode: {opencode_skills / 'ocmo' / 'SKILL.md'}", output)
+        self.assertIn(f"claude: {claude_skills / 'ocmo' / 'SKILL.md'}", output)
+
+    def test_skill_path_reports_unavailable_provider_without_home(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", {}, clear=True), contextlib.redirect_stdout(stdout):
+            code = cli.main(["skill", "path"])
+        self.assertEqual(code, 0)
+        self.assertIn("opencode: not available", stdout.getvalue())
+        self.assertIn("claude: not available", stdout.getvalue())
 
     def test_skill_install_writes_source_and_is_idempotent(self) -> None:
         source = self.root / "source-skill"
@@ -3055,6 +3293,73 @@ class CliEntrypointTests(OcmoTestCase):
 
         with self.assertRaisesRegex(cli.OcmoError, "bundled skill file not found"):
             cli.bundled_skill_files(source)
+
+    def test_skill_install_writes_to_every_available_provider(self) -> None:
+        source = self.root / "source-skill"
+        source.mkdir()
+        (source / "SKILL.md").write_text("skill text\n", encoding="utf-8")
+        command_source = self.root / "source-commands"
+        command_source.mkdir()
+        (command_source / "ocmo-operation-statuses.md").write_text("command text\n", encoding="utf-8")
+        opencode_skills = self.root / "opencode" / "skills"
+        opencode_commands = self.root / "opencode" / "commands"
+        claude_skills = self.root / "claude" / "skills"
+        claude_commands = self.root / "claude" / "commands"
+        opencode_skills.parent.mkdir()
+        claude_skills.parent.mkdir()
+        env = {
+            "OCMO_SKILL_SOURCE": str(source),
+            "OCMO_COMMAND_SOURCE": str(command_source),
+            "OCMO_OPENCODE_SKILLS_DIR": str(opencode_skills),
+            "OCMO_OPENCODE_COMMANDS_DIR": str(opencode_commands),
+            "OCMO_CLAUDE_SKILLS_DIR": str(claude_skills),
+            "OCMO_CLAUDE_COMMANDS_DIR": str(claude_commands),
+        }
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
+            code = cli.main(["skill", "install"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual((opencode_skills / "ocmo" / "SKILL.md").read_text(encoding="utf-8"), "skill text\n")
+        self.assertEqual((claude_skills / "ocmo" / "SKILL.md").read_text(encoding="utf-8"), "skill text\n")
+        self.assertEqual((opencode_commands / "ocmo-operation-statuses.md").read_text(encoding="utf-8"), "command text\n")
+        self.assertEqual((claude_commands / "ocmo-operation-statuses.md").read_text(encoding="utf-8"), "command text\n")
+        output = stdout.getvalue()
+        self.assertIn("restart opencode", output)
+        self.assertIn("start a new claude session", output)
+
+    def test_skill_install_skips_provider_when_directory_absent(self) -> None:
+        source = self.root / "source-skill"
+        source.mkdir()
+        (source / "SKILL.md").write_text("skill text\n", encoding="utf-8")
+        opencode_skills = self.root / "opencode-skills"
+        claude_skills = self.root / "missing-agent" / "skills"  # parent does not exist
+        env = {
+            "OCMO_SKILL_SOURCE": str(source),
+            "OCMO_OPENCODE_SKILLS_DIR": str(opencode_skills),
+            "OCMO_CLAUDE_SKILLS_DIR": str(claude_skills),
+        }
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
+            code = cli.main(["skill", "install"])
+
+        self.assertEqual(code, 0)
+        self.assertTrue((opencode_skills / "ocmo" / "SKILL.md").exists())
+        self.assertFalse(claude_skills.exists())
+        output = stdout.getvalue()
+        self.assertIn("claude not available", output)
+        self.assertIn("skipping", output)
+
+    def test_skill_install_reports_when_no_provider_available(self) -> None:
+        source = self.root / "source-skill"
+        source.mkdir()
+        (source / "SKILL.md").write_text("skill text\n", encoding="utf-8")
+        stdout = io.StringIO()
+        with mock.patch.dict("os.environ", {"OCMO_SKILL_SOURCE": str(source)}, clear=True), contextlib.redirect_stdout(stdout):
+            code = cli.main(["skill", "install"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("no supported agent directories found", stdout.getvalue())
 
     def test_skill_source_errors_when_configured_path_is_missing(self) -> None:
         with mock.patch.dict("os.environ", {"OCMO_SKILL_SOURCE": str(self.root / "missing.md")}, clear=True):

@@ -5,3 +5,10 @@ __pycache__/
 .venv/
 .ocmo/state/
 .ocmo/worktrees/
+
+# Smoke-operation runtime artifacts (definition files are tracked)
+.ocmo/claude-stdin-transport/state.json
+.ocmo/claude-stdin-transport/state.json.lock
+.ocmo/claude-stdin-transport/outputs/
+.ocmo/claude-stdin-transport/prompt-inputs/
+.ocmo/claude-stdin-transport/result.json
