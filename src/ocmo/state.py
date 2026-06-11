@@ -390,14 +390,14 @@ def workflow_overall_status(state: dict[str, Any]) -> str:
     return "completed"
 
 
-def command_without_prompt(command: list[str]) -> list[str]:
-    if command:
+def command_without_prompt(command: list[str], prompt_in_argv: bool = True) -> list[str]:
+    if command and prompt_in_argv:
         return command[:-1] + ["<prompt>"]
-    return command
+    return list(command)
 
 
-def format_command(command: list[str]) -> str:
-    return " ".join(quote_arg(part) for part in command_without_prompt(command))
+def format_command(command: list[str], prompt_in_argv: bool = True) -> str:
+    return " ".join(quote_arg(part) for part in command_without_prompt(command, prompt_in_argv))
 
 
 def quote_arg(value: str) -> str:

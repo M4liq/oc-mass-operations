@@ -179,11 +179,11 @@ def main(argv: list[str] | None = None) -> int:
     for workflow_parameterized_parser in (workflow_validate_parser, workflow_run_parser, workflow_status_parser, workflow_list_parser, workflow_pause_parser, workflow_resume_parser, workflow_rerun_parser, workflow_kill_parser, workflow_erase_parser):
         add_parameter_arguments(workflow_parameterized_parser)
 
-    skill_parser = subparsers.add_parser("skill", help="Manage the bundled OCMO opencode skill")
+    skill_parser = subparsers.add_parser("skill", help="Manage the bundled OCMO skill")
     skill_subparsers = skill_parser.add_subparsers(dest="skill_command", required=True)
-    skill_install_parser = skill_subparsers.add_parser("install", help="Install the bundled opencode planning skill")
+    skill_install_parser = skill_subparsers.add_parser("install", help="Install the bundled planning skill for every available agent (opencode, claude)")
     skill_install_parser.add_argument("--force", action="store_true", help="Accepted for compatibility; install updates the bundled skill by default")
-    skill_subparsers.add_parser("path", help="Print the target opencode skill path")
+    skill_subparsers.add_parser("path", help="Print the target skill path for each supported agent")
 
     args = parser.parse_args(argv)
     try:
@@ -212,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest = load_manifest(manifest_path, command_params(args))
             validate_manifest(manifest, manifest_path)
             warn_shared_worktree_concurrency(manifest)
+            warn_provider_runner_fields(manifest)
             print(f"valid: {manifest_path}")
             return 0
         if args.command == "operation" and args.operation_command == "render":
@@ -219,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest = load_manifest(manifest_path, command_params(args))
             validate_manifest(manifest, manifest_path)
             warn_shared_worktree_concurrency(manifest)
+            warn_provider_runner_fields(manifest)
             path = state_path(manifest, manifest_path)
             existing_state = read_json_file(path) if path.exists() else {}
             previews = []

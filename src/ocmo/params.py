@@ -57,7 +57,12 @@ def suggested_top_level_command(argv: list[str]) -> str | None:
 
 def skill_command(args: argparse.Namespace) -> int:
     if args.skill_command == "path":
-        print(opencode_skill_path())
+        for target in skill_provider_targets():
+            path = skill_target_path(target)
+            if path is None:
+                print(f"{target['label']}: not available (could not determine home directory)")
+            else:
+                print(f"{target['label']}: {path}")
         return 0
     if args.skill_command == "install":
         install_skill(force=args.force)

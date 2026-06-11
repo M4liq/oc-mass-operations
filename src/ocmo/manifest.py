@@ -131,8 +131,10 @@ def validate_manifest_schema(manifest: dict[str, Any], manifest_path: Path, allo
         raise OcmoError("operation.kind is no longer supported")
     runner = require_mapping(manifest, "runner")
     require_string(runner, "command")
+    validate_runner_provider(runner.get("provider"), "runner.provider")
+    provider = runner_provider(runner)
     validate_build_agent(runner.get("agent"), "runner.agent")
-    validate_model_value(runner.get("model"), "runner.model")
+    validate_model_value(runner.get("model"), "runner.model", provider)
     validate_reasoning_effort(runner.get("reasoningEffort"), "runner.reasoningEffort")
     if "mode" in runner:
         raise OcmoError("runner.mode is no longer supported; ocmo always uses opencode run")
@@ -192,9 +194,12 @@ def validate_work_unit_runs(manifest: dict[str, Any], work_unit: dict[str, Any],
         raise OcmoError(f"workUnits[{work_unit_index}].runs.steps must be a non-empty list")
     seen = set()
     produced_by_step: dict[str, set[str]] = {}
+    provider = runner_provider(manifest.get("runner"))
     for step_index, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
             raise OcmoError(f"workUnits[{work_unit_index}].runs.steps[{step_index}] must be a mapping")
+        if "provider" in step:
+            raise OcmoError(f"workUnits[{work_unit_index}].runs.steps[{step_index}].provider is not supported; set runner.provider once per manifest")
         run_id = step.get("id")
         if run_id is None or not str(run_id).strip():
             raise OcmoError(f"workUnits[{work_unit_index}].runs.steps[{step_index}].id is required")
@@ -205,7 +210,7 @@ def validate_work_unit_runs(manifest: dict[str, Any], work_unit: dict[str, Any],
         if timeout_seconds is not None and (not isinstance(timeout_seconds, int) or timeout_seconds < 1):
             raise OcmoError(f"workUnits[{work_unit_index}].runs.steps[{step_index}].timeoutSeconds must be a positive integer")
         validate_build_agent(step.get("agent"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].agent")
-        validate_model_value(step.get("model"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].model")
+        validate_model_value(step.get("model"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].model", provider)
         validate_reasoning_effort(step.get("reasoningEffort"), f"workUnits[{work_unit_index}].runs.steps[{step_index}].reasoningEffort")
         prompt = step.get("prompt")
         if prompt is not None:
@@ -236,6 +241,28 @@ def warn_shared_worktree_concurrency(manifest: dict[str, Any]) -> None:
         print(warning, file=sys.stderr)
 
 
+def provider_runner_warnings(manifest: dict[str, Any]) -> list[str]:
+    runner = manifest.get("runner", {})
+    if runner_provider(runner) != "claude-code":
+        return []
+    ignored_fields = []
+    for field in OPENCODE_ONLY_RUNNER_FIELDS:
+        if runner.get(field):
+            ignored_fields.append(f"runner.{field}")
+            continue
+        for work_unit in manifest.get("workUnits", []):
+            steps = (work_unit.get("runs") or {}).get("steps") if isinstance(work_unit, dict) else None
+            if isinstance(steps, list) and any(isinstance(step, dict) and step.get(field) for step in steps):
+                ignored_fields.append(f"runs.steps[].{field}")
+                break
+    return [f"warning: {field} is ignored when runner.provider=claude-code" for field in ignored_fields]
+
+
+def warn_provider_runner_fields(manifest: dict[str, Any]) -> None:
+    for warning in provider_runner_warnings(manifest):
+        print(warning, file=sys.stderr)
+
+
 def validate_build_agent(value: Any, field: str) -> None:
     if value is None:
         return
@@ -245,8 +272,22 @@ def validate_build_agent(value: Any, field: str) -> None:
         raise OcmoError(f"{field} must be build")
 
 
-def validate_model_value(value: Any, field: str) -> None:
+def validate_runner_provider(value: Any, field: str) -> None:
     if value is None:
+        return
+    if not isinstance(value, str) or value not in RUNNER_PROVIDERS:
+        allowed = ", ".join(RUNNER_PROVIDERS)
+        raise OcmoError(f"{field} must be one of: {allowed}")
+
+
+def validate_model_value(value: Any, field: str, provider: str = DEFAULT_RUNNER_PROVIDER) -> None:
+    if value is None:
+        return
+    if provider == "claude-code":
+        if not isinstance(value, str) or not value.strip():
+            raise OcmoError(f"{field} must be a non-empty model name")
+        if "/" in value:
+            raise OcmoError(f"{field} must be a plain Anthropic model name for runner.provider=claude-code (e.g. sonnet, opus, claude-sonnet-4-6), not provider/model")
         return
     if not isinstance(value, str) or not value.strip():
         raise OcmoError(f"{field} must be a non-empty string in the form provider/model")

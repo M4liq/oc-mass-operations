@@ -53,7 +53,7 @@ python -m ocmo --help
 
 ## OCMO Skill
 
-This repository ships an optional opencode skill for working with OCMO commands, manifests, generated operation folders, state, and operation control:
+This repository ships an optional agent skill for working with OCMO commands, manifests, generated operation folders, state, and operation control. It installs into both opencode and Claude Code:
 
 ```text
 src/ocmo/resources/skill/SKILL.md
@@ -72,7 +72,9 @@ Print the target install path with:
 ocmo skill path
 ```
 
-`ocmo skill install` updates the installed skill directory when the bundled skill or its handbook changes. It installs both `SKILL.md` and a version-matched `README.md` handbook, installs the `/ocmo-operation-statuses` and `/ocmo-workflow-statuses` slash commands under `~/.config/opencode/commands/`, and removes the old managed `ocmo-plan-grill` skill path during migration. Restart opencode after installing the skill. Running sessions keep using the already-loaded skill and command set.
+`ocmo skill install` installs the skill for every supported agent whose config directory is present: opencode (`~/.config/opencode/`) and Claude Code (`~/.claude/`). For each available agent it installs `SKILL.md` plus a version-matched `README.md` handbook under that agent's `skills/ocmo/` directory and the `/ocmo-operation-statuses` and `/ocmo-workflow-statuses` slash commands under its `commands/` directory, updating them when the bundled files change and removing the old managed `ocmo-plan-grill` skill path during migration. If an agent's directory is not present, install prints an informational `<agent> not available ...; skipping` line and continues with the others. Restart opencode or start a new Claude Code session afterward; running sessions keep using the already-loaded skill and command set.
+
+The install locations can be overridden with the `OCMO_OPENCODE_SKILLS_DIR`, `OCMO_OPENCODE_COMMANDS_DIR`, `OCMO_CLAUDE_SKILLS_DIR`, and `OCMO_CLAUDE_COMMANDS_DIR` environment variables. `ocmo skill path` prints the target `SKILL.md` location for each agent.
 
 Use `/ocmo` when you want an agent to inspect OCMO manifests, validate or render operations, explain command usage, inspect state and outputs, plan mass operations, or control running work with pause/resume/rerun/kill/erase.
 
@@ -101,7 +103,7 @@ Core concepts:
 - Work unit: one independently schedulable unit of work within an operation.
 - Workflow: one sequential orchestration of multiple operation manifests.
 - Manifest: generated plan describing work units, prompts, queue settings, and state path.
-- Prompt template: text rendered once per selected work unit/run and passed to `opencode run`; very long prompts are written to runtime prompt-input files and attached with `--file` to avoid OS command-line limits.
+- Prompt template: text rendered once per selected work unit/run and passed to the runner CLI; very long prompts are written to runtime prompt-input files to avoid OS command-line limits and attached with `--file` (opencode) or piped via stdin (claude-code).
 - Selection: work unit filter such as `uncompleted`, `all`, `ITEM-001`, or `1-10`.
 - State file: durable JSON state written by `ocmo operation run` or `ocmo workflow run` for status, resume, and audit.
 
@@ -302,7 +304,7 @@ Useful options:
 
 If `policy.worktree: single` uses concurrency above `1`, `ocmo operation run` requires `--allow-shared-worktree-concurrency`. Use that only when selected work unit scopes are explicitly non-overlapping.
 
-Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata. `ocmo operation status` continuously refreshes operation status until interrupted, summarizes operation token usage and total operation elapsed time, and includes compact per-work-unit `Work Time`, `Agent Time`, and `Tokens` columns. `Tokens` is formatted as `input/output`.
+Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata; with `runner.provider: claude-code`, usage arrives once at the end of each run from the final `result` event. `ocmo operation status` continuously refreshes operation status until interrupted, summarizes operation token usage and total operation elapsed time, and includes compact per-work-unit `Work Time`, `Agent Time`, and `Tokens` columns. `Tokens` is formatted as `input/output`.
 
 Changing a manifest or prompt template while an operation is running does not affect already-started agent processes. It can affect queued work units or later sequential run steps because prompts are rendered immediately before each run starts. Long-prompt transport writes the prompt input file before launching the agent, so edits after launch do not change that launched run.
 
@@ -512,7 +514,7 @@ Pressing `Ctrl+C` during a foreground `ocmo operation run` or `ocmo workflow run
 
 Pressing `Ctrl+C` during `ocmo operation plan` terminates the active planner process when ocmo owns it, prints `ocmo: interrupted`, and exits with code `130` without writing a manifest unless planning had already reached the final write step.
 
-`resume` is strict session continuation. It resumes only paused runs that have a persisted opencode session id and starts them with `opencode run --session <sessionId>`. It never falls back to `opencode --continue` because that can resume the wrong session during concurrent work.
+`resume` is strict session continuation. It resumes only paused runs that have a persisted runner session id and starts them with `opencode run --session <sessionId>` (or `claude -p --resume <sessionId>` when `runner.provider` is `claude-code`). It never falls back to `opencode --continue` because that can resume the wrong session during concurrent work.
 
 `rerun` is a fresh start and never uses `--session`. By default, `ocmo operation rerun` selects `retryable` work units: `paused_unresumable`, `timed_out`, `failed`, `cleanup_failed`, `worktree_failed`, `setup_failed`, and `killed`. Use `--select unresumable`, `--select timed-out`, `--select failed`, `--select killed`, `--select all`, or explicit work unit IDs/ranges to narrow or expand the fresh rerun.
 
@@ -599,13 +601,14 @@ Manifest rules:
 - `operation.id` is the stable operation identifier.
 - `operation.description` should explain the operation goal in human-readable terms.
 - `operation.workspace` is the target repository or directory where `opencode run` executes.
-- `runner.command` is normally `opencode`.
-- `runner.agent` is normally `build`; explicit run-step `agent` values must also be `build`.
-- `runner.model` is optional and is passed to `opencode` when set. Use the `provider/model` form, where `provider` is one of `opencode`, `github-copilot`, `openai`, or `anthropic` (e.g. `github-copilot/claude-sonnet`, `openai/gpt-5.5`, `opencode/big-pickle`). A bare model id is also accepted and lets `opencode` resolve the default provider.
-- `runner.reasoningEffort` is optional and forwards to `opencode --variant`; allowed values are `minimal`, `low`, `medium`, `high`. Per-run step overrides are supported.
-- `runner.attach` is an optional `opencode serve` URL.
-- `runner.timeoutSeconds` controls the per-run timeout unless overridden from the CLI.
-- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` when true.
+- `runner.provider` selects the agent CLI serving the operation: `opencode` (default) or `claude-code`. One provider per manifest; run steps cannot override it. Workflows inherit the provider from each step's operation manifest.
+- `runner.command` is normally `opencode` (or `claude` when `runner.provider` is `claude-code`). On Windows the Claude Code binary may need to be named explicitly, e.g. `claude.cmd`.
+- `runner.agent` is normally `build`; explicit run-step `agent` values must also be `build`. opencode only — ignored with a warning under `claude-code`.
+- `runner.model` is optional and is passed to the runner CLI when set. For opencode, use the `provider/model` form, where `provider` is one of `opencode`, `github-copilot`, `openai`, or `anthropic` (e.g. `github-copilot/claude-sonnet`, `openai/gpt-5.5`, `opencode/big-pickle`); a bare model id is also accepted and lets `opencode` resolve the default provider. For `claude-code`, use a plain Anthropic model name or alias (e.g. `sonnet`, `opus`, `claude-sonnet-4-6`); the `provider/model` form is rejected.
+- `runner.reasoningEffort` is optional and forwards to `opencode --variant`; allowed values are `minimal`, `low`, `medium`, `high`. Per-run step overrides are supported. opencode only — ignored with a warning under `claude-code`.
+- `runner.attach` is an optional `opencode serve` URL. opencode only — ignored with a warning under `claude-code`.
+- `runner.timeoutSeconds` controls the per-run timeout unless overridden from the CLI. Applies to both providers.
+- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` when true. Applies to both providers.
 - `selection.default` is used when `--select` is omitted. Prefer `uncompleted` for repeatable operations.
 - `queue.concurrency` is maximum active work units, not maximum run steps inside one work unit.
 - `queue.order` is currently `manifest`.
