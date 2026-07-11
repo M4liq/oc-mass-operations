@@ -243,7 +243,8 @@ def warn_shared_worktree_concurrency(manifest: dict[str, Any]) -> None:
 
 def provider_runner_warnings(manifest: dict[str, Any]) -> list[str]:
     runner = manifest.get("runner", {})
-    if runner_provider(runner) != "claude-code":
+    provider = runner_provider(runner)
+    if provider == "opencode":
         return []
     ignored_fields = []
     for field in OPENCODE_ONLY_RUNNER_FIELDS:
@@ -255,7 +256,7 @@ def provider_runner_warnings(manifest: dict[str, Any]) -> list[str]:
             if isinstance(steps, list) and any(isinstance(step, dict) and step.get(field) for step in steps):
                 ignored_fields.append(f"runs.steps[].{field}")
                 break
-    return [f"warning: {field} is ignored when runner.provider=claude-code" for field in ignored_fields]
+    return [f"warning: {field} is ignored when runner.provider={provider}" for field in ignored_fields]
 
 
 def warn_provider_runner_fields(manifest: dict[str, Any]) -> None:
@@ -283,11 +284,13 @@ def validate_runner_provider(value: Any, field: str) -> None:
 def validate_model_value(value: Any, field: str, provider: str = DEFAULT_RUNNER_PROVIDER) -> None:
     if value is None:
         return
-    if provider == "claude-code":
+    if provider in ("claude-code", "cursor"):
         if not isinstance(value, str) or not value.strip():
             raise OcmoError(f"{field} must be a non-empty model name")
         if "/" in value:
-            raise OcmoError(f"{field} must be a plain Anthropic model name for runner.provider=claude-code (e.g. sonnet, opus, claude-sonnet-4-6), not provider/model")
+            if provider == "claude-code":
+                raise OcmoError(f"{field} must be a plain Anthropic model name for runner.provider=claude-code (e.g. sonnet, opus, claude-sonnet-4-6), not provider/model")
+            raise OcmoError(f"{field} must be a plain model name for runner.provider=cursor (e.g. gpt-5, sonnet-4.5), not provider/model")
         return
     if not isinstance(value, str) or not value.strip():
         raise OcmoError(f"{field} must be a non-empty string in the form provider/model")

@@ -166,6 +166,20 @@ def skill_provider_targets() -> list[dict[str, Any]]:
         "commands_dir": claude_commands,
         "restart": "start a new claude session to load the skill",
     })
+
+    cursor_skills = env_path("OCMO_CURSOR_SKILLS_DIR")
+    if cursor_skills is None and home is not None:
+        cursor_skills = home / ".cursor" / "skills"
+    cursor_commands = env_path("OCMO_CURSOR_COMMANDS_DIR")
+    if cursor_commands is None and cursor_skills is not None:
+        cursor_commands = cursor_skills.parent / "commands"
+    targets.append({
+        "provider": "cursor",
+        "label": "cursor",
+        "skills_dir": cursor_skills,
+        "commands_dir": cursor_commands,
+        "restart": "start a new cursor-agent session to load the skill",
+    })
     return targets
 
 
