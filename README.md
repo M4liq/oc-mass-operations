@@ -605,7 +605,7 @@ Manifest rules:
 - `runner.command` is normally `opencode` (or `claude` when `runner.provider` is `claude-code`). On Windows the Claude Code binary may need to be named explicitly, e.g. `claude.cmd`.
 - `runner.agent` is normally `build`; explicit run-step `agent` values must also be `build`. opencode only — ignored with a warning under `claude-code`.
 - `runner.model` is optional and is passed to the runner CLI when set. For opencode, use the `provider/model` form, where `provider` is one of `opencode`, `github-copilot`, `openai`, or `anthropic` (e.g. `github-copilot/claude-sonnet`, `openai/gpt-5.5`, `opencode/big-pickle`); a bare model id is also accepted and lets `opencode` resolve the default provider. For `claude-code`, use a plain Anthropic model name or alias (e.g. `sonnet`, `opus`, `claude-sonnet-4-6`); the `provider/model` form is rejected.
-- `runner.reasoningEffort` is optional and forwards to `opencode --variant`; allowed values are `minimal`, `low`, `medium`, `high`. Per-run step overrides are supported. opencode only — ignored with a warning under `claude-code`.
+- `runner.reasoningEffort` is optional and forwards to `opencode --variant`; allowed values are `minimal`, `low`, `medium`, `high`, `xhigh`. Per-run step overrides are supported. Variant availability depends on the selected model (e.g. `openai/gpt-5.5` supports `xhigh`). opencode only — ignored with a warning under `claude-code`.
 - `runner.attach` is an optional `opencode serve` URL. opencode only — ignored with a warning under `claude-code`.
 - `runner.timeoutSeconds` controls the per-run timeout unless overridden from the CLI. Applies to both providers.
 - `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` when true. Applies to both providers.
