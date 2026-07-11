@@ -300,7 +300,11 @@ def validate_model_value(value: Any, field: str, provider: str = DEFAULT_RUNNER_
         raise OcmoError(f"{field} must be in the form provider/model")
     if provider not in KNOWN_MODEL_PROVIDERS:
         known = ", ".join(KNOWN_MODEL_PROVIDERS)
-        raise OcmoError(f"{field} provider '{provider}' is not supported (known: {known})")
+        print(
+            f"warning: {field} provider '{provider}' is not a known provider (known: {known}); "
+            "assuming a custom provider defined in opencode config",
+            file=sys.stderr,
+        )
 
 
 def validate_reasoning_effort(value: Any, field: str) -> None:
@@ -442,6 +446,7 @@ def artifact_instructions(manifest_path: Path, item: dict[str, Any], run: dict[s
         lines.append(f"  Required: {'yes' if required else 'no'}")
     lines.append("")
     lines.append("Create parent directories if needed. Required artifacts must be non-empty.")
+    lines.append("Write each artifact at its absolute path listed above; the manifest-relative path is informational only — do NOT resolve it against the workspace directory.")
     if any(is_handoff_artifact(artifact_id, config) for artifact_id, config in artifacts.items()):
         lines.append('For handoff JSON, set decision to "block" when the next run should not proceed. Do not inflate confidence to satisfy a gate.')
     return "\n".join(lines)

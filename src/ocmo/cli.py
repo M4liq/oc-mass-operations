@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--out", type=Path, help="Manifest output path; defaults to <workspace>/.ocmo/<prompt-stem>/manifest.yaml")
     plan_parser.add_argument("--workspace", type=Path, help="Target workspace for planning; defaults to the current directory")
     plan_parser.add_argument("--model", help="opencode model")
-    plan_parser.add_argument("--reasoning-effort", dest="reasoning_effort", choices=list(REASONING_EFFORT_VALUES), help="Reasoning effort (minimal|low|medium|high) passed to opencode --variant")
+    plan_parser.add_argument("--reasoning-effort", dest="reasoning_effort", choices=list(REASONING_EFFORT_VALUES), help="Reasoning effort (minimal|low|medium|high|xhigh) passed to opencode --variant")
     plan_parser.add_argument("--max-attempts", type=int, default=3, help="Maximum planner correction attempts")
     plan_parser.add_argument("--interactive", action="store_true", help="Allow the planner to ask terminal questions before returning marked YAML")
     plan_parser.add_argument("--dry-run", action="store_true", help="Print the planning prompt only")
