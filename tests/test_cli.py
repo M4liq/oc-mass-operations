@@ -715,11 +715,13 @@ class SelectionAndRenderingTests(OcmoTestCase):
         )
         self.assertNotIn("--variant", command)
 
-    def test_validate_manifest_rejects_unknown_provider(self) -> None:
+    def test_validate_manifest_warns_on_unknown_provider(self) -> None:
         manifest = self.load()
         manifest["runner"]["model"] = "bogus/foo"
-        with self.assertRaisesRegex(cli.OcmoError, "provider 'bogus' is not supported"):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
             cli.validate_manifest_schema(manifest, self.manifest_path)
+        self.assertIn("provider 'bogus' is not a known provider", stderr.getvalue())
 
     def test_validate_manifest_accepts_known_providers(self) -> None:
         for model in ("opencode/zen", "github-copilot/claude-sonnet", "openai/gpt-5.5", "anthropic/claude-sonnet-4"):

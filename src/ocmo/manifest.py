@@ -300,7 +300,11 @@ def validate_model_value(value: Any, field: str, provider: str = DEFAULT_RUNNER_
         raise OcmoError(f"{field} must be in the form provider/model")
     if provider not in KNOWN_MODEL_PROVIDERS:
         known = ", ".join(KNOWN_MODEL_PROVIDERS)
-        raise OcmoError(f"{field} provider '{provider}' is not supported (known: {known})")
+        print(
+            f"warning: {field} provider '{provider}' is not a known provider (known: {known}); "
+            "assuming a custom provider defined in opencode config",
+            file=sys.stderr,
+        )
 
 
 def validate_reasoning_effort(value: Any, field: str) -> None:
