@@ -855,7 +855,7 @@ class ClaudeCodeProviderTests(OcmoTestCase):
 
     def test_validate_manifest_rejects_unknown_runner_provider(self) -> None:
         manifest = self.load()
-        manifest["runner"]["provider"] = "cursor"
+        manifest["runner"]["provider"] = "codex"
         with self.assertRaisesRegex(cli.OcmoError, "runner.provider must be one of"):
             cli.validate_manifest_schema(manifest, self.manifest_path)
 
@@ -971,6 +971,181 @@ class ClaudeCodeProviderTests(OcmoTestCase):
         self.assertEqual(run_state["usage"]["input"], 10)
         self.assertEqual(run_state["usage"]["output"], 5)
         self.assertEqual(run_state["usage"]["cost"], 0.05)
+        self.assertIn("promptPath", run_state)
+        self.assertNotIn("<prompt>", " ".join(run_state["command"]))
+
+
+FAKE_CURSOR_SCRIPT = """\
+import json
+import sys
+
+args = sys.argv[1:]
+positional = []
+index = 0
+while index < len(args):
+    arg = args[index]
+    if arg in ("--output-format", "--model", "--resume"):
+        index += 2
+        continue
+    if arg in ("-p", "--force"):
+        index += 1
+        continue
+    positional.append(arg)
+    index += 1
+if "-p" not in args or "--output-format" not in args:
+    raise SystemExit(3)
+prompt = positional[0] if positional else sys.stdin.read()
+print(json.dumps({"type": "system", "subtype": "init", "session_id": "fake-cursor-session", "model": "gpt-5", "permissionMode": "default"}))
+print(json.dumps({"type": "assistant", "session_id": "fake-cursor-session", "message": {"content": [{"type": "text", "text": "prompt length %d" % len(prompt)}]}}))
+print(json.dumps({"type": "result", "subtype": "success", "session_id": "fake-cursor-session", "duration_ms": 5, "result": "done"}))
+"""
+
+
+class CursorProviderTests(OcmoTestCase):
+    def cursor_runner(self, **extra) -> dict:
+        return {"provider": "cursor", "command": "cursor-agent", **extra}
+
+    def make_fake_cursor(self) -> Path:
+        script = self.root / "fake_cursor.py"
+        script.write_text(FAKE_CURSOR_SCRIPT, encoding="utf-8")
+        if os.name == "nt":
+            wrapper = self.root / "fake_cursor.cmd"
+            wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        else:
+            wrapper = self.root / "fake_cursor"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+        return wrapper
+
+    def test_build_command_cursor_flags(self) -> None:
+        manifest = self.load()
+        command = cli.build_command(
+            manifest,
+            self.manifest_path,
+            "do the task",
+            runner=self.cursor_runner(model="gpt-5", dangerouslySkipPermissions=True),
+        )
+        self.assertEqual(
+            command,
+            ["cursor-agent", "-p", "--output-format", "stream-json", "--model", "gpt-5", "--force", "do the task"],
+        )
+
+    def test_build_command_cursor_ignores_opencode_fields(self) -> None:
+        manifest = self.load()
+        command = cli.build_command(
+            manifest,
+            self.manifest_path,
+            "prompt",
+            runner=self.cursor_runner(agent="build", reasoningEffort="high", attach="http://localhost:1", title="My Title"),
+        )
+        for flag in ("--agent", "--variant", "--attach", "--title", "--format", "--file", "--dir", "--verbose"):
+            self.assertNotIn(flag, command)
+        self.assertEqual(command[-1], "prompt")
+
+    def test_build_resume_command_cursor(self) -> None:
+        manifest = self.load()
+        command = cli.build_resume_command(manifest, self.manifest_path, "continue", "chat-1", runner=self.cursor_runner())
+        self.assertEqual(command[:4], ["cursor-agent", "-p", "--resume", "chat-1"])
+        self.assertEqual(command[-1], "continue")
+        self.assertNotIn("--session", command)
+
+    def test_build_transport_command_cursor_uses_stdin_for_long_prompts(self) -> None:
+        manifest = self.load()
+        prompt_file = self.root / "prompt-input.md"
+        long_prompt = "x" * (cli.PROMPT_ARG_MAX_CHARS + 1)
+        command, written, stdin_text = cli.build_transport_command(manifest, self.manifest_path, long_prompt, prompt_file, runner=self.cursor_runner())
+        self.assertEqual(stdin_text, long_prompt)
+        self.assertEqual(written, prompt_file)
+        self.assertEqual(prompt_file.read_text(encoding="utf-8"), long_prompt)
+        self.assertNotIn(long_prompt, command)
+        self.assertNotIn("--file", command)
+        self.assertEqual(command[-1], "stream-json")
+
+    def test_build_transport_command_cursor_short_prompt_stays_in_argv(self) -> None:
+        manifest = self.load()
+        command, written, stdin_text = cli.build_transport_command(manifest, self.manifest_path, "short", self.root / "prompt-input.md", runner=self.cursor_runner())
+        self.assertIsNone(written)
+        self.assertIsNone(stdin_text)
+        self.assertEqual(command[-1], "short")
+
+    def test_validate_manifest_rejects_cursor_model_with_slash(self) -> None:
+        manifest = self.load()
+        manifest["runner"]["provider"] = "cursor"
+        manifest["runner"]["model"] = "openai/gpt-5.5"
+        with self.assertRaisesRegex(cli.OcmoError, "plain model name for runner.provider=cursor"):
+            cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_validate_manifest_accepts_cursor_models(self) -> None:
+        for model in ("gpt-5", "sonnet-4.5", "opus-4.1"):
+            manifest = self.load()
+            manifest["runner"]["provider"] = "cursor"
+            manifest["runner"]["model"] = model
+            cli.validate_manifest_schema(manifest, self.manifest_path)
+
+    def test_provider_runner_warnings_list_ignored_fields_for_cursor(self) -> None:
+        manifest = self.load()
+        manifest["runner"].update({"provider": "cursor", "agent": "build", "reasoningEffort": "high", "title": "T"})
+        manifest["workUnits"][0]["runs"] = {"steps": [{"id": "plan", "attach": "http://localhost:1"}]}
+        warnings = cli.provider_runner_warnings(manifest)
+        self.assertEqual(
+            warnings,
+            [
+                "warning: runner.agent is ignored when runner.provider=cursor",
+                "warning: runner.reasoningEffort is ignored when runner.provider=cursor",
+                "warning: runs.steps[].attach is ignored when runner.provider=cursor",
+                "warning: runner.title is ignored when runner.provider=cursor",
+            ],
+        )
+
+    def test_render_cursor_output_line(self) -> None:
+        first_delta = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hel"}]}})
+        second_delta = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "lo"}]}})
+        self.assertEqual(cli.render_cursor_output_line(first_delta), "Hel")
+        self.assertEqual(cli.render_cursor_output_line(second_delta), "lo")
+        self.assertEqual(cli.render_cursor_output_line(json.dumps({"type": "result", "result": "final"})), "\n")
+        self.assertEqual(cli.render_cursor_output_line(json.dumps({"type": "system", "subtype": "init"})), "")
+        self.assertEqual(cli.render_cursor_output_line("plain text\n"), "plain text\n")
+        self.assertEqual(cli.render_cursor_output_line('{"broken json\n'), "")
+
+    def test_render_cursor_output_text_joins_deltas(self) -> None:
+        output = "\n".join(
+            [
+                json.dumps({"type": "system", "subtype": "init", "session_id": "chat-1"}),
+                json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hel"}]}}),
+                json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "lo"}]}}),
+                json.dumps({"type": "result", "result": "Hello"}),
+            ]
+        )
+        self.assertEqual(cli.render_cursor_output_text(output), "Hello\n")
+
+    def test_extract_cursor_session_id(self) -> None:
+        output = "noise\n" + json.dumps({"type": "system", "subtype": "init", "session_id": "chat-init"}) + "\n"
+        self.assertEqual(cli.extract_cursor_session_id(output), "chat-init")
+        self.assertIsNone(cli.extract_cursor_session_id("no events here"))
+
+    def test_extract_cursor_usage_delta_returns_none(self) -> None:
+        result = json.dumps({"type": "result", "subtype": "success", "duration_ms": 5, "result": "done"})
+        self.assertIsNone(cli.extract_cursor_usage_delta(result))
+
+    def test_run_item_with_fake_cursor_records_session(self) -> None:
+        wrapper = self.make_fake_cursor()
+        long_prompt = "CURSOR_STDIN_SMOKE " + "z" * (cli.PROMPT_ARG_MAX_CHARS + 100)
+        self.prompt.write_text(long_prompt, encoding="utf-8")
+        self.write_manifest()
+        text = self.manifest_path.read_text(encoding="utf-8")
+        self.manifest_path.write_text(
+            text.replace("command: opencode\n  agent: build\n  model: test-model", f"command: {wrapper.as_posix()}\n  provider: cursor"),
+            encoding="utf-8",
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.main(["operation", "run", str(self.manifest_path), "--select", "1", "--yes", "--ui", "plain"])
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        run_state = state["workUnits"]["1"]["runs"]["default"]
+        self.assertEqual(code, 0, msg=stdout.getvalue() + stderr.getvalue())
+        self.assertEqual(run_state["status"], "completed")
+        self.assertEqual(run_state["sessionId"], "fake-cursor-session")
+        self.assertNotIn("usage", run_state)
         self.assertIn("promptPath", run_state)
         self.assertNotIn("<prompt>", " ".join(run_state["command"]))
 
@@ -3162,9 +3337,14 @@ class CliEntrypointTests(OcmoTestCase):
     def test_skill_path_prints_per_provider_destinations(self) -> None:
         opencode_skills = self.root / "opencode-skills"
         claude_skills = self.root / "claude-skills"
+        cursor_skills = self.root / "cursor-skills"
         stdout = io.StringIO()
 
-        env = {"OCMO_OPENCODE_SKILLS_DIR": str(opencode_skills), "OCMO_CLAUDE_SKILLS_DIR": str(claude_skills)}
+        env = {
+            "OCMO_OPENCODE_SKILLS_DIR": str(opencode_skills),
+            "OCMO_CLAUDE_SKILLS_DIR": str(claude_skills),
+            "OCMO_CURSOR_SKILLS_DIR": str(cursor_skills),
+        }
         with mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(stdout):
             code = cli.main(["skill", "path"])
 
@@ -3172,6 +3352,7 @@ class CliEntrypointTests(OcmoTestCase):
         output = stdout.getvalue()
         self.assertIn(f"opencode: {opencode_skills / 'ocmo' / 'SKILL.md'}", output)
         self.assertIn(f"claude: {claude_skills / 'ocmo' / 'SKILL.md'}", output)
+        self.assertIn(f"cursor: {cursor_skills / 'ocmo' / 'SKILL.md'}", output)
 
     def test_skill_path_reports_unavailable_provider_without_home(self) -> None:
         stdout = io.StringIO()
@@ -3180,6 +3361,7 @@ class CliEntrypointTests(OcmoTestCase):
         self.assertEqual(code, 0)
         self.assertIn("opencode: not available", stdout.getvalue())
         self.assertIn("claude: not available", stdout.getvalue())
+        self.assertIn("cursor: not available", stdout.getvalue())
 
     def test_skill_install_writes_source_and_is_idempotent(self) -> None:
         source = self.root / "source-skill"
