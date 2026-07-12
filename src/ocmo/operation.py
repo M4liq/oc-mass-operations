@@ -78,7 +78,7 @@ def run_manifest(options: RunOptions) -> int:
                     prompt_file = prompt_input_path(options.manifest_path, str(item["id"]), str(run["id"]))
                     command = build_command(manifest, options.manifest_path, prompt_text, run_dir, runner, prompt_file)
                     prompt_file_rel = relative_to_manifest(prompt_file, options.manifest_path)
-                    if runner_provider(runner) == "claude-code":
+                    if provider_uses_stdin_transport(runner_provider(runner)):
                         prompt_in_argv = False
                         details.append(("prompt transport", f"stdin when executed; prompt copy -> {prompt_file_rel}"))
                     else:
