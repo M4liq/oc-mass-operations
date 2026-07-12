@@ -412,7 +412,7 @@ Manifest rules:
 - `runner.model` is optional. For `claude-code` it must be a plain Anthropic model name (e.g. `sonnet`), not `provider/model`. For `cursor` it must be a plain model name (e.g. `gpt-5`), not `provider/model`.
 - `runner.attach` is an optional `opencode serve` URL. opencode only — ignored with a warning under `claude-code` and `cursor`.
 - `runner.timeoutSeconds` controls the per-run timeout unless overridden from the CLI.
-- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` when true.
+- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` (opencode, claude-code) or `--force` (cursor) when true. `cursor-agent` refuses non-interactive runs in untrusted directories; without this flag the cursor workspace must be trusted beforehand.
 - `selection.default` is used when `--select` is omitted. Prefer `uncompleted` for repeatable operations.
 - `queue.concurrency` is maximum active work units, not maximum run steps inside one work unit.
 - `queue.order` is currently `manifest`.

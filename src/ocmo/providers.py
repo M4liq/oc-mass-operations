@@ -171,8 +171,19 @@ def extract_cursor_session_id(output: str) -> str | None:
 
 
 def extract_cursor_usage_delta(output_line: str) -> dict[str, Any] | None:
-    # cursor-agent stream-json result events expose no token usage fields yet.
-    return None
+    event = claude_output_event(output_line)
+    if event is None or event.get("type") != "result":
+        return None
+    # cursor-agent result usage uses camelCase token fields and has no cost.
+    tokens = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+    usage = empty_usage()
+    usage["input"] = usage_int(tokens.get("inputTokens"))
+    usage["output"] = usage_int(tokens.get("outputTokens"))
+    usage["cacheRead"] = usage_int(tokens.get("cacheReadTokens"))
+    usage["cacheWrite"] = usage_int(tokens.get("cacheWriteTokens"))
+    usage["total"] = usage["input"] + usage["output"] + usage["cacheRead"] + usage["cacheWrite"]
+    usage["steps"] = 1
+    return usage
 
 
 def provider_uses_stdin_transport(provider: str) -> bool:

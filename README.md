@@ -304,7 +304,7 @@ Useful options:
 
 If `policy.worktree: single` uses concurrency above `1`, `ocmo operation run` requires `--allow-shared-worktree-concurrency`. Use that only when selected work unit scopes are explicitly non-overlapping.
 
-Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata; with `runner.provider: claude-code`, usage arrives once at the end of each run from the final `result` event; with `runner.provider: cursor`, token usage is not reported because `cursor-agent` does not emit usage metadata. `ocmo operation status` continuously refreshes operation status until interrupted, summarizes operation token usage and total operation elapsed time, and includes compact per-work-unit `Work Time`, `Agent Time`, and `Tokens` columns. `Tokens` is formatted as `input/output`.
+Foreground runs show token usage after each `opencode` step completes when `opencode run --format json` emits usage metadata; with `runner.provider: claude-code` or `cursor`, usage arrives once at the end of each run from the final `result` event (cursor reports token counts but no cost). `ocmo operation status` continuously refreshes operation status until interrupted, summarizes operation token usage and total operation elapsed time, and includes compact per-work-unit `Work Time`, `Agent Time`, and `Tokens` columns. `Tokens` is formatted as `input/output`.
 
 Changing a manifest or prompt template while an operation is running does not affect already-started agent processes. It can affect queued work units or later sequential run steps because prompts are rendered immediately before each run starts. Long-prompt transport writes the prompt input file before launching the agent, so edits after launch do not change that launched run.
 
@@ -608,7 +608,7 @@ Manifest rules:
 - `runner.reasoningEffort` is optional and forwards to `opencode --variant`; allowed values are `minimal`, `low`, `medium`, `high`, `xhigh`. Per-run step overrides are supported. Variant availability depends on the selected model (e.g. `openai/gpt-5.5` supports `xhigh`). opencode only — ignored with a warning under `claude-code` and `cursor`.
 - `runner.attach` is an optional `opencode serve` URL. opencode only — ignored with a warning under `claude-code` and `cursor`.
 - `runner.timeoutSeconds` controls the per-run timeout unless overridden from the CLI. Applies to all providers.
-- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` (opencode, claude-code) or `--force` (cursor) when true. Applies to all providers.
+- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` (opencode, claude-code) or `--force` (cursor) when true. Applies to all providers. Note: `cursor-agent` refuses non-interactive runs in untrusted directories; `--force` grants trust, so cursor operations without `dangerouslySkipPermissions: true` require the workspace to be trusted beforehand (run `cursor-agent` interactively there once).
 - `selection.default` is used when `--select` is omitted. Prefer `uncompleted` for repeatable operations.
 - `queue.concurrency` is maximum active work units, not maximum run steps inside one work unit.
 - `queue.order` is currently `manifest`.

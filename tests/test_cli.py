@@ -997,7 +997,7 @@ if "-p" not in args or "--output-format" not in args:
 prompt = positional[0] if positional else sys.stdin.read()
 print(json.dumps({"type": "system", "subtype": "init", "session_id": "fake-cursor-session", "model": "gpt-5", "permissionMode": "default"}))
 print(json.dumps({"type": "assistant", "session_id": "fake-cursor-session", "message": {"content": [{"type": "text", "text": "prompt length %d" % len(prompt)}]}}))
-print(json.dumps({"type": "result", "subtype": "success", "session_id": "fake-cursor-session", "duration_ms": 5, "result": "done"}))
+print(json.dumps({"type": "result", "subtype": "success", "session_id": "fake-cursor-session", "duration_ms": 5, "result": "done", "usage": {"inputTokens": 10, "outputTokens": 5, "cacheReadTokens": 2, "cacheWriteTokens": 1}}))
 """
 
 
@@ -1123,9 +1123,17 @@ class CursorProviderTests(OcmoTestCase):
         self.assertEqual(cli.extract_cursor_session_id(output), "chat-init")
         self.assertIsNone(cli.extract_cursor_session_id("no events here"))
 
-    def test_extract_cursor_usage_delta_returns_none(self) -> None:
-        result = json.dumps({"type": "result", "subtype": "success", "duration_ms": 5, "result": "done"})
-        self.assertIsNone(cli.extract_cursor_usage_delta(result))
+    def test_extract_cursor_usage_delta(self) -> None:
+        result = json.dumps({"type": "result", "subtype": "success", "duration_ms": 5, "result": "done", "usage": {"inputTokens": 100, "outputTokens": 20, "cacheReadTokens": 50, "cacheWriteTokens": 5}})
+        usage = cli.extract_cursor_usage_delta(result)
+        self.assertEqual(usage["input"], 100)
+        self.assertEqual(usage["output"], 20)
+        self.assertEqual(usage["cacheRead"], 50)
+        self.assertEqual(usage["cacheWrite"], 5)
+        self.assertEqual(usage["total"], 175)
+        self.assertEqual(usage["steps"], 1)
+        self.assertIsNone(cli.extract_cursor_usage_delta(json.dumps({"type": "assistant"})))
+        self.assertIsNone(cli.extract_cursor_usage_delta("not json"))
 
     def test_run_item_with_fake_cursor_records_session(self) -> None:
         wrapper = self.make_fake_cursor()
@@ -1145,7 +1153,8 @@ class CursorProviderTests(OcmoTestCase):
         self.assertEqual(code, 0, msg=stdout.getvalue() + stderr.getvalue())
         self.assertEqual(run_state["status"], "completed")
         self.assertEqual(run_state["sessionId"], "fake-cursor-session")
-        self.assertNotIn("usage", run_state)
+        self.assertEqual(run_state["usage"]["input"], 10)
+        self.assertEqual(run_state["usage"]["output"], 5)
         self.assertIn("promptPath", run_state)
         self.assertNotIn("<prompt>", " ".join(run_state["command"]))
 

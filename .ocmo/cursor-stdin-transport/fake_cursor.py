@@ -30,7 +30,7 @@ def main(argv: list[str]) -> int:
     (Path(__file__).resolve().parent / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps({"type": "system", "subtype": "init", "session_id": "smoke-cursor-session", "model": "gpt-5", "permissionMode": "default"}))
     print(json.dumps({"type": "assistant", "session_id": "smoke-cursor-session", "message": {"content": [{"type": "text", "text": "cursor stdin transport smoke completed"}]}}))
-    print(json.dumps({"type": "result", "subtype": "success", "session_id": "smoke-cursor-session", "duration_ms": 5, "result": "done"}))
+    print(json.dumps({"type": "result", "subtype": "success", "session_id": "smoke-cursor-session", "duration_ms": 5, "result": "done", "usage": {"inputTokens": 10, "outputTokens": 5, "cacheReadTokens": 2, "cacheWriteTokens": 1}}))
     return 0 if result["usedStdinTransport"] and result["hasMarker"] and has_required_flags else 2
 
 
