@@ -1,0 +1,32 @@
+schema: ocmo/v1
+# Smoke test for the claude-code provider: verifies that prompts longer than
+# PROMPT_ARG_MAX_CHARS are delivered via stdin (no positional prompt argument)
+# and that stream-json session/usage events are parsed into state.json.
+# Run from the repo root: python -m ocmo operation run .ocmo/claude-stdin-transport/manifest.yaml --yes
+# The default runnerCommand is a Windows path relative to the repo root (CreateProcess
+# resolves it against the parent process working directory and needs backslashes).
+# On non-Windows, pass: --param runnerCommand=$PWD/.ocmo/claude-stdin-transport/claude-shim
+params:
+  runnerCommand: '.ocmo\claude-stdin-transport\claude-shim.cmd'
+operation:
+  id: claude-stdin-transport
+  # Workspace is the repo root so the child process working directory matches
+  # the directory the relative runnerCommand is resolved against.
+  workspace: ../..
+runner:
+  command: "{{params.runnerCommand}}"
+  provider: claude-code
+  timeoutSeconds: 30
+queue:
+  concurrency: 1
+policy:
+  worktree: single
+prompt:
+  template: prompt.md
+state:
+  path: state.json
+workUnits:
+  - id: CLAUDE-001
+    title: Verify claude-code stdin prompt transport
+    payload:
+      expectedTransport: stdin

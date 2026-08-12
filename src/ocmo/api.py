@@ -2,6 +2,7 @@ from __future__ import annotations
 
 _MODULE_NAMES = (
     "common",
+    "providers",
     "params",
     "skill_install",
     "manifest",

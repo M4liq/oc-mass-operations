@@ -30,6 +30,7 @@ from .common import *
 def run_manifest(options: RunOptions) -> int:
     manifest = load_manifest(options.manifest_path, options.params)
     validate_manifest(manifest, options.manifest_path, options.allow_shared_worktree_concurrency)
+    warn_provider_runner_fields(manifest)
     fresh = options.fresh or (not options.resume and not options.rerun and clean_before_run_enabled(manifest))
     existing_state = {} if fresh else read_json_file(state_path(manifest, options.manifest_path)) if state_path(manifest, options.manifest_path).exists() else {}
     if options.resume:
@@ -72,10 +73,16 @@ def run_manifest(options: RunOptions) -> int:
                 prompt_text = render_prompt(manifest, item, options.manifest_path, execution, run, runs)
                 command = build_command(manifest, options.manifest_path, prompt_text, run_dir, runner)
                 details = []
+                prompt_in_argv = True
                 if should_use_prompt_file(command):
                     prompt_file = prompt_input_path(options.manifest_path, str(item["id"]), str(run["id"]))
                     command = build_command(manifest, options.manifest_path, prompt_text, run_dir, runner, prompt_file)
-                    details.append(("prompt transport", f"file when executed -> {relative_to_manifest(prompt_file, options.manifest_path)}"))
+                    prompt_file_rel = relative_to_manifest(prompt_file, options.manifest_path)
+                    if provider_uses_stdin_transport(runner_provider(runner)):
+                        prompt_in_argv = False
+                        details.append(("prompt transport", f"stdin when executed; prompt copy -> {prompt_file_rel}"))
+                    else:
+                        details.append(("prompt transport", f"file when executed -> {prompt_file_rel}"))
                 if execution:
                     details.append(("worktree", str(execution["worktreePath"])))
                     details.append(("branch", str(execution["branchName"])))
@@ -87,7 +94,7 @@ def run_manifest(options: RunOptions) -> int:
                     details.append(("consumes", str(reference)))
                 details.extend(clean_details)
                 details.extend(hook_details)
-                previews.append(PromptPreview(str(item["id"]), str(run["id"]), prompt_text, format_command(command), details))
+                previews.append(PromptPreview(str(item["id"]), str(run["id"]), prompt_text, format_command(command, prompt_in_argv), details))
         print_prompt_previews(previews, options.preview_all)
         return 0
 

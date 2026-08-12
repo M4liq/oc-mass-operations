@@ -66,6 +66,7 @@ def run_item(
     resumed_paused_run = False
     for run in runs:
         runner = effective_runner(manifest, run)
+        provider = runner_provider(runner)
         run_id = str(run["id"])
         previous_run_state = state.run(item_id, run_id)
         use_session_resume = False
@@ -85,15 +86,16 @@ def run_item(
         run_timeout = timeout_seconds if timeout_seconds is not None else runner.get("timeoutSeconds")
         try:
             prompt_file: Path | None = None
+            stdin_text: str | None = None
             if use_session_resume:
                 session_id = previous_run_state.get("sessionId")
                 if not isinstance(session_id, str) or not session_id:
-                    raise OcmoError(f"paused run is missing opencode sessionId: {item_id}/{run_id}")
+                    raise OcmoError(f"paused run is missing runner sessionId: {item_id}/{run_id}")
                 prompt_text = resume_prompt(item_id, run_id)
                 command = build_resume_command(manifest, manifest_path, prompt_text, session_id, run_dir, runner)
             else:
                 prompt_text = render_prompt(manifest, item, manifest_path, execution, run, runs)
-                command, prompt_file = build_transport_command(manifest, manifest_path, prompt_text, prompt_input_path(manifest_path, item_id, run_id), run_dir, runner)
+                command, prompt_file, stdin_text = build_transport_command(manifest, manifest_path, prompt_text, prompt_input_path(manifest_path, item_id, run_id), run_dir, runner)
         except (OSError, OcmoError) as exc:
             state.mark_run(item_id, run_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc)})
             state.mark(item_id, "failed", {"completedAt": utc_now(), "exitCode": 1, "error": str(exc), **execution})
@@ -103,7 +105,7 @@ def run_item(
         output_path = run_output_path(manifest_path, item_id, run_id)
         running_run_state = {
             "startedAt": utc_now(),
-            "command": command_without_prompt(command),
+            "command": command_without_prompt(command, prompt_in_argv=stdin_text is None),
             "timeoutSeconds": run_timeout,
             "outputPath": relative_to_manifest(output_path, manifest_path),
             "artifacts": {
@@ -143,7 +145,7 @@ def run_item(
             reporter.usage(item_id, run_id, usage_total)
 
         try:
-            completed = run_opencode_command(
+            completed = run_runner_command(
                 command,
                 run_dir,
                 run_timeout,
@@ -151,6 +153,8 @@ def run_item(
                 on_start=lambda pid, item_id=item_id, run_id=run_id: state.mark_run(item_id, run_id, "running", {"pid": pid}),
                 on_session=lambda session_id, item_id=item_id, run_id=run_id: state.patch_run(item_id, run_id, {"sessionId": session_id}),
                 on_usage=record_usage,
+                provider=provider,
+                stdin_text=stdin_text,
             )
         except subprocess.TimeoutExpired:
             flush_usage()
@@ -167,8 +171,8 @@ def run_item(
             cleanup_code = cleanup_worktree(manifest, manifest_path, item, execution, auto_worktrees, state, success=False, reporter=reporter)
             return cleanup_code or 1
         flush_usage()
-        reporter.subprocess_output(item_id, run_id, completed)
-        session_id = extract_session_id(completed.stdout or "")
+        reporter.subprocess_output(item_id, run_id, completed, provider)
+        session_id = provider_extract_session_id(provider, completed.stdout or "")
         if session_id:
             state.patch_run(item_id, run_id, {"sessionId": session_id})
         if completed.returncode == 0:
