@@ -53,4 +53,3 @@ result = cli.run_runner_command(command, root, 180, runtime / "resume.txt", prov
 assert result.returncode == 0, result.stdout
 assert "OCMO_RESUME_OK" in cli.provider_render_output_text("codex", result.stdout)
 print("PASS: live operation, long prompt stdin, persisted thread, live resume", flush=True)
-
