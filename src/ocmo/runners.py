@@ -371,7 +371,10 @@ def run_runner_command(
             process = subprocess.Popen(
                 command,
                 cwd=str(run_dir),
-                stdin=subprocess.PIPE if stdin_text is not None else None,
+                # Codex exec appends piped stdin even with an argv prompt.
+                # An inherited open pipe (e.g. a service launcher) would make
+                # it wait forever for EOF instead of starting the model call.
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL if provider == "codex" else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,

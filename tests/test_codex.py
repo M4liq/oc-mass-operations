@@ -1,10 +1,31 @@
 import json
 import unittest
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 from ocmo import cli
 
 class CodexTests(unittest.TestCase):
+    def test_short_prompt_does_not_inherit_an_open_stdin_pipe(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = (
+                'import sys; from pathlib import Path; from ocmo import cli; '
+                f'root = Path({folder!r}); '
+                'result = cli.run_runner_command('
+                '[sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"], '
+                'root, 2, root / "out.txt", provider="codex"); '
+                'print(result.stdout); sys.exit(result.returncode)'
+            )
+            with subprocess.Popen([sys.executable, '-c', script], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as parent:
+                # Deliberately keep the launcher's input open until it exits.
+                parent.wait(timeout=10)
+                output, error = parent.communicate()
+            self.assertEqual(parent.returncode, 0, error)
+            self.assertIn("''", output)
+
     def setUp(self):
         self.runner = {"provider": "codex", "command": "codex", "model": "test-model", "reasoningEffort": "high"}
         self.manifest = {"runner": self.runner}
