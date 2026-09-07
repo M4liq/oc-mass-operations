@@ -601,14 +601,14 @@ Manifest rules:
 - `operation.id` is the stable operation identifier.
 - `operation.description` should explain the operation goal in human-readable terms.
 - `operation.workspace` is the target repository or directory where `opencode run` executes.
-- `runner.provider` selects the agent CLI serving the operation: `opencode` (default), `claude-code`, or `cursor`. One provider per manifest; run steps cannot override it. Workflows inherit the provider from each step's operation manifest.
-- `runner.command` is normally `opencode` (`claude` when `runner.provider` is `claude-code`, `cursor-agent` when it is `cursor`). On Windows the binary may need to be named explicitly, e.g. `claude.cmd`.
+- `runner.provider` selects the agent CLI serving the operation: `opencode` (default), `claude-code`, `cursor`, or `codex`. One provider per manifest; run steps cannot override it. Workflows inherit the provider from each step's operation manifest.
+- `runner.command` is normally `opencode` (`claude` when `runner.provider` is `claude-code`, `cursor-agent` when it is `cursor`, `codex` when it is `codex`). On Windows the binary may need to be named explicitly, e.g. `claude.cmd`.
 - `runner.agent` is normally `build`; explicit run-step `agent` values must also be `build`. opencode only — ignored with a warning under `claude-code` and `cursor`.
 - `runner.model` is optional and is passed to the runner CLI when set. For opencode, use the `provider/model` form, where `provider` is one of `opencode`, `github-copilot`, `openai`, or `anthropic` (e.g. `github-copilot/claude-sonnet`, `openai/gpt-5.5`, `opencode/big-pickle`); a bare model id is also accepted and lets `opencode` resolve the default provider. For `claude-code`, use a plain Anthropic model name or alias (e.g. `sonnet`, `opus`, `claude-sonnet-4-6`); the `provider/model` form is rejected. For `cursor`, use a plain model name (e.g. `gpt-5`, `sonnet-4.5`); the `provider/model` form is rejected.
 - `runner.reasoningEffort` is optional and forwards to `opencode --variant`; allowed values are `minimal`, `low`, `medium`, `high`, `xhigh`. Per-run step overrides are supported. Variant availability depends on the selected model (e.g. `openai/gpt-5.5` supports `xhigh`). opencode only — ignored with a warning under `claude-code` and `cursor`.
 - `runner.attach` is an optional `opencode serve` URL. opencode only — ignored with a warning under `claude-code` and `cursor`.
 - `runner.timeoutSeconds` controls the per-run timeout unless overridden from the CLI. Applies to all providers.
-- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` (opencode, claude-code) or `--force` (cursor) when true. Applies to all providers. Note: `cursor-agent` refuses non-interactive runs in untrusted directories; `--force` grants trust, so cursor operations without `dangerouslySkipPermissions: true` require the workspace to be trusted beforehand (run `cursor-agent` interactively there once).
+- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` (opencode, claude-code) or `--force` (cursor), or `--dangerously-bypass-approvals-and-sandbox` (codex) when true. Applies to all providers. Note: `cursor-agent` refuses non-interactive runs in untrusted directories; `--force` grants trust, so cursor operations without `dangerouslySkipPermissions: true` require the workspace to be trusted beforehand (run `cursor-agent` interactively there once).
 - `selection.default` is used when `--select` is omitted. Prefer `uncompleted` for repeatable operations.
 - `queue.concurrency` is maximum active work units, not maximum run steps inside one work unit.
 - `queue.order` is currently `manifest`.
@@ -747,3 +747,26 @@ Reference examples are available in:
 - `examples/report-rewrite-auto-worktrees.yaml`
 - `examples/report-rewrite-multi-agent.yaml`
 - `examples/prompts/report-rewrite.md`
+
+### Codex CLI provider
+
+Use an installed, authenticated Codex CLI (`codex login`) with:
+
+```yaml
+runner:
+  provider: codex
+  command: codex
+  reasoningEffort: high
+  timeoutSeconds: 3600
+```
+
+Omit `model` to inherit the Codex configuration, or use a plain model ID.
+OCMO runs `codex exec --json` in the step workspace and resumes the recorded
+thread with `codex exec resume`. Long prompts travel through stdin. Completed
+agent messages appear in transcripts; thread IDs and usage are saved in operation state.
+Token totals include cached input exactly once. Codex does not report a dollar
+cost in these events; OCMO's zero cost field is not a billing estimate.
+`reasoningEffort` maps to `model_reasoning_effort`; `agent`, `attach`, and
+`title` are ignored with warnings. Existing Codex sandbox settings apply.
+Only explicit `dangerouslySkipPermissions: true` adds
+`--dangerously-bypass-approvals-and-sandbox`.

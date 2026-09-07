@@ -186,11 +186,82 @@ def extract_cursor_usage_delta(output_line: str) -> dict[str, Any] | None:
     return usage
 
 
+def build_codex_command(
+    manifest: dict[str, Any], manifest_path: Path, prompt_text: str,
+    run_dir: Path | None = None, runner: dict[str, Any] | None = None,
+    prompt_file: Path | None = None,
+) -> list[str]:
+    runner = runner or manifest["runner"]
+    command = [resolve_executable_command(str(runner.get("command", "codex"))), "exec", "--json"]
+    if runner.get("model"):
+        command += ["--model", str(runner["model"])]
+    if runner.get("reasoningEffort"):
+        command += ["-c", "model_reasoning_effort=" + json.dumps(runner["reasoningEffort"])]
+    if runner.get("dangerouslySkipPermissions"):
+        command.append("--dangerously-bypass-approvals-and-sandbox")
+    command += ["--", "-" if prompt_file is not None else prompt_text]
+    return command
+
+
+def build_codex_resume_command(
+    manifest: dict[str, Any], manifest_path: Path, prompt_text: str, session_id: str,
+    run_dir: Path | None = None, runner: dict[str, Any] | None = None,
+    prompt_file: Path | None = None,
+) -> list[str]:
+    command = build_codex_command(manifest, manifest_path, prompt_text, run_dir, runner, prompt_file)
+    command.insert(2, "resume")
+    command.insert(len(command) - 1, session_id)
+    return command
+
+
+def render_codex_output_line(line: str) -> str:
+    event = claude_output_event(line)
+    if event is None:
+        return "" if strip_ansi(line).strip().startswith("{") else strip_ansi(line)
+    if event.get("type") == "item.completed":
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            return item["text"] + ("" if item["text"].endswith("\n") else "\n")
+    if event.get("type") in ("error", "turn.failed"):
+        error = event.get("error")
+        message = error.get("message") if isinstance(error, dict) else event.get("message")
+        return str(message) + "\n" if message else ""
+    return ""
+
+
+def extract_codex_session_id(output: str) -> str | None:
+    for line in output.splitlines():
+        event = claude_output_event(line)
+        if event and event.get("type") == "thread.started":
+            session_id = event.get("thread_id")
+            if isinstance(session_id, str) and session_id:
+                return session_id
+    return None
+
+
+def extract_codex_usage_delta(line: str) -> dict[str, Any] | None:
+    event = claude_output_event(line)
+    if not event or event.get("type") != "turn.completed" or not isinstance(event.get("usage"), dict):
+        return None
+    tokens = event["usage"]
+    usage = empty_usage()
+    # Codex input_tokens includes cached tokens; OCMO adds cacheRead separately.
+    total_input = usage_int(tokens.get("input_tokens"))
+    usage["cacheRead"] = min(total_input, usage_int(tokens.get("cached_input_tokens")))
+    usage["input"] = total_input - usage["cacheRead"]
+    usage["output"] = usage_int(tokens.get("output_tokens"))
+    usage["total"] = total_input + usage["output"]
+    usage["steps"] = 1
+    return usage
+
+
 def provider_uses_stdin_transport(provider: str) -> bool:
-    return provider in ("claude-code", "cursor")
+    return provider in ("claude-code", "cursor", "codex")
 
 
 def provider_render_output_line(provider: str, line: str) -> str:
+    if provider == "codex":
+        return render_codex_output_line(line)
     if provider == "claude-code":
         return render_claude_output_line(line)
     if provider == "cursor":
@@ -199,6 +270,8 @@ def provider_render_output_line(provider: str, line: str) -> str:
 
 
 def provider_render_output_text(provider: str, output: str) -> str:
+    if provider == "codex":
+        return "".join(render_codex_output_line(line) for line in output.splitlines(keepends=True))
     if provider == "claude-code":
         return render_claude_output_text(output)
     if provider == "cursor":
@@ -207,6 +280,8 @@ def provider_render_output_text(provider: str, output: str) -> str:
 
 
 def provider_extract_session_id(provider: str, output: str) -> str | None:
+    if provider == "codex":
+        return extract_codex_session_id(output)
     if provider == "claude-code":
         return extract_claude_session_id(output)
     if provider == "cursor":
@@ -215,6 +290,8 @@ def provider_extract_session_id(provider: str, output: str) -> str | None:
 
 
 def provider_extract_usage_delta(provider: str, output_line: str) -> dict[str, Any] | None:
+    if provider == "codex":
+        return extract_codex_usage_delta(output_line)
     if provider == "claude-code":
         return extract_claude_usage_delta(output_line)
     if provider == "cursor":

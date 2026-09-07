@@ -885,7 +885,7 @@ class ClaudeCodeProviderTests(OcmoTestCase):
 
     def test_validate_manifest_rejects_unknown_runner_provider(self) -> None:
         manifest = self.load()
-        manifest["runner"]["provider"] = "codex"
+        manifest["runner"]["provider"] = "unknown-provider"
         with self.assertRaisesRegex(cli.OcmoError, "runner.provider must be one of"):
             cli.validate_manifest_schema(manifest, self.manifest_path)
 

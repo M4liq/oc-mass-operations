@@ -406,13 +406,13 @@ Manifest rules:
 - `operation.id` is the stable operation identifier.
 - `operation.description` should explain the operation goal in human-readable terms.
 - `operation.workspace` is the target repository or directory for `opencode run`.
-- `runner.provider` selects the agent CLI: `opencode` (default), `claude-code`, or `cursor`. One provider per manifest; run steps cannot override it.
-- `runner.command` is normally `opencode` (`claude` when `runner.provider` is `claude-code`, `cursor-agent` when it is `cursor`).
+- `runner.provider` selects the agent CLI: `opencode` (default), `claude-code`, `cursor`, or `codex`. One provider per manifest; run steps cannot override it.
+- `runner.command` is normally `opencode` (`claude` when `runner.provider` is `claude-code`, `cursor-agent` when it is `cursor`, `codex` when it is `codex`).
 - Explicit `runner.agent` and run-step `agent` values must be `build`. opencode only — ignored with a warning under `claude-code` and `cursor`.
 - `runner.model` is optional. For `claude-code` it must be a plain Anthropic model name (e.g. `sonnet`), not `provider/model`. For `cursor` it must be a plain model name (e.g. `gpt-5`), not `provider/model`.
 - `runner.attach` is an optional `opencode serve` URL. opencode only — ignored with a warning under `claude-code` and `cursor`.
 - `runner.timeoutSeconds` controls the per-run timeout unless overridden from the CLI.
-- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` (opencode, claude-code) or `--force` (cursor) when true. `cursor-agent` refuses non-interactive runs in untrusted directories; without this flag the cursor workspace must be trusted beforehand.
+- `runner.dangerouslySkipPermissions` passes `--dangerously-skip-permissions` (opencode, claude-code) or `--force` (cursor), or `--dangerously-bypass-approvals-and-sandbox` (codex) when true. `cursor-agent` refuses non-interactive runs in untrusted directories; without this flag the cursor workspace must be trusted beforehand.
 - `selection.default` is used when `--select` is omitted. Prefer `uncompleted` for repeatable operations.
 - `queue.concurrency` is maximum active work units, not maximum run steps inside one work unit.
 - `queue.order` is currently `manifest`.
@@ -734,3 +734,12 @@ Before running `ocmo operation plan`, make sure the request identifies enough of
 If the request is vague, ask focused questions. Do not turn this into a long grilling ritual by default; ask only what is necessary for safe planning or execution.
 
 Do not run `ocmo operation plan`, `ocmo operation run`, `ocmo operation resume`, `ocmo operation rerun`, `ocmo operation kill`, `ocmo operation erase`, or workflow control commands unless the user asked for that action or approved the relevant operation/workflow.
+
+### Codex
+
+Set `runner.provider: codex` and `runner.command: codex` after `codex login`.
+OCMO uses `codex exec --json`, stdin for long prompts, and `codex exec resume`
+with the recorded thread ID. Use a plain model ID or omit it to inherit Codex
+configuration. `reasoningEffort` maps to `model_reasoning_effort`; `agent`,
+`attach`, and `title` are ignored. Token totals count cached input once;
+the zero cost field is not a billing estimate.

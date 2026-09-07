@@ -248,6 +248,8 @@ def provider_runner_warnings(manifest: dict[str, Any]) -> list[str]:
         return []
     ignored_fields = []
     for field in OPENCODE_ONLY_RUNNER_FIELDS:
+        if provider == "codex" and field == "reasoningEffort":
+            continue
         if runner.get(field):
             ignored_fields.append(f"runner.{field}")
             continue
@@ -284,10 +286,12 @@ def validate_runner_provider(value: Any, field: str) -> None:
 def validate_model_value(value: Any, field: str, provider: str = DEFAULT_RUNNER_PROVIDER) -> None:
     if value is None:
         return
-    if provider in ("claude-code", "cursor"):
+    if provider in ("claude-code", "cursor", "codex"):
         if not isinstance(value, str) or not value.strip():
             raise OcmoError(f"{field} must be a non-empty model name")
         if "/" in value:
+            if provider == "codex":
+                raise OcmoError(f"{field} must be a plain model name for runner.provider=codex, not provider/model")
             if provider == "claude-code":
                 raise OcmoError(f"{field} must be a plain Anthropic model name for runner.provider=claude-code (e.g. sonnet, opus, claude-sonnet-4-6), not provider/model")
             raise OcmoError(f"{field} must be a plain model name for runner.provider=cursor (e.g. gpt-5, sonnet-4.5), not provider/model")

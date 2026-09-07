@@ -217,6 +217,8 @@ def build_command(
     prompt_file: Path | None = None,
 ) -> list[str]:
     provider = runner_provider(runner or manifest["runner"])
+    if provider == "codex":
+        return build_codex_command(manifest, manifest_path, prompt_text, run_dir, runner, prompt_file)
     if provider == "claude-code":
         return build_claude_code_command(manifest, manifest_path, prompt_text, run_dir, runner, prompt_file)
     if provider == "cursor":
@@ -265,6 +267,8 @@ def build_resume_command(
     prompt_file: Path | None = None,
 ) -> list[str]:
     provider = runner_provider(runner or manifest["runner"])
+    if provider == "codex":
+        return build_codex_resume_command(manifest, manifest_path, prompt_text, session_id, run_dir, runner, prompt_file)
     if provider == "claude-code":
         return build_claude_code_resume_command(manifest, manifest_path, prompt_text, session_id, run_dir, runner, prompt_file)
     if provider == "cursor":
